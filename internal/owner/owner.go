@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -37,7 +38,11 @@ var (
 	ErrCeremony        = errors.New("owner: ceremony failed")
 	ErrSessionInvalid  = errors.New("owner: session invalid")
 	ErrPasskeyNotFound = errors.New("owner: passkey not found")
+	ErrRecoveryInvalid = errors.New("owner: recovery code invalid or used")
 )
+
+// RecoveryCodeCount is how many codes a set contains.
+const RecoveryCodeCount = 10
 
 // Owner wires WebAuthn to the store.
 type Owner struct {
@@ -233,14 +238,111 @@ func (o *Owner) FinishLogin(ctx context.Context, challengeID string, r *http.Req
 			}
 		}
 	}
-	token = randomToken()
-	now := o.Now()
-	expires = now.Add(SessionTTL)
-	if err := o.Store.PutSession(ctx, store.Session{Hash: hash(token), CreatedAt: now, ExpiresAt: expires, IP: ip}); err != nil {
+	token, expires, err = o.openSession(ctx, "passkey", ip)
+	if err != nil {
 		return "", time.Time{}, err
 	}
 	o.audit(ctx, "owner.login", "pk="+b64(cred.ID), ip)
 	return token, expires, nil
+}
+
+func (o *Owner) openSession(ctx context.Context, method, ip string) (string, time.Time, error) {
+	token := randomToken()
+	now := o.Now()
+	expires := now.Add(SessionTTL)
+	err := o.Store.PutSession(ctx, store.Session{Hash: hash(token), CreatedAt: now, ExpiresAt: expires, IP: ip, Method: method})
+	return token, expires, err
+}
+
+// ── recovery codes (auth-service-4) ────────────────────────────────────────
+
+// RecoveryStatus summarises the current code set without revealing it.
+type RecoveryStatus struct {
+	Total     int
+	Remaining int
+	CreatedAt *time.Time
+}
+
+// RecoveryStatus reports how many codes exist and are unused.
+func (o *Owner) RecoveryStatus(ctx context.Context) (RecoveryStatus, error) {
+	codes, err := o.Store.ListRecoveryCodes(ctx)
+	if err != nil {
+		return RecoveryStatus{}, err
+	}
+	st := RecoveryStatus{Total: len(codes)}
+	for _, c := range codes {
+		if c.UsedAt == nil {
+			st.Remaining++
+		}
+		if st.CreatedAt == nil {
+			t := c.CreatedAt
+			st.CreatedAt = &t
+		}
+	}
+	return st, nil
+}
+
+// GenerateRecoveryCodes replaces the owner's codes with a fresh set and
+// returns the plain codes exactly once. Format: four groups of four base32
+// characters (80 bits), easy to read back from paper.
+func (o *Owner) GenerateRecoveryCodes(ctx context.Context, ip string) ([]string, error) {
+	codes := make([]string, 0, RecoveryCodeCount)
+	hashes := make([]string, 0, RecoveryCodeCount)
+	for len(codes) < RecoveryCodeCount {
+		c := recoveryCode()
+		codes = append(codes, c)
+		hashes = append(hashes, hash(normalizeRecovery(c)))
+	}
+	if err := o.Store.ReplaceRecoveryCodes(ctx, hashes, o.Now()); err != nil {
+		return nil, err
+	}
+	o.audit(ctx, "recovery.generate", fmt.Sprintf("count=%d", len(codes)), ip)
+	return codes, nil
+}
+
+// RecoverLogin opens a "recovery" session from an unused code. Such a session
+// can manage passkeys (register a replacement) but cannot approve connectors.
+func (o *Owner) RecoverLogin(ctx context.Context, code, ip string) (token string, expires time.Time, err error) {
+	norm := normalizeRecovery(code)
+	if len(norm) != 16 {
+		o.audit(ctx, "recovery.denied", "malformed code", ip)
+		return "", time.Time{}, ErrRecoveryInvalid
+	}
+	err = o.Store.ConsumeRecoveryCode(ctx, hash(norm), o.Now())
+	if errors.Is(err, store.ErrNotFound) {
+		o.audit(ctx, "recovery.denied", "unknown or used code", ip)
+		return "", time.Time{}, ErrRecoveryInvalid
+	}
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	token, expires, err = o.openSession(ctx, "recovery", ip)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	o.audit(ctx, "recovery.login", "", ip)
+	return token, expires, nil
+}
+
+// recoveryCode draws 80 bits as 16 lowercase base32 chars, grouped by 4.
+func recoveryCode() string {
+	var b [10]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("owner: crypto/rand failed: %v", err))
+	}
+	raw := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
+	return raw[0:4] + "-" + raw[4:8] + "-" + raw[8:12] + "-" + raw[12:16]
+}
+
+// normalizeRecovery strips separators and case so a hand-typed code matches.
+func normalizeRecovery(s string) string {
+	var sb strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if r >= 'a' && r <= 'z' || r >= '2' && r <= '7' {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
 }
 
 // ValidateSession resolves a cookie value to a live session.

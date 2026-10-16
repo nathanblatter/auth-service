@@ -75,7 +75,14 @@ The owner (Nathan) is the one cross-tenant identity. He authenticates to the con
   uses it to register the first passkey. *Proposed, Nathan did not pick:* the bearer token
   stays valid as break-glass alongside passkeys until auth-service-4 (backup passkey and
   recovery codes) exists, so a lost single passkey cannot lock him out of every service.
-- Audit actors are `admin:passkey` or `admin:token`, so the log shows which path was used.
+- Audit actors are `admin:passkey`, `admin:recovery` or `admin:token`, so the log shows which
+  path was used.
+- **Recovery (auth-service-4):** any number of passkeys can be registered (a second device is
+  the backup). Ten offline **recovery codes** (80-bit, `xxxx-xxxx-xxxx-xxxx`, stored hashed
+  under `OWNER#me / RECOVERY#<sha256>`) are generated in the console and shown once; a new set
+  replaces the old. `POST /admin/recover` with an unused code opens a 1-hour **recovery
+  session** that can manage passkeys but cannot approve connectors. Codes are single use and
+  attempts count against the login brute-force limit.
 
 ## Connector OAuth (auth-service-23, slice 2)
 

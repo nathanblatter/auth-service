@@ -500,3 +500,55 @@ func TestConnectorOAuthFlow(t *testing.T) {
 		t.Fatalf("deny: %d %v", code, out2)
 	}
 }
+
+func TestRecoveryFlow(t *testing.T) {
+	ts, _ := newServerWithStore(t, "https://auth.test")
+	admin := "Bearer " + adminToken
+	if code, st := do(t, "GET", ts.URL+"/admin/recovery-codes", admin, "", ""); code != 200 || st["total"].(float64) != 0 {
+		t.Fatalf("status: %d %v", code, st)
+	}
+	code, gen := do(t, "POST", ts.URL+"/admin/recovery-codes", admin, "", "")
+	if code != 201 || len(gen["codes"].([]any)) != owner.RecoveryCodeCount {
+		t.Fatalf("generate: %d %v", code, gen)
+	}
+	first := gen["codes"].([]any)[0].(string)
+	if code, _ := do(t, "GET", ts.URL+"/admin/recovery-codes", admin, "", ""); code != 200 {
+		t.Fatalf("status after: %d", code)
+	}
+	if code, body := do(t, "POST", ts.URL+"/admin/recover", "", "application/json", `{"code":"nope-nope-nope-nope"}`); code != 401 || body["error"] != "recovery_code_rejected" {
+		t.Fatalf("bad code: %d %v", code, body)
+	}
+	resp := doRaw(t, "POST", ts.URL+"/admin/recover", map[string]string{"Content-Type": "application/json"}, `{"code":"`+first+`"}`)
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || out["method"] != "recovery" {
+		t.Fatalf("recover: %d %v", resp.StatusCode, out)
+	}
+	var tok string
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionCookie {
+			tok = c.Value
+		}
+	}
+	if tok == "" {
+		t.Fatal("no session cookie after recovery")
+	}
+	hdr := map[string]string{"Cookie": sessionCookie + "=" + tok, "Origin": "https://auth.test"}
+	// A recovery session can start passkey registration (the whole point)…
+	resp = doRaw(t, "POST", ts.URL+"/admin/passkeys/begin", hdr, "")
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("passkeys/begin with recovery session: %d", resp.StatusCode)
+	}
+	// …but the session endpoint reports its weaker method, and the code is spent.
+	resp = doRaw(t, "GET", ts.URL+"/admin/session", hdr, "")
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if out["method"] != "recovery" {
+		t.Fatalf("session method: %v", out)
+	}
+	if code, _ := do(t, "POST", ts.URL+"/admin/recover", "", "application/json", `{"code":"`+first+`"}`); code != 401 {
+		t.Fatalf("reused code: %d", code)
+	}
+}

@@ -65,6 +65,15 @@ type Session struct {
 	CreatedAt time.Time
 	ExpiresAt time.Time
 	IP        string
+	// Method is how the session was opened: "passkey" (default) or "recovery".
+	Method string
+}
+
+// RecoveryCode is one offline recovery code, stored hashed.
+type RecoveryCode struct {
+	Hash      string
+	CreatedAt time.Time
+	UsedAt    *time.Time
 }
 
 // OAuthClient is a dynamically registered OAuth client (RFC 7591).
@@ -146,6 +155,11 @@ type Store interface {
 	PutSession(ctx context.Context, s Session) error
 	GetSession(ctx context.Context, hash string, now time.Time) (Session, error) // ErrNotFound when missing or expired
 	DeleteSession(ctx context.Context, hash string) error
+
+	// Recovery codes: ReplaceRecoveryCodes wipes any existing set.
+	ReplaceRecoveryCodes(ctx context.Context, hashes []string, created time.Time) error
+	ListRecoveryCodes(ctx context.Context) ([]RecoveryCode, error)
+	ConsumeRecoveryCode(ctx context.Context, hash string, now time.Time) error // ErrNotFound when missing or used
 
 	// OAuth 2.1 for connectors.
 	CreateOAuthClient(ctx context.Context, c OAuthClient) error

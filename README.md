@@ -54,6 +54,8 @@ curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 | POST | `/admin/login/begin`, `/admin/login/finish` | none | passkey sign-in ceremony |
 | POST | `/admin/logout` | cookie | end the session |
 | GET/POST | `/admin/passkeys[/begin\|/finish]` | admin | list / register passkeys |
+| GET/POST | `/admin/recovery-codes` | admin | status / generate a new set (shown once) |
+| POST | `/admin/recover` | none | sign in with a recovery code (recovery session) |
 | POST | `/admin/services` | admin | register a service |
 | GET | `/admin/services[/{id}]` | admin | list / fetch |
 | POST | `/admin/services/{id}/credentials` | admin | mint (shown once) |

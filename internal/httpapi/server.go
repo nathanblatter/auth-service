@@ -78,6 +78,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/passkeys", s.requireAdmin(s.listPasskeys))
 	mux.HandleFunc("POST /admin/passkeys/begin", s.requireAdmin(s.passkeyBegin))
 	mux.HandleFunc("POST /admin/passkeys/finish", s.requireAdmin(s.passkeyFinish))
+	mux.HandleFunc("GET /admin/recovery-codes", s.requireAdmin(s.recoveryStatus))
+	mux.HandleFunc("POST /admin/recovery-codes", s.requireAdmin(s.recoveryGenerate))
+	mux.HandleFunc("POST /admin/recover", s.recoverLogin)
 
 	mux.HandleFunc("POST /admin/services", s.requireAdmin(s.createService))
 	mux.HandleFunc("GET /admin/services", s.requireAdmin(s.listServices))
@@ -237,11 +240,14 @@ func (s *Server) adminMethod(r *http.Request) string {
 		return "token"
 	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
-		if _, err := s.Owner.ValidateSession(r.Context(), c.Value); err == nil {
+		if sess, err := s.Owner.ValidateSession(r.Context(), c.Value); err == nil {
 			if r.Method != http.MethodGet && r.Method != http.MethodHead && !s.sameOrigin(r) {
 				return ""
 			}
-			return "passkey"
+			if sess.Method == "" {
+				return "passkey"
+			}
+			return sess.Method // passkey | recovery
 		}
 	}
 	return ""
@@ -302,7 +308,7 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 	if m := s.adminMethod(r); m != "" {
 		out["authenticated"] = true
 		out["method"] = m
-		if c, err := r.Cookie(sessionCookie); err == nil && m == "passkey" {
+		if c, err := r.Cookie(sessionCookie); err == nil && m != "token" {
 			if sess, err := s.Owner.ValidateSession(r.Context(), c.Value); err == nil {
 				out["expires_at"] = sess.ExpiresAt.UTC().Format(time.RFC3339)
 			}
@@ -401,6 +407,57 @@ func (s *Server) passkeyFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]any{"id": pk.ID, "name": pk.Name, "created_at": pk.CreatedAt.UTC().Format(time.RFC3339)})
+}
+
+// ── recovery (auth-service-4) ──────────────────────────────────────────────
+
+func (s *Server) recoveryStatus(w http.ResponseWriter, r *http.Request) {
+	st, err := s.Owner.RecoveryStatus(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := map[string]any{"total": st.Total, "remaining": st.Remaining}
+	if st.CreatedAt != nil {
+		out["created_at"] = st.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, 200, out)
+}
+
+// recoveryGenerate replaces the code set. The plain codes are in this
+// response and nowhere else.
+func (s *Server) recoveryGenerate(w http.ResponseWriter, r *http.Request) {
+	codes, err := s.Owner.GenerateRecoveryCodes(r.Context(), clientIP(r))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"codes": codes})
+}
+
+// recoverLogin opens a recovery session from a code. Public, rate limited.
+func (s *Server) recoverLogin(w http.ResponseWriter, r *http.Request) {
+	ipKey := "login:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, ipKey) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
+	var in struct{ Code string }
+	if !readJSON(w, r, &in) {
+		return
+	}
+	tok, exp, err := s.Owner.RecoverLogin(r.Context(), in.Code, clientIP(r))
+	if errors.Is(err, owner.ErrRecoveryInvalid) {
+		s.Limit.Fail(r.Context(), ratelimit.LoginIP, ipKey)
+		writeJSON(w, 401, map[string]string{"error": "recovery_code_rejected"})
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.SetCookie(w, s.cookie(tok, exp))
+	writeJSON(w, 200, map[string]any{"authenticated": true, "method": "recovery", "expires_at": exp.UTC().Format(time.RFC3339)})
 }
 
 // cookie builds the session cookie. Secure is dropped only for an http issuer

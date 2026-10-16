@@ -22,6 +22,7 @@ type Memory struct {
 	authz     map[string]AuthzRequest
 	codes     map[string]Code
 	refresh   map[string]RefreshToken
+	recovery  map[string]RecoveryCode
 	Audit     []AuditEvent
 }
 
@@ -42,6 +43,7 @@ func NewMemory() *Memory {
 		passkeys: map[string]Passkey{}, chals: map[string]challenge{}, sessions: map[string]Session{},
 		fails: map[string]failCounter{}, resources: map[string]string{}, clients: map[string]OAuthClient{},
 		authz: map[string]AuthzRequest{}, codes: map[string]Code{}, refresh: map[string]RefreshToken{},
+		recovery: map[string]RecoveryCode{},
 	}
 }
 
@@ -347,5 +349,38 @@ func (m *Memory) RevokeRefreshFamily(_ context.Context, family string) error {
 			delete(m.refresh, h)
 		}
 	}
+	return nil
+}
+
+func (m *Memory) ReplaceRecoveryCodes(_ context.Context, hashes []string, created time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recovery = map[string]RecoveryCode{}
+	for _, h := range hashes {
+		m.recovery[h] = RecoveryCode{Hash: h, CreatedAt: created}
+	}
+	return nil
+}
+
+func (m *Memory) ListRecoveryCodes(_ context.Context) ([]RecoveryCode, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]RecoveryCode, 0, len(m.recovery))
+	for _, c := range m.recovery {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Hash < out[j].Hash })
+	return out, nil
+}
+
+func (m *Memory) ConsumeRecoveryCode(_ context.Context, hash string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.recovery[hash]
+	if !ok || c.UsedAt != nil {
+		return ErrNotFound
+	}
+	c.UsedAt = &now
+	m.recovery[hash] = c
 	return nil
 }

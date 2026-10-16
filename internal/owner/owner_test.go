@@ -133,3 +133,60 @@ func TestSessions(t *testing.T) {
 		t.Fatalf("session survives logout: %v", err)
 	}
 }
+
+func TestRecoveryCodes(t *testing.T) {
+	o, mem := newOwner(t)
+	ctx := context.Background()
+	st, err := o.RecoveryStatus(ctx)
+	if err != nil || st.Total != 0 {
+		t.Fatalf("empty status: %+v %v", st, err)
+	}
+	codes, err := o.GenerateRecoveryCodes(ctx, "ip")
+	if err != nil || len(codes) != RecoveryCodeCount {
+		t.Fatalf("generate: %v %v", codes, err)
+	}
+	for _, c := range codes {
+		if len(c) != 19 || c[4] != '-' || strings.ToLower(c) != c {
+			t.Fatalf("code format: %q", c)
+		}
+	}
+	st, _ = o.RecoveryStatus(ctx)
+	if st.Total != 10 || st.Remaining != 10 || st.CreatedAt == nil {
+		t.Fatalf("status after generate: %+v", st)
+	}
+	// Typed with different case and spacing still works; once.
+	typed := strings.ToUpper(strings.ReplaceAll(codes[0], "-", " "))
+	tok, _, err := o.RecoverLogin(ctx, typed, "ip")
+	if err != nil || tok == "" {
+		t.Fatalf("recover: %v", err)
+	}
+	sess, err := o.ValidateSession(ctx, tok)
+	if err != nil || sess.Method != "recovery" {
+		t.Fatalf("recovery session: %+v %v", sess, err)
+	}
+	if _, _, err := o.RecoverLogin(ctx, codes[0], "ip"); !errors.Is(err, ErrRecoveryInvalid) {
+		t.Fatalf("code reuse: %v", err)
+	}
+	if _, _, err := o.RecoverLogin(ctx, "nope", "ip"); !errors.Is(err, ErrRecoveryInvalid) {
+		t.Fatalf("garbage code: %v", err)
+	}
+	st, _ = o.RecoveryStatus(ctx)
+	if st.Remaining != 9 {
+		t.Fatalf("remaining: %+v", st)
+	}
+	// A new set invalidates the old one.
+	fresh, _ := o.GenerateRecoveryCodes(ctx, "ip")
+	if _, _, err := o.RecoverLogin(ctx, codes[1], "ip"); !errors.Is(err, ErrRecoveryInvalid) {
+		t.Fatalf("old code after regenerate: %v", err)
+	}
+	if _, _, err := o.RecoverLogin(ctx, fresh[0], "ip"); err != nil {
+		t.Fatalf("fresh code: %v", err)
+	}
+	kinds := map[string]int{}
+	for _, e := range mem.Audit {
+		kinds[e.Kind]++
+	}
+	if kinds["recovery.generate"] != 2 || kinds["recovery.login"] != 2 || kinds["recovery.denied"] != 3 {
+		t.Fatalf("audit: %v", kinds)
+	}
+}

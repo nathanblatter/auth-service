@@ -229,13 +229,46 @@ func conformance(t *testing.T, s Store) {
 		t.Fatalf("family not revoked: %v", err)
 	}
 
+	// Recovery codes: replace wipes, consume is single use.
+	if err := s.ReplaceRecoveryCodes(ctx, []string{"rc1", "rc2"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConsumeRecoveryCode(ctx, "rc1", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConsumeRecoveryCode(ctx, "rc1", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("recovery code reuse: %v", err)
+	}
+	if err := s.ConsumeRecoveryCode(ctx, "ghost", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown recovery code: %v", err)
+	}
+	rcs, err := s.ListRecoveryCodes(ctx)
+	if err != nil || len(rcs) != 2 {
+		t.Fatalf("ListRecoveryCodes: %+v %v", rcs, err)
+	}
+	used := 0
+	for _, c := range rcs {
+		if c.UsedAt != nil {
+			used++
+		}
+	}
+	if used != 1 {
+		t.Fatalf("used count: %d", used)
+	}
+	if err := s.ReplaceRecoveryCodes(ctx, []string{"rc3"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if rcs, _ := s.ListRecoveryCodes(ctx); len(rcs) != 1 || rcs[0].Hash != "rc3" {
+		t.Fatalf("replace did not wipe: %+v", rcs)
+	}
+
 	// Sessions expire and can be deleted.
-	sess := Session{Hash: "h1", CreatedAt: now, ExpiresAt: now.Add(time.Hour), IP: "1.2.3.4"}
+	sess := Session{Hash: "h1", CreatedAt: now, ExpiresAt: now.Add(time.Hour), IP: "1.2.3.4", Method: "recovery"}
 	if err := s.PutSession(ctx, sess); err != nil {
 		t.Fatal(err)
 	}
 	gs, err := s.GetSession(ctx, "h1", now.Add(30*time.Minute))
-	if err != nil || gs.IP != "1.2.3.4" || !gs.ExpiresAt.Equal(sess.ExpiresAt) {
+	if err != nil || gs.IP != "1.2.3.4" || gs.Method != "recovery" || !gs.ExpiresAt.Equal(sess.ExpiresAt) {
 		t.Fatalf("GetSession: %+v %v", gs, err)
 	}
 	if _, err := s.GetSession(ctx, "h1", now.Add(2*time.Hour)); !errors.Is(err, ErrNotFound) {

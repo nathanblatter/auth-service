@@ -37,6 +37,7 @@ const (
 	pkCode      = "CODE#"
 	pkRefresh   = "REFRESH#"
 	gsiFamily   = "FAMILY#"
+	skRecovery  = "RECOVERY#"
 )
 
 // DynamoAPI is the slice of the DynamoDB client the store uses.
@@ -294,6 +295,7 @@ type expiringItem struct {
 	CreatedAt string `dynamodbav:"created_at,omitempty"`
 	ExpiresAt string `dynamodbav:"expires_at"`
 	IP        string `dynamodbav:"ip,omitempty"`
+	Method    string `dynamodbav:"method,omitempty"`
 	Data      []byte `dynamodbav:"data,omitempty"`
 	// TTL is the table's TTL attribute: DynamoDB deletes the row within ~48h
 	// of this epoch second. Expiry is still enforced in code.
@@ -402,7 +404,7 @@ func (d *Dynamo) ConsumeChallenge(ctx context.Context, id string, now time.Time)
 
 func (d *Dynamo) PutSession(ctx context.Context, s Session) error {
 	item, err := attributevalue.MarshalMap(expiringItem{
-		PK: pkSession + s.Hash, SK: skMeta, Type: "session", IP: s.IP,
+		PK: pkSession + s.Hash, SK: skMeta, Type: "session", IP: s.IP, Method: s.Method,
 		CreatedAt: s.CreatedAt.UTC().Format(time.RFC3339Nano),
 		ExpiresAt: s.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: s.ExpiresAt.Unix() + 60,
 	})
@@ -430,7 +432,7 @@ func (d *Dynamo) GetSession(ctx context.Context, hash string, now time.Time) (Se
 		return Session{}, ErrNotFound
 	}
 	created, _ := time.Parse(time.RFC3339Nano, it.CreatedAt)
-	return Session{Hash: hash, CreatedAt: created, ExpiresAt: exp, IP: it.IP}, nil
+	return Session{Hash: hash, CreatedAt: created, ExpiresAt: exp, IP: it.IP, Method: it.Method}, nil
 }
 
 func (d *Dynamo) DeleteSession(ctx context.Context, hash string) error {
@@ -800,4 +802,85 @@ func (d *Dynamo) RevokeRefreshFamily(ctx context.Context, family string) error {
 		}
 	}
 	return nil
+}
+
+// ── recovery codes ─────────────────────────────────────────────────────────
+
+type recoveryItem struct {
+	PK, SK    string
+	Type      string `dynamodbav:"type"`
+	CreatedAt string `dynamodbav:"created_at"`
+	UsedAt    string `dynamodbav:"used_at,omitempty"`
+}
+
+func (d *Dynamo) ReplaceRecoveryCodes(ctx context.Context, hashes []string, created time.Time) error {
+	old, err := d.ListRecoveryCodes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range old {
+		if _, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkOwner, skRecovery+c.Hash)}); err != nil {
+			return err
+		}
+	}
+	for _, h := range hashes {
+		item, err := attributevalue.MarshalMap(recoveryItem{PK: pkOwner, SK: skRecovery + h, Type: "recovery", CreatedAt: created.UTC().Format(time.RFC3339Nano)})
+		if err != nil {
+			return err
+		}
+		if _, err := d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *Dynamo) ListRecoveryCodes(ctx context.Context) ([]RecoveryCode, error) {
+	out, err := d.db.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &d.table,
+		KeyConditionExpression: aws.String("PK = :p AND begins_with(SK, :s)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: pkOwner},
+			":s": &types.AttributeValueMemberS{Value: skRecovery},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var items []recoveryItem
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &items); err != nil {
+		return nil, err
+	}
+	codes := make([]RecoveryCode, 0, len(items))
+	for _, it := range items {
+		t, err := time.Parse(time.RFC3339Nano, it.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("store: bad created_at on %s/%s: %w", it.PK, it.SK, err)
+		}
+		c := RecoveryCode{Hash: strings.TrimPrefix(it.SK, skRecovery), CreatedAt: t}
+		if it.UsedAt != "" {
+			u, err := time.Parse(time.RFC3339Nano, it.UsedAt)
+			if err != nil {
+				return nil, fmt.Errorf("store: bad used_at on %s/%s: %w", it.PK, it.SK, err)
+			}
+			c.UsedAt = &u
+		}
+		codes = append(codes, c)
+	}
+	return codes, nil
+}
+
+func (d *Dynamo) ConsumeRecoveryCode(ctx context.Context, hash string, now time.Time) error {
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &d.table,
+		Key:                       dynKey(pkOwner, skRecovery+hash),
+		UpdateExpression:          aws.String("SET used_at = :t"),
+		ConditionExpression:       aws.String("attribute_exists(PK) AND attribute_not_exists(used_at)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":t": &types.AttributeValueMemberS{Value: now.UTC().Format(time.RFC3339Nano)}},
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
 }

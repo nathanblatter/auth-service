@@ -67,6 +67,12 @@
       <p id="gate-intro">This console is protected by your passkey.</p>
       <button id="login" class="primary">Sign in with passkey</button>
     </div>
+    <details id="gate-recover" style="margin-top:10px"><summary>Lost your passkey? Use a recovery code</summary>
+      <div class="row" style="margin-top:8px">
+        <input id="recover-code" class="grow mono" autocomplete="off" placeholder="xxxx-xxxx-xxxx-xxxx">
+        <button id="recover">Sign in with recovery code</button>
+      </div>
+    </details>
     <div id="gate-setup" class="hidden">
       <p>No passkey is registered yet. Paste the bootstrap admin token to register this device as the first passkey.</p>
       <div class="row">
@@ -103,11 +109,19 @@
     </section>
 
     <section class="card">
+      <h2>Recovery codes</h2>
+      <p id="rc-status" class="muted"></p>
+      <div id="rc-codes" class="secret hidden"></div>
+      <div class="row"><button id="rc-generate">Generate new codes</button></div>
+      <p id="rc-msg" class="msg"></p>
+    </section>
+
+    <section class="card">
       <h2>Passkeys</h2>
       <div id="passkeys"></div>
       <div class="row" style="margin-top:10px">
         <input id="pk-name" class="grow" placeholder="Name for this device">
-        <button id="pk-add">Add passkey for this device</button>
+        <button id="pk-add">Add passkey for this device (backup)</button>
       </div>
       <p id="pk-msg" class="msg"></p>
     </section>
@@ -167,9 +181,11 @@
     $('logout').classList.toggle('hidden', !state.authenticated);
     $('gate-login').classList.toggle('hidden', state.setup_required);
     $('gate-setup').classList.toggle('hidden', !state.setup_required);
-    $('who').textContent = state.authenticated
-      ? (state.method === 'passkey' ? 'Signed in with passkey' + (state.expires_at ? ' · until ' + new Date(state.expires_at).toLocaleTimeString() : '') : 'Using bootstrap token')
-      : '';
+    const until = state.expires_at ? ' · until ' + new Date(state.expires_at).toLocaleTimeString() : '';
+    $('who').textContent = !state.authenticated ? ''
+      : state.method === 'passkey' ? 'Signed in with passkey' + until
+      : state.method === 'recovery' ? 'Recovery session (register a new passkey now)' + until
+      : 'Using bootstrap token';
     if (approveId) {
       // A connector is waiting. Approval needs a passkey session specifically.
       const canApprove = state.authenticated && state.method === 'passkey';
@@ -182,8 +198,41 @@
       if (canApprove) await loadApproval();
       return;
     }
-    if (state.authenticated) await Promise.all([loadServices(), loadPasskeys()]);
+    if (state.authenticated) await Promise.all([loadServices(), loadPasskeys(), loadRecovery()]);
   }
+
+  async function loadRecovery() {
+    const st = await api('GET', '/admin/recovery-codes');
+    $('rc-status').textContent = st.total
+      ? `${st.remaining} of ${st.total} codes unused · generated ${fmt(st.created_at)}. Each code signs you in once if every passkey is lost; a recovery session can register a new passkey but cannot approve connectors.`
+      : 'No recovery codes yet. Generate a set and keep it somewhere offline; without one, losing every passkey means a manual database fix.';
+  }
+
+  $('rc-generate').onclick = async () => {
+    const b = $('rc-generate');
+    if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Confirm: this replaces any existing codes'; setTimeout(() => { b.dataset.armed = ''; b.textContent = 'Generate new codes'; }, 5000); return; }
+    b.dataset.armed = ''; b.textContent = 'Generate new codes';
+    try {
+      const { codes } = await api('POST', '/admin/recovery-codes');
+      const el = $('rc-codes');
+      el.classList.remove('hidden');
+      el.innerHTML = '<div><b>Your recovery codes.</b> Shown once. Print them or put them in your password manager.</div><pre class="mono" style="margin:8px 0;white-space:pre-wrap"></pre><div class="row"><button class="small copy">Copy all</button><button class="small done">I have stored them</button></div>';
+      el.querySelector('pre').textContent = codes.join('\n');
+      el.querySelector('.copy').onclick = async (ev) => { await navigator.clipboard.writeText(codes.join('\n')); ev.target.textContent = 'Copied'; };
+      el.querySelector('.done').onclick = () => { el.classList.add('hidden'); el.innerHTML = ''; };
+      say('rc-msg', '');
+      await loadRecovery();
+    } catch (e) { say('rc-msg', e.message, 'err'); }
+  };
+
+  $('recover').onclick = async () => {
+    try {
+      await api('POST', '/admin/recover', { Code: $('recover-code').value });
+      $('recover-code').value = '';
+      say('gate-msg', '');
+      await refreshSession();
+    } catch (e) { say('gate-msg', e.message, 'err'); }
+  };
 
   async function loadApproval() {
     const body = $('approve-body');
