@@ -199,7 +199,7 @@ func conformance(t *testing.T, s Store) {
 	}
 
 	// End users: identity is unique per service; one method for life.
-	u1 := User{ID: "u1", ServiceID: "svc_a", Method: "google", Identity: "google:123", Email: "a@x.test", Name: "A", Roles: []string{"user"}, Status: "active", CreatedAt: now}
+	u1 := User{ID: "u1", ServiceID: "svc_a", Method: "google", Identity: "google:123", Email: "a@x.test", Name: "A", Roles: []string{"user"}, Status: "active", CreatedAt: now, EmailVerified: true}
 	if err := s.CreateUser(ctx, u1); err != nil {
 		t.Fatal(err)
 	}
@@ -212,8 +212,18 @@ func conformance(t *testing.T, s Store) {
 	if err := s.CreateUser(ctx, u2); err != nil {
 		t.Fatal(err)
 	}
-	if gu, err := s.GetUser(ctx, "svc_a", "u1"); err != nil || gu.Email != "a@x.test" || len(gu.Roles) != 1 || !gu.NotBefore.IsZero() {
+	if gu, err := s.GetUser(ctx, "svc_a", "u1"); err != nil || gu.Email != "a@x.test" || len(gu.Roles) != 1 || !gu.NotBefore.IsZero() || !gu.EmailVerified {
 		t.Fatalf("GetUser: %+v %v", gu, err)
+	}
+	if gu, _ := s.GetUser(ctx, "svc_a", "u2"); gu.EmailVerified {
+		t.Fatalf("u2 must start unverified: %+v", gu)
+	}
+	u2.EmailVerified = true
+	if err := s.UpdateUser(ctx, u2); err != nil {
+		t.Fatal(err)
+	}
+	if gu, _ := s.GetUser(ctx, "svc_a", "u2"); !gu.EmailVerified {
+		t.Fatalf("UpdateUser must persist email_verified: %+v", gu)
 	}
 	if _, err := s.GetUser(ctx, "svc_b", "u1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("user from another service: %v", err)

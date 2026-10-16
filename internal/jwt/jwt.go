@@ -27,9 +27,12 @@ type Claims struct {
 	Scope    string `json:"scope,omitempty"`
 	ClientID string `json:"client_id,omitempty"`
 	Email    string `json:"email,omitempty"`
-	IssuedAt int64  `json:"iat"`
-	Expires  int64  `json:"exp"`
-	ID       string `json:"jti"`
+	// EmailVerified is set on user tokens once the address is proven
+	// (Google asserted it, an email code was entered, or the owner vouched).
+	EmailVerified bool   `json:"email_verified,omitempty"`
+	IssuedAt      int64  `json:"iat"`
+	Expires       int64  `json:"exp"`
+	ID            string `json:"jti"`
 }
 
 type header struct {

@@ -481,14 +481,14 @@ func (s *Server) refresh(ctx context.Context, c store.OAuthClient, req TokenRequ
 
 func (s *Server) mint(ctx context.Context, clientID, serviceID, subject, scope, family, kind, ip string) (TokenResponse, error) {
 	now := s.Now()
-	email := ""
+	email, verified := "", false
 	if id, ok := strings.CutPrefix(subject, "usr:"); ok {
 		if user, err := s.Store.GetUser(ctx, serviceID, id); err == nil {
-			email = user.Email
+			email, verified = user.Email, user.EmailVerified
 		}
 	}
 	access, err := jwt.Sign(ctx, s.Core.Ring.Active(), jwt.Claims{
-		Issuer: s.Issuer, Subject: subject, Audience: serviceID, Scope: scope, ClientID: clientID, Email: email,
+		Issuer: s.Issuer, Subject: subject, Audience: serviceID, Scope: scope, ClientID: clientID, Email: email, EmailVerified: verified,
 		IssuedAt: now.Unix(), Expires: now.Add(AccessTTL).Unix(),
 	})
 	if err != nil {

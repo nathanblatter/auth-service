@@ -167,6 +167,24 @@ service row.
 linking: a user has exactly one login method for life. Customers of each product are separate
 pools. Each app renders its own screens (headless).
 
+**DECIDED (Nathan, 2026-10-16): email codes, Anthropic-style, in both roles.** (1) A third
+method `email`: the person types an address, we mail a 6-digit code, the right code signs them
+in (and, on an open pool, creates the account; the code is the proof of address). Identity
+`emailcode:<addr>`, deliberately distinct from a passkey account's `email:<addr>` so the
+one-method-for-life rule holds. (2) Verification for passkey sign-ups: an app-created passkey
+account starts `email_verified=false` and cannot sign in until a verification code is entered.
+Google asserts the address, an email code proves it, the owner vouches for provisioned
+accounts. Tokens carry `email_verified`. Codes live in `CHALLENGE#` rows as a salted SHA-256
+(challenge id + code), 10 minutes, 5 attempts (a wrong guess re-puts the row with the same
+expiry), single use. Sends are rate-limited per address and per IP.
+
+**Delivery (auth-service-8): an SQS outbox and a bridge, never SMTP from the Lambda.** The API
+enqueues `{to, subject, text}` on `MailQueue`; email-api's `sqs-bridge` on the Mac mini drains
+it over a scoped IAM user (receive/delete on that one queue) and calls email-api's own keyed
+`/send`, so every message still leaves through email-api with `actor=auth-service`. Rejected:
+Lambda → Brevo direct (bypasses email-api's vision) and a public keyed `/send` on
+email.nathanblatter.com (new public write surface). A DLQ alarm catches undeliverable codes.
+
 ### Shape
 
 A service is **owner-only** (no `login_url`; connectors are approved by Nathan in the console,
@@ -202,7 +220,11 @@ same email is a stranger.
      authorization and redirect the browser to the app's `redirect_uri` with `code`.
    - **Sign-up with a passkey:** `POST /v1/users` creates a user (method `passkey`,
      `email`, `name`), then `POST /v1/users/{id}/passkeys/begin` + `/finish` registers the
-     credential (service token). Passkey users must register before they can log in.
+     credential (service token), and `POST /v1/users/{id}/email/verify/begin` + `/finish`
+     proves the address. Passkey users must register and verify before they can log in.
+   - **Email code:** app backend calls `POST /v1/login/email/begin` `{login_challenge, email}`
+     (a code is mailed), then `POST /v1/login/email/finish?challenge=` `{code}` →
+     `{redirect_to}`, exactly like the passkey finish.
 4. App exchanges the code at `/oauth/token`; refresh as usual.
 
 WebAuthn is bound to the **app's** origin, not ours: each user-pool service declares `rp_id`

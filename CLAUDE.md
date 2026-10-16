@@ -17,7 +17,8 @@ don't invent new ones, log proposals in flightdeck (project slug `auth-service`)
   (Store interface: DynamoDB + in-memory) · `internal/signer` (Signer: KMS + local ECDSA) ·
   `internal/jwt` (ES256 compact JWS, JWKS) · `internal/owner` (owner passkeys + console sessions,
   go-webauthn) · `internal/oauth` (connector + first-party OAuth 2.1) · `internal/users` (end
-  users: per-service WebAuthn, Google provider) · `internal/ratelimit` · `internal/config`.
+  users: per-service WebAuthn, Google provider, email codes) · `internal/mailqueue` (SQS outbox)
+  · `internal/ratelimit` · `internal/config`.
 - `client/` is a separate, stdlib-only Go module (the SDK consumers import). Keep it
   dependency-free; `make check` and CI run its tests too.
 - Infra: `infra/template.yaml` (the whole stack) · `infra/bootstrap/github-oidc.yaml`
@@ -42,6 +43,11 @@ Custom domain: repo vars `AUTH_DOMAIN_NAME` + `AUTH_CERTIFICATE_ARN`; empty = ex
   client secret sits in SSM `/auth-service/prod/google-client-secret` (SecureString). The
   Lambda logs and keeps running without it. Redirect URI to register at Google:
   `https://auth.nathanblatter.com/v1/login/google/callback`.
+- Email codes and verification are off until `AUTH_MAIL_QUEUE_URL` is set (the template sets
+  it to `MailQueue`). The Lambda only enqueues; email-api's `sqs-bridge` on the Mac mini
+  (repo `~/dev/email-api`, compose service `bridge`) drains the queue with the `MailBridgeUser`
+  access key and calls email-api's keyed `/send`. If codes stop arriving, check the bridge
+  container and the `auth-service-prod-mail-dlq` alarm before suspecting this repo.
 - `/admin/*` accepts a passkey session cookie (1h, `internal/owner`) or the interim bearer
   token (break-glass until auth-service-4; also bootstraps the first passkey). Passkeys bind
   to the issuer host, so they only work on auth.nathanblatter.com or localhost, never on the

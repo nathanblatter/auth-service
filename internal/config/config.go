@@ -30,6 +30,9 @@ type Config struct {
 	// GoogleClientSecret (dev) or GoogleClientSecretParam (SSM, prod).
 	GoogleClientSecret      string
 	GoogleClientSecretParam string
+	// MailQueueURL is the SQS outbox the email-api bridge drains; empty
+	// disables every email feature (codes, verification).
+	MailQueueURL string
 	// Port for the local HTTP listener.
 	Port string
 	// Version is the build id baked in by the Makefile.
@@ -48,6 +51,7 @@ func FromEnv(version string) (Config, error) {
 		GoogleClientID:          os.Getenv("AUTH_GOOGLE_CLIENT_ID"),
 		GoogleClientSecret:      os.Getenv("AUTH_GOOGLE_CLIENT_SECRET"),
 		GoogleClientSecretParam: os.Getenv("AUTH_GOOGLE_CLIENT_SECRET_PARAM"),
+		MailQueueURL:            os.Getenv("AUTH_MAIL_QUEUE_URL"),
 		Port:                    os.Getenv("PORT"),
 		Version:                 version,
 	}

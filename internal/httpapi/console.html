@@ -413,10 +413,10 @@
         <div class="row" style="margin-top:8px"><input class="grow login-url" placeholder="login URL the app hosts, e.g. https://finforge.nathanblatter.com/login"></div>
         <div class="row" style="margin-top:6px"><input class="grow mono login-rp" placeholder="rp_id, e.g. finforge.nathanblatter.com"><input class="grow mono login-origins" placeholder="origins, space separated: https://finforge.nathanblatter.com"></div>
         <div class="row" style="margin-top:6px"><input class="grow mono login-roles" placeholder="default roles for new users: user"><button class="small login-save">Save user pool</button></div>
-        <label class="row muted" style="font-size:13px;margin-top:6px;gap:6px;align-items:center"><input type="checkbox" class="login-open"> Open to the public: anyone can sign up (Google, or the app's sign-up form). Off = invite-only, you add every account below.</label>
+        <label class="row muted" style="font-size:13px;margin-top:6px;gap:6px;align-items:center"><input type="checkbox" class="login-open"> Open to the public: anyone can sign up (Google, an email code, or the app's sign-up form). Off = invite-only, you add every account below.</label>
         <p class="muted" style="font-size:13px;margin:6px 0 0">Leave the login URL empty for an owner-only service (connectors approved by you). With a login URL, the app's own page signs users in with passkeys or Google.</p>
         <div class="users"></div>
-        <div class="row user-add${svc.login_url ? '' : ' hidden'}" style="margin-top:8px"><input class="grow user-email" placeholder="email"><input class="grow user-name" placeholder="name (optional)"><select class="user-method"><option value="passkey">passkey</option><option value="google">google</option></select><button class="small user-create">Add account</button></div>
+        <div class="row user-add${svc.login_url ? '' : ' hidden'}" style="margin-top:8px"><input class="grow user-email" placeholder="email"><input class="grow user-name" placeholder="name (optional)"><select class="user-method"><option value="passkey">passkey</option><option value="google">google</option><option value="email">email code</option></select><button class="small user-create">Add account</button></div>
       </details>
       <details><summary>${(svc.resources || []).length} connector resource${(svc.resources || []).length === 1 ? '' : 's'}</summary>
         <div class="resources"></div>

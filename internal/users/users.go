@@ -1,5 +1,5 @@
 // Package users is slice 3: end users of a product. A user belongs to one
-// service, has exactly one login method for life (passkey or Google), and
+// service, has exactly one login method for life (passkey, Google or email code), and
 // signs in through the product's own screens; this package owns the
 // ceremonies and the account records.
 package users
@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
@@ -30,6 +31,12 @@ import (
 const (
 	MethodPasskey = "passkey"
 	MethodGoogle  = "google"
+	MethodEmail   = "email"
+
+	// CodeTTL is how long a sign-in / verification code stays valid.
+	CodeTTL = 10 * time.Minute
+	// CodeAttempts is how many wrong guesses one code survives.
+	CodeAttempts = 5
 
 	// ChallengeTTL bounds a WebAuthn ceremony.
 	ChallengeTTL = 5 * time.Minute
@@ -48,13 +55,23 @@ var (
 	ErrEmailUnverified = errors.New("users: provider did not verify the email")
 	ErrInvalidRole     = errors.New("users: role is not defined on the service")
 	ErrSignupClosed    = errors.New("users: sign-up is closed; accounts are created by the owner")
+	ErrEmailDisabled   = errors.New("users: email is not configured on this server")
+	ErrCodeRejected    = errors.New("users: wrong code")
+	ErrAlreadyVerified = errors.New("users: email already verified")
 )
+
+// Mailer delivers one plain-text message. nil on Users disables every email feature.
+type Mailer interface {
+	Send(ctx context.Context, to, subject, text string) error
+}
 
 // Users wires the store with per-service WebAuthn instances.
 type Users struct {
 	Store store.Store
 	Now   func() time.Time
 	Log   *slog.Logger
+	// Mail sends sign-in and verification codes; nil = email features off.
+	Mail Mailer
 
 	mu sync.Mutex
 	wa map[string]*webauthn.WebAuthn // keyed by service id + config fingerprint
@@ -103,7 +120,8 @@ func (u *Users) Create(ctx context.Context, svc store.Service, email, name strin
 		u.audit(ctx, "user.signup_denied", svc.ID, "", "method=passkey email="+strings.ToLower(strings.TrimSpace(email)), "")
 		return store.User{}, ErrSignupClosed
 	}
-	return u.newUser(ctx, svc, MethodPasskey, email, name, "user.create")
+	// The app only told us the address; the person proves it with a code.
+	return u.newUser(ctx, svc, MethodPasskey, email, name, false, "user.create")
 }
 
 // Provision is the owner's path: it creates an account whatever the pool's
@@ -113,24 +131,29 @@ func (u *Users) Provision(ctx context.Context, svc store.Service, method, email,
 	if svc.LoginURL == "" {
 		return store.User{}, ErrNotUserPool
 	}
-	if method != MethodPasskey && method != MethodGoogle {
+	if method != MethodPasskey && method != MethodGoogle && method != MethodEmail {
 		return store.User{}, ErrInvalidMethod
 	}
-	return u.newUser(ctx, svc, method, email, name, "user.provision")
+	// The owner vouches for the address.
+	return u.newUser(ctx, svc, method, email, name, true, "user.provision")
 }
 
-func (u *Users) newUser(ctx context.Context, svc store.Service, method, email, name, auditKind string) (store.User, error) {
+func (u *Users) newUser(ctx context.Context, svc store.Service, method, email, name string, verified bool, auditKind string) (store.User, error) {
 	email, err := normalizeEmail(email)
 	if err != nil {
 		return store.User{}, err
 	}
 	identity := "email:" + email
-	if method == MethodGoogle {
+	switch method {
+	case MethodGoogle:
 		identity = pendingGoogle + email
+	case MethodEmail:
+		identity = emailCode + email
 	}
 	user := store.User{
 		ID: "usr_" + randomBase32(16), ServiceID: svc.ID, Method: method, Identity: identity,
 		Email: email, Name: strings.TrimSpace(name), Roles: append([]string(nil), svc.DefaultRoles...), Status: "active", CreatedAt: u.Now(),
+		EmailVerified: verified,
 	}
 	if err := u.Store.CreateUser(ctx, user); err != nil {
 		if errors.Is(err, store.ErrConflict) {
@@ -458,6 +481,9 @@ func (u *Users) FinishLoginPasskey(ctx context.Context, svc store.Service, chall
 		u.audit(ctx, "user.login_denied", svc.ID, matched.ID, "disabled", ip)
 		return store.User{}, "", ErrDisabled
 	}
+	if err := u.loginAllowed(ctx, svc, matched, "passkey", ip); err != nil {
+		return store.User{}, "", err
+	}
 	data, err := json.Marshal(cred)
 	if err != nil {
 		return store.User{}, "", err
@@ -520,6 +546,7 @@ func (u *Users) LoginGoogle(ctx context.Context, svc store.Service, g GoogleIden
 		user = store.User{
 			ID: "usr_" + randomBase32(16), ServiceID: svc.ID, Method: MethodGoogle, Identity: identity,
 			Email: email, Name: strings.TrimSpace(g.Name), Roles: append([]string(nil), svc.DefaultRoles...), Status: "active", CreatedAt: u.Now(),
+			EmailVerified: true, // Google asserted email_verified
 		}
 		if err := u.Store.CreateUser(ctx, user); err != nil {
 			if errors.Is(err, store.ErrConflict) {
@@ -543,6 +570,193 @@ func (u *Users) finishGoogle(ctx context.Context, svc store.Service, user store.
 	return user, nil
 }
 
+// ── email codes ────────────────────────────────────────────────────────────
+
+// emailCode prefixes the identity of an email-code account. It is distinct
+// from a passkey account's "email:" lock on purpose: one method for life, no
+// linking (DECIDED), so the same address may own one account per method.
+const emailCode = "emailcode:"
+
+// loginAllowed is the last gate before a sign-in succeeds: the address must
+// be proven. Google, email-code and owner-provisioned accounts are born
+// verified; app-created passkey accounts verify with a code first.
+func (u *Users) loginAllowed(ctx context.Context, svc store.Service, user store.User, how, ip string) error {
+	if !user.EmailVerified {
+		u.audit(ctx, "user.login_denied", svc.ID, user.ID, how+" email_unverified", ip)
+		return ErrEmailUnverified
+	}
+	return nil
+}
+
+// BeginLoginEmail emails a sign-in code for a parked authorization. The
+// account need not exist yet on an open pool; on a closed pool it must.
+func (u *Users) BeginLoginEmail(ctx context.Context, svc store.Service, authzID, email, ip string) (string, error) {
+	if svc.LoginURL == "" {
+		return "", ErrNotUserPool
+	}
+	if u.Mail == nil {
+		return "", ErrEmailDisabled
+	}
+	email, err := normalizeEmail(email)
+	if err != nil {
+		return "", err
+	}
+	user, err := u.Store.GetUserByIdentity(ctx, svc.ID, emailCode+email)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		if !svc.OpenSignup {
+			u.audit(ctx, "user.signup_denied", svc.ID, "", "method=email email="+email, ip)
+			return "", ErrSignupClosed
+		}
+	case err != nil:
+		return "", err
+	case user.Status != "active":
+		u.audit(ctx, "user.login_denied", svc.ID, user.ID, "disabled", ip)
+		return "", ErrDisabled
+	}
+	chID, err := u.sendCode(ctx, svc, challengeData{Kind: "login_email", ServiceID: svc.ID, AuthzID: authzID, Email: email, UserID: user.ID},
+		fmt.Sprintf("Your %s sign-in code", svc.Name),
+		fmt.Sprintf("Enter this code to sign in to %s:\n\n    %%s\n\nIt expires in %d minutes. If you didn't request it, ignore this email.", svc.Name, int(CodeTTL.Minutes())))
+	if err != nil {
+		return "", err
+	}
+	u.audit(ctx, "user.email_code.sent", svc.ID, user.ID, "login email="+email, ip)
+	return chID, nil
+}
+
+// FinishLoginEmail checks the code. On success the account is created if it
+// does not exist yet (the code proved the address), and the parked
+// authorization id is returned so the caller can complete it.
+func (u *Users) FinishLoginEmail(ctx context.Context, svc store.Service, challengeID, code, ip string) (store.User, string, error) {
+	ch, err := u.checkCode(ctx, svc, challengeID, "login_email", code)
+	if err != nil {
+		return store.User{}, "", err
+	}
+	user, err := u.Store.GetUserByIdentity(ctx, svc.ID, emailCode+ch.Email)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		if !svc.OpenSignup {
+			// The pool closed between begin and finish.
+			u.audit(ctx, "user.signup_denied", svc.ID, "", "method=email email="+ch.Email, ip)
+			return store.User{}, "", ErrSignupClosed
+		}
+		user, err = u.newUser(ctx, svc, MethodEmail, ch.Email, "", true, "user.create")
+		if err != nil {
+			return store.User{}, "", err
+		}
+	case err != nil:
+		return store.User{}, "", err
+	}
+	if user.Status != "active" {
+		u.audit(ctx, "user.login_denied", svc.ID, user.ID, "disabled", ip)
+		return store.User{}, "", ErrDisabled
+	}
+	u.audit(ctx, "user.login", svc.ID, user.ID, "email", ip)
+	return user, ch.AuthzID, nil
+}
+
+// BeginVerifyEmail emails a verification code to an unverified account
+// (an app-created passkey sign-up).
+func (u *Users) BeginVerifyEmail(ctx context.Context, svc store.Service, userID, ip string) (string, error) {
+	if u.Mail == nil {
+		return "", ErrEmailDisabled
+	}
+	user, err := u.Get(ctx, svc.ID, userID)
+	if err != nil {
+		return "", err
+	}
+	if user.EmailVerified {
+		return "", ErrAlreadyVerified
+	}
+	chID, err := u.sendCode(ctx, svc, challengeData{Kind: "verify_email", ServiceID: svc.ID, UserID: user.ID, Email: user.Email},
+		fmt.Sprintf("Verify your email for %s", svc.Name),
+		fmt.Sprintf("Enter this code to verify your email address for %s:\n\n    %%s\n\nIt expires in %d minutes. If you didn't request it, ignore this email.", svc.Name, int(CodeTTL.Minutes())))
+	if err != nil {
+		return "", err
+	}
+	u.audit(ctx, "user.email_code.sent", svc.ID, user.ID, "verify email="+user.Email, ip)
+	return chID, nil
+}
+
+// FinishVerifyEmail checks the code and marks the account verified.
+func (u *Users) FinishVerifyEmail(ctx context.Context, svc store.Service, userID, challengeID, code, ip string) (store.User, error) {
+	ch, err := u.checkCode(ctx, svc, challengeID, "verify_email", code)
+	if err != nil {
+		return store.User{}, err
+	}
+	if ch.UserID != userID {
+		return store.User{}, ErrCeremony
+	}
+	user, err := u.Get(ctx, svc.ID, userID)
+	if err != nil {
+		return store.User{}, err
+	}
+	user.EmailVerified = true
+	if err := u.Store.UpdateUser(ctx, user); err != nil {
+		return store.User{}, err
+	}
+	u.audit(ctx, "user.email.verified", svc.ID, user.ID, "", ip)
+	return user, nil
+}
+
+// sendCode mints a 6-digit code, stores its hash in a challenge row and mails
+// it. bodyFmt has one %s for the code.
+func (u *Users) sendCode(ctx context.Context, svc store.Service, c challengeData, subject, bodyFmt string) (string, error) {
+	code := randomDigits(6)
+	id := "u" + randomToken()
+	c.CodeHash = hashCode(id, code)
+	c.Expires = u.Now().Add(CodeTTL)
+	if err := u.putChallenge(ctx, id, c, c.Expires); err != nil {
+		return "", err
+	}
+	if err := u.Mail.Send(ctx, c.Email, subject, fmt.Sprintf(bodyFmt, code)); err != nil {
+		u.Log.Error("code email failed", "service", svc.Slug, "err", err)
+		return "", err
+	}
+	return id, nil
+}
+
+// checkCode consumes the challenge and compares. A wrong guess puts the row
+// back with attempts+1 and the original expiry, until CodeAttempts is spent.
+func (u *Users) checkCode(ctx context.Context, svc store.Service, challengeID, kind, code string) (challengeData, error) {
+	ch, err := u.loadChallenge(ctx, challengeID)
+	if err != nil || ch.Kind != kind || ch.ServiceID != svc.ID {
+		return challengeData{}, ErrCeremony
+	}
+	if subtle.ConstantTimeCompare([]byte(hashCode(challengeID, strings.TrimSpace(code))), []byte(ch.CodeHash)) == 1 {
+		return ch, nil
+	}
+	ch.Attempts++
+	if ch.Attempts < CodeAttempts {
+		if err := u.putChallenge(ctx, challengeID, ch, ch.Expires); err != nil {
+			return challengeData{}, err
+		}
+		return challengeData{}, ErrCodeRejected
+	}
+	u.audit(ctx, "user.login_denied", svc.ID, ch.UserID, kind+" code attempts exhausted email="+ch.Email, "")
+	return challengeData{}, ErrCeremony
+}
+
+func hashCode(challengeID, code string) string {
+	sum := sha256.Sum256([]byte(challengeID + ":" + code))
+	return b64(sum[:])
+}
+
+// randomDigits returns n uniformly random decimal digits.
+func randomDigits(n int) string {
+	var out strings.Builder
+	for out.Len() < n {
+		var b [1]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			panic(fmt.Sprintf("users: crypto/rand failed: %v", err))
+		}
+		if b[0] < 250 { // 250 = 25*10, so each digit is equally likely
+			out.WriteByte('0' + b[0]%10)
+		}
+	}
+	return out.String()
+}
+
 // ── challenges ─────────────────────────────────────────────────────────────
 
 type challengeData struct {
@@ -551,15 +765,27 @@ type challengeData struct {
 	UserID    string                `json:"user_id,omitempty"`
 	AuthzID   string                `json:"authz_id,omitempty"`
 	Nonce     string                `json:"nonce,omitempty"`
+	// Email codes: what the code is for, who it went to, its hash, how many
+	// wrong guesses so far, and when the row dies (kept so a re-put after a
+	// wrong guess does not extend the life of the code).
+	Kind     string    `json:"kind,omitempty"` // login_email | verify_email
+	Email    string    `json:"email,omitempty"`
+	CodeHash string    `json:"code_hash,omitempty"`
+	Attempts int       `json:"attempts,omitempty"`
+	Expires  time.Time `json:"expires,omitempty"`
 }
 
 func (u *Users) saveChallenge(ctx context.Context, c challengeData) (string, error) {
+	id := "u" + randomToken()
+	return id, u.putChallenge(ctx, id, c, u.Now().Add(ChallengeTTL))
+}
+
+func (u *Users) putChallenge(ctx context.Context, id string, c challengeData, expires time.Time) error {
 	data, err := json.Marshal(c)
 	if err != nil {
-		return "", err
+		return err
 	}
-	id := "u" + randomToken()
-	return id, u.Store.PutChallenge(ctx, id, data, u.Now().Add(ChallengeTTL))
+	return u.Store.PutChallenge(ctx, id, data, expires)
 }
 
 func (u *Users) loadChallenge(ctx context.Context, id string) (challengeData, error) {

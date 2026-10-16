@@ -119,6 +119,38 @@ Resources:
       QueueName: !Sub ${AWS::StackName}-jobs-dlq
       MessageRetentionPeriod: 1209600
 
+  # ── mail outbox ──────────────────────────────────────────────────────────
+  # The API drops {to, subject, text} here; email-api's sqs-bridge on the Mac
+  # mini drains it (long poll) and calls its own keyed /send. The Lambda never
+  # reaches the Tailscale-only email-api directly. See docs/DESIGN.md.
+  MailQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-mail
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400 # a code is useless after 10 min; a day covers a bridge outage
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt MailDeadLetterQueue.Arn
+        maxReceiveCount: 5
+  MailDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-mail-dlq
+      MessageRetentionPeriod: 1209600
+  # Identity for the bridge. It may only receive/delete on MailQueue; its
+  # access key is created once by hand and lives in ~/deploy/email-api/.env.
+  MailBridgeUser:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: drain-mail-queue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !GetAtt MailQueue.Arn
+
   # ── API ──────────────────────────────────────────────────────────────────
   HttpApi:
     Type: AWS::Serverless::HttpApi
@@ -171,6 +203,7 @@ Resources:
           AUTH_ADMIN_TOKEN_HASH_PARAM: !Ref AdminTokenHashParam
           AUTH_GOOGLE_CLIENT_ID: !Ref GoogleClientID
           AUTH_GOOGLE_CLIENT_SECRET_PARAM: !Ref GoogleClientSecretParam
+          AUTH_MAIL_QUEUE_URL: !Ref MailQueue
       Events:
         Root:
           Type: HttpApi
@@ -189,6 +222,8 @@ Resources:
             TableName: !Ref Table
         - SQSSendMessagePolicy:
             QueueName: !GetAtt JobQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt MailQueue.QueueName
         - Statement:
             - Effect: Allow
               Action: [kms:Sign, kms:GetPublicKey]
@@ -260,6 +295,21 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+  MailDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-mail-dlq
+      AlarmDescription: sign-in / verification emails the bridge could not deliver
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt MailDeadLetterQueue.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
 
 Outputs:
   ApiUrl:
@@ -275,3 +325,9 @@ Outputs:
     Value: !Ref Table
   JobQueueUrl:
     Value: !Ref JobQueue
+  MailQueueUrl:
+    Description: SQS_QUEUE_URL for email-api's sqs-bridge
+    Value: !Ref MailQueue
+  MailBridgeUserName:
+    Description: IAM user whose access key the bridge uses (create the key by hand)
+    Value: !Ref MailBridgeUser

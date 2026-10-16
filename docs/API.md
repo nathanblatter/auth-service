@@ -148,8 +148,19 @@ The Go client does all of this: `client.NewVerifier(issuer, serviceID)` + `clien
 
 A **user-pool** service (one with a `login_url`) has its own users. All `/v1/users*` and
 `/v1/login/passkey/*` calls need the service's **service token**; users are always scoped to
-the calling service. A user has one method for life: `passkey` (created via `POST /v1/users`)
-or `google` (created on first Google sign-in).
+the calling service. A user has one method for life: `passkey` (created via `POST /v1/users`),
+`google` (created on first Google sign-in) or `email` (a 6-digit code mailed on each sign-in,
+account created on the first correct code). No linking: the same address may own one account
+per method.
+
+**Email verification.** `user.email_verified` is true for Google, email-code and
+owner-provisioned accounts. An app-created passkey account starts `false` and **cannot sign
+in** (`403 email_unverified` from passkey finish) until the person enters the code from
+`POST /v1/users/{id}/email/verify/begin`. User tokens carry `email_verified`.
+
+Email endpoints answer `404 email_disabled` on a server without a mail outbox
+(`AUTH_MAIL_QUEUE_URL`). Codes: 6 digits, 10 minutes, 5 attempts, single use; sends are capped
+at 5 per address and 20 per IP per 15 minutes (`429`).
 
 **Who may create accounts** is the service's `open_signup` flag (default `false`):
 
@@ -175,11 +186,15 @@ refusals are audited as `user.signup_denied`.
 | POST | `/v1/users/{id}/passkeys/begin` | `{"challenge_id","options"}` WebAuthn creation options bound to the service's `rp_id`/`origins` |
 | POST | `/v1/users/{id}/passkeys/finish?challenge=&name=` | body: the browser's credential JSON → `201` |
 | POST | `/v1/login/passkey/begin` | `{"login_challenge"}` → `{"challenge_id","options"}` (usernameless) |
-| POST | `/v1/login/passkey/finish?challenge=` | body: credential JSON → `{"redirect_to","user"}`; send the browser to `redirect_to` |
+| POST | `/v1/login/passkey/finish?challenge=` | body: credential JSON → `{"redirect_to","user"}`; send the browser to `redirect_to`. `403 email_unverified` until the account verified its email |
+| POST | `/v1/login/email/begin` | `{"login_challenge","email"}` → `{"challenge_id","expires_in":600}`; a code is mailed. `403 signup_closed` for an unknown address on an invite-only pool, `403 account_disabled`, `429` |
+| POST | `/v1/login/email/finish?challenge=` | `{"code":"123456"}` → `{"redirect_to","user"}`. `401 code_rejected` (wrong, expired, used, or out of attempts: request a new one) |
+| POST | `/v1/users/{id}/email/verify/begin` | → `{"challenge_id","expires_in"}`; mails a verification code. `409 already_verified` |
+| POST | `/v1/users/{id}/email/verify/finish?challenge=` | `{"code"}` → `200 user` with `email_verified: true`. `401 code_rejected` |
 | GET | `/v1/login/google/start?login_challenge=` | browser endpoint, no auth; `302` to Google (404 `google_disabled` when not configured) |
 | GET | `/v1/login/google/callback` | Google returns here; `302` to the app's `redirect_uri` with `code`, or back to `login_url?login_challenge=&error=` |
 
-`user` = `{"id":"usr_…","service_id","method","email","name","roles":[…],"status","created_at"}`.
+`user` = `{"id":"usr_…","service_id","method","email","email_verified","name","roles":[…],"status","created_at"}`.
 
 **Login flow:** the app sends the browser to `/oauth/authorize` (its own client, PKCE,
 `resource`); because the service has a `login_url` the browser lands on
@@ -222,7 +237,7 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | GET | `/admin/services/{id}` | `service` |
 | POST | `/admin/services/{id}/resources` | `{"resource":"https://finforge.nathanblatter.com/mcp"}` → `200 service`. Absolute https URL, unique across services |
 | PUT | `/admin/services/{id}/login` | `{"login_url","rp_id","origins":[…],"default_roles":[…],"open_signup":false}` → `200 service`. Empty `login_url` = owner-only (and `open_signup` is forced off). `rp_id` must be a registrable suffix of every origin; default roles must exist |
-| POST | `/admin/services/{id}/users` | `{"email","name"?,"method":"passkey|google"}` (default `passkey`) → `201 user`, whatever `open_signup` says. `409 identity_taken`, `409 service_not_configured` on an owner-only service |
+| POST | `/admin/services/{id}/users` | `{"email","name"?,"method":"passkey|google|email"}` (default `passkey`) → `201 user` (born `email_verified`), whatever `open_signup` says. `409 identity_taken`, `409 service_not_configured` on an owner-only service |
 | GET | `/admin/services/{id}/users?limit=50&cursor=` | `{"users":[user],"next"}` |
 | PUT | `/admin/services/{id}/permissions` | `{"scopes":["read","write"],"roles":{"admin":["read","write"],"viewer":["read"]}}` → `200 service`. Scopes `^[a-z][a-z0-9:._-]{0,39}$` (≤50); role names `^[a-z][a-z0-9-]{0,39}$` (≤20) bundling catalog scopes only. Replaces the whole catalog |
 | POST | `/admin/services/{id}/credentials` | **fresh**. `201 {"credential":"nbk_…", "id","service_id","last4","created_at","revoked":false}` |
@@ -244,7 +259,7 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | GET | `/admin/audit?month=YYYY-MM&limit=50&cursor=` | `{"month","events":[{"at","kind","actor","service_id","detail","ip"}],"next"}` newest first; pass `next` back as `cursor` |
 
 Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `service.login.set`,
-`user.create`, `user.provision`, `user.signup_denied`, `user.google.bind`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
+`user.create`, `user.provision`, `user.signup_denied`, `user.google.bind`, `user.email_code.sent`, `user.email.verified`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
 `user.passkey.register`, `user.export`, `user.delete`, `credential.mint`, `credential.revoke`,
 `token.issue`, `token.denied`, `passkey.register`, `owner.login`, `owner.login_denied`,
 `owner.stepup`, `owner.stepup_denied`, `owner.logout_everywhere`, `recovery.generate`,

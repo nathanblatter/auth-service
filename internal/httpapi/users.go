@@ -32,6 +32,10 @@ func (s *Server) userRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/users/{id}/passkeys/finish", s.requireService(s.userPasskeyFinish))
 	mux.HandleFunc("POST /v1/login/passkey/begin", s.requireService(s.loginPasskeyBegin))
 	mux.HandleFunc("POST /v1/login/passkey/finish", s.requireService(s.loginPasskeyFinish))
+	mux.HandleFunc("POST /v1/login/email/begin", s.requireService(s.loginEmailBegin))
+	mux.HandleFunc("POST /v1/login/email/finish", s.requireService(s.loginEmailFinish))
+	mux.HandleFunc("POST /v1/users/{id}/email/verify/begin", s.requireService(s.userVerifyEmailBegin))
+	mux.HandleFunc("POST /v1/users/{id}/email/verify/finish", s.requireService(s.userVerifyEmailFinish))
 	mux.HandleFunc("GET /v1/login/google/start", s.googleStart)
 	mux.HandleFunc("GET /v1/login/google/callback", s.googleCallback)
 	mux.HandleFunc("PUT /admin/services/{id}/login", s.requireAdmin(s.setLogin))
@@ -65,6 +69,14 @@ func (s *Server) userFail(w http.ResponseWriter, err error) bool {
 		writeJSON(w, 400, map[string]string{"error": "invalid_request", "detail": err.Error()})
 	case errors.Is(err, users.ErrSignupClosed):
 		writeJSON(w, 403, map[string]string{"error": "signup_closed", "detail": "this service does not accept sign-ups; the owner creates accounts"})
+	case errors.Is(err, users.ErrEmailDisabled):
+		writeJSON(w, 404, map[string]string{"error": "email_disabled", "detail": "this server has no mail outbox configured"})
+	case errors.Is(err, users.ErrAlreadyVerified):
+		writeJSON(w, 409, map[string]string{"error": "already_verified"})
+	case errors.Is(err, users.ErrCodeRejected):
+		writeJSON(w, 401, map[string]string{"error": "code_rejected", "detail": "wrong code; try again"})
+	case errors.Is(err, users.ErrCeremony):
+		writeJSON(w, 401, map[string]string{"error": "code_rejected", "detail": "code expired, already used or out of attempts; request a new one"})
 	case errors.Is(err, users.ErrDisabled):
 		writeJSON(w, 403, map[string]string{"error": "account_disabled"})
 	case errors.Is(err, users.ErrEmailUnverified):
@@ -80,7 +92,7 @@ func userJSON(u store.User) map[string]any {
 	if roles == nil {
 		roles = []string{}
 	}
-	out := map[string]any{"id": u.ID, "service_id": u.ServiceID, "method": u.Method, "email": u.Email, "name": u.Name,
+	out := map[string]any{"id": u.ID, "service_id": u.ServiceID, "method": u.Method, "email": u.Email, "email_verified": u.EmailVerified, "name": u.Name,
 		"roles": roles, "status": u.Status, "created_at": u.CreatedAt.UTC().Format(time.RFC3339)}
 	return out
 }
@@ -471,4 +483,128 @@ func (s *Server) adminListUsers(w http.ResponseWriter, r *http.Request) {
 		out = append(out, userJSON(u))
 	}
 	writeJSON(w, 200, map[string]any{"users": out, "next": next})
+}
+
+// ── email codes ────────────────────────────────────────────────────────────
+
+// loginEmailBegin mails a sign-in code for a parked authorization. Sends are
+// capped per address and per IP so a stranger cannot turn us into a spam cannon.
+func (s *Server) loginEmailBegin(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		LoginChallenge string `json:"login_challenge"`
+		Email          string `json:"email"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if !s.pendingFor(w, r, svc, in.LoginChallenge) {
+		return
+	}
+	emailKey := "email:send:" + strings.ToLower(strings.TrimSpace(in.Email))
+	ipKey := "email:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.EmailSend, emailKey) {
+		tooMany(w, ratelimit.EmailSend)
+		return
+	}
+	if !s.Limit.Allow(r.Context(), ratelimit.EmailSendIP, ipKey) {
+		tooMany(w, ratelimit.EmailSendIP)
+		return
+	}
+	chID, err := s.Users.BeginLoginEmail(r.Context(), svc, in.LoginChallenge, in.Email, clientIP(r))
+	if s.userFail(w, err) {
+		return
+	}
+	s.Limit.Fail(r.Context(), ratelimit.EmailSend, emailKey)
+	s.Limit.Fail(r.Context(), ratelimit.EmailSendIP, ipKey)
+	writeJSON(w, 200, map[string]any{"challenge_id": chID, "expires_in": int(users.CodeTTL.Seconds())})
+}
+
+// loginEmailFinish checks the code and completes the authorization, like the
+// passkey finish: the app sends the browser to redirect_to.
+func (s *Server) loginEmailFinish(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Code string `json:"code"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	ipKey := "login:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, ipKey) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
+	user, authzID, err := s.Users.FinishLoginEmail(r.Context(), svc, r.URL.Query().Get("challenge"), in.Code, clientIP(r))
+	if errors.Is(err, users.ErrCodeRejected) || errors.Is(err, users.ErrCeremony) {
+		s.Limit.Fail(r.Context(), ratelimit.LoginIP, ipKey)
+	}
+	if s.userFail(w, err) {
+		return
+	}
+	loc, err := s.OAuth.CompleteForUser(r.Context(), authzID, user, users.AllowedScopes(svc, user), clientIP(r))
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "login_challenge expired; start over"})
+		return
+	}
+	if s.oauthFail(w, err) {
+		return
+	}
+	writeJSON(w, 200, map[string]any{"redirect_to": loc, "user": userJSON(user)})
+}
+
+func (s *Server) userVerifyEmailBegin(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	userKey := "email:send:user:" + r.PathValue("id")
+	ipKey := "email:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.EmailSend, userKey) {
+		tooMany(w, ratelimit.EmailSend)
+		return
+	}
+	if !s.Limit.Allow(r.Context(), ratelimit.EmailSendIP, ipKey) {
+		tooMany(w, ratelimit.EmailSendIP)
+		return
+	}
+	chID, err := s.Users.BeginVerifyEmail(r.Context(), svc, r.PathValue("id"), clientIP(r))
+	if s.userFail(w, err) {
+		return
+	}
+	s.Limit.Fail(r.Context(), ratelimit.EmailSend, userKey)
+	s.Limit.Fail(r.Context(), ratelimit.EmailSendIP, ipKey)
+	writeJSON(w, 200, map[string]any{"challenge_id": chID, "expires_in": int(users.CodeTTL.Seconds())})
+}
+
+func (s *Server) userVerifyEmailFinish(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Code string `json:"code"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	ipKey := "login:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, ipKey) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
+	u, err := s.Users.FinishVerifyEmail(r.Context(), svc, r.PathValue("id"), r.URL.Query().Get("challenge"), in.Code, clientIP(r))
+	if errors.Is(err, users.ErrCodeRejected) || errors.Is(err, users.ErrCeremony) {
+		s.Limit.Fail(r.Context(), ratelimit.LoginIP, ipKey)
+	}
+	if s.userFail(w, err) {
+		return
+	}
+	writeJSON(w, 200, userJSON(u))
 }

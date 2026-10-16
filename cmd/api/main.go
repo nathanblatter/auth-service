@@ -17,12 +17,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/awslabs/aws-lambda-go-api-proxy/httpadapter"
 
 	"github.com/nathanblatter/auth-service/internal/config"
 	"github.com/nathanblatter/auth-service/internal/core"
 	"github.com/nathanblatter/auth-service/internal/httpapi"
+	"github.com/nathanblatter/auth-service/internal/mailqueue"
 	"github.com/nathanblatter/auth-service/internal/oauth"
 	"github.com/nathanblatter/auth-service/internal/owner"
 	"github.com/nathanblatter/auth-service/internal/ratelimit"
@@ -138,6 +140,11 @@ func build(ctx context.Context, log *slog.Logger) (http.Handler, config.Config, 
 	lim.Log = log
 	us := users.New(st)
 	us.Log = log
+	if cfg.MailQueueURL != "" {
+		us.Mail = &mailqueue.SQS{Client: sqs.NewFromConfig(awsCfg), QueueURL: cfg.MailQueueURL}
+	} else {
+		log.Warn("AUTH_MAIL_QUEUE_URL unset; email codes and verification disabled")
+	}
 	srv := &httpapi.Server{Core: c, Owner: own, Limit: lim, OAuth: oauth.New(c), Users: us, Google: google, AdminTokenHash: adminHash, Log: log, Version: version}
 	return srv.Handler(), cfg, nil
 }

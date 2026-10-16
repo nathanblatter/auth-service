@@ -950,3 +950,134 @@ func TestClosedSignupHTTP(t *testing.T) {
 		t.Fatalf("audit: denied=%d bound=%d", denied, bound)
 	}
 }
+
+type captureMail struct{ to, subject, text string }
+
+func (c *captureMail) Send(_ context.Context, to, subject, text string) error {
+	c.to, c.subject, c.text = to, subject, text
+	return nil
+}
+
+func (c *captureMail) code(t *testing.T) string {
+	t.Helper()
+	for _, w := range strings.Fields(c.text) {
+		if len(w) == 6 && strings.Trim(w, "0123456789") == "" {
+			return w
+		}
+	}
+	t.Fatalf("no code in %q", c.text)
+	return ""
+}
+
+// TestEmailCodeHTTP: sign in with an emailed code (open pool), verify an
+// app-created passkey account, and the email_verified claim on user tokens.
+func TestEmailCodeHTTP(t *testing.T) {
+	ts, _ := newServerWithStore(t, "https://auth.test")
+	srv := lastServer
+	admin := "Bearer " + adminToken
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"Codenames","slug":"codenames"}`)
+	id := svc["id"].(string)
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/permissions", admin, "application/json", `{"scopes":["read"],"roles":{"user":["read"]}}`)
+	do(t, "POST", ts.URL+"/admin/services/"+id+"/resources", admin, "application/json", `{"resource":"https://codenames.test/api"}`)
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/login", admin, "application/json", `{"login_url":"https://codenames.test/login","rp_id":"codenames.test","origins":["https://codenames.test"],"default_roles":["user"],"open_signup":true}`)
+	_, cred := do(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", admin, "", "")
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {id}, "client_secret": {cred["credential"].(string)}}
+	_, tk := do(t, "POST", ts.URL+"/v1/token", "", "application/x-www-form-urlencoded", form.Encode())
+	svcTok := "Bearer " + tk["access_token"].(string)
+
+	_, reg := do(t, "POST", ts.URL+"/oauth/register", "", "application/json", `{"client_name":"Codenames web","redirect_uris":["https://codenames.test/cb"],"token_endpoint_auth_method":"none"}`)
+	clientID := reg["client_id"].(string)
+	verifier := strings.Repeat("v", 43)
+	sum := sha256.Sum256([]byte(verifier))
+	authorize := func() string {
+		q := url.Values{"client_id": {clientID}, "redirect_uri": {"https://codenames.test/cb"}, "response_type": {"code"}, "state": {"s1"},
+			"resource": {"https://codenames.test/api"}, "scope": {"read"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}}
+		resp, _ := noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+		resp.Body.Close()
+		loc, _ := url.Parse(resp.Header.Get("Location"))
+		return loc.Query().Get("login_challenge")
+	}
+	lc := authorize()
+
+	// No outbox configured → 404 email_disabled, nothing else leaks.
+	if code, body := do(t, "POST", ts.URL+"/v1/login/email/begin", svcTok, "application/json", `{"login_challenge":"`+lc+`","email":"p@x.test"}`); code != 404 || body["error"] != "email_disabled" {
+		t.Fatalf("email disabled: %d %v", code, body)
+	}
+	mail := &captureMail{}
+	srv.Users.Mail = mail
+
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/email/begin", "", "application/json", `{}`); code != 401 {
+		t.Fatalf("begin without service token: %d", code)
+	}
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/email/begin", svcTok, "application/json", `{"login_challenge":"nope","email":"p@x.test"}`); code != 404 {
+		t.Fatalf("begin with bad challenge: %d", code)
+	}
+	code, begin := do(t, "POST", ts.URL+"/v1/login/email/begin", svcTok, "application/json", `{"login_challenge":"`+lc+`","email":"Player@X.test"}`)
+	if code != 200 || begin["challenge_id"] == nil || mail.to != "player@x.test" || !strings.Contains(mail.subject, "Codenames") {
+		t.Fatalf("begin: %d %v to=%q", code, begin, mail.to)
+	}
+	chID := begin["challenge_id"].(string)
+	if code, body := do(t, "POST", ts.URL+"/v1/login/email/finish?challenge="+chID, svcTok, "application/json", `{"code":"000000"}`); code != 401 || body["error"] != "code_rejected" {
+		t.Fatalf("wrong code: %d %v", code, body)
+	}
+	code, fin := do(t, "POST", ts.URL+"/v1/login/email/finish?challenge="+chID, svcTok, "application/json", `{"code":"`+mail.code(t)+`"}`)
+	if code != 200 {
+		t.Fatalf("finish: %d %v", code, fin)
+	}
+	user := fin["user"].(map[string]any)
+	if user["method"] != "email" || user["email_verified"] != true {
+		t.Fatalf("user: %v", user)
+	}
+	cb, _ := url.Parse(fin["redirect_to"].(string))
+	form = url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {cb.Query().Get("code")}, "code_verifier": {verifier}, "redirect_uri": {"https://codenames.test/cb"}}
+	code, ut := do(t, "POST", ts.URL+"/oauth/token", "", "application/x-www-form-urlencoded", form.Encode())
+	if code != 200 {
+		t.Fatalf("token: %d %v", code, ut)
+	}
+	claims, err := srv.Core.VerifyToken(ut["access_token"].(string), id)
+	if err != nil || claims.Subject != "usr:"+user["id"].(string) || claims.Email != "player@x.test" || !claims.EmailVerified {
+		t.Fatalf("claims: %+v %v", claims, err)
+	}
+	// The code is single-use.
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/email/finish?challenge="+chID, svcTok, "application/json", `{"code":"`+mail.code(t)+`"}`); code != 401 {
+		t.Fatalf("replay: %d", code)
+	}
+	// Per-address send cap.
+	for i := 0; i < 10; i++ {
+		code, _ = do(t, "POST", ts.URL+"/v1/login/email/begin", svcTok, "application/json", `{"login_challenge":"`+authorize()+`","email":"spam@x.test"}`)
+		if code == 429 {
+			break
+		}
+	}
+	if code != 429 {
+		t.Fatalf("send cap never hit: %d", code)
+	}
+
+	// Verification: an app-created passkey account starts unverified.
+	code, pk := do(t, "POST", ts.URL+"/v1/users", svcTok, "application/json", `{"email":"pk@x.test"}`)
+	if code != 201 || pk["email_verified"] != false {
+		t.Fatalf("create passkey user: %d %v", code, pk)
+	}
+	pkID := pk["id"].(string)
+	code, vb := do(t, "POST", ts.URL+"/v1/users/"+pkID+"/email/verify/begin", svcTok, "", "")
+	if code != 200 || mail.to != "pk@x.test" {
+		t.Fatalf("verify begin: %d %v to=%q", code, vb, mail.to)
+	}
+	vch := vb["challenge_id"].(string)
+	if code, body := do(t, "POST", ts.URL+"/v1/users/"+pkID+"/email/verify/finish?challenge="+vch, svcTok, "application/json", `{"code":"123456"}`); code != 401 || body["error"] != "code_rejected" {
+		t.Fatalf("verify wrong code: %d %v", code, body)
+	}
+	code, verified := do(t, "POST", ts.URL+"/v1/users/"+pkID+"/email/verify/finish?challenge="+vch, svcTok, "application/json", `{"code":"`+mail.code(t)+`"}`)
+	if code != 200 || verified["email_verified"] != true {
+		t.Fatalf("verify finish: %d %v", code, verified)
+	}
+	if code, body := do(t, "POST", ts.URL+"/v1/users/"+pkID+"/email/verify/begin", svcTok, "", ""); code != 409 || body["error"] != "already_verified" {
+		t.Fatalf("verify twice: %d %v", code, body)
+	}
+	// Owner-provisioned email accounts show up with their method.
+	if code, p := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", admin, "application/json", `{"email":"vip@x.test","method":"email"}`); code != 201 || p["method"] != "email" || p["email_verified"] != true {
+		t.Fatalf("provision email: %d %v", code, p)
+	}
+}

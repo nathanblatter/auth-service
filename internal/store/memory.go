@@ -549,7 +549,7 @@ func (m *Memory) UpdateUser(_ context.Context, u User) error {
 	if !ok {
 		return ErrNotFound
 	}
-	cur.Email, cur.Name, cur.Status, cur.NotBefore = u.Email, u.Name, u.Status, u.NotBefore
+	cur.Email, cur.Name, cur.Status, cur.NotBefore, cur.EmailVerified = u.Email, u.Name, u.Status, u.NotBefore, u.EmailVerified
 	cur.Roles = append([]string(nil), u.Roles...)
 	m.users[ukey(u.ServiceID, u.ID)] = cur
 	return nil

@@ -326,3 +326,211 @@ func countAudit(t *testing.T, mem *store.Memory, kind string) int {
 	}
 	return n
 }
+
+// fakeMail captures the last message and lets a test pull the code out of it.
+type fakeMail struct {
+	to, subject, text string
+	sent              int
+	err               error
+}
+
+func (f *fakeMail) Send(_ context.Context, to, subject, text string) error {
+	f.sent++
+	f.to, f.subject, f.text = to, subject, text
+	return f.err
+}
+
+func (f *fakeMail) code(t *testing.T) string {
+	t.Helper()
+	for _, w := range strings.Fields(f.text) {
+		if len(w) == 6 && strings.Trim(w, "0123456789") == "" {
+			return w
+		}
+	}
+	t.Fatalf("no 6-digit code in %q", f.text)
+	return ""
+}
+
+func TestEmailCodeLogin(t *testing.T) {
+	u, mem, svc := newUsers(t)
+	ctx := context.Background()
+
+	if _, err := u.BeginLoginEmail(ctx, svc, "authz-1", "a@x.test", "ip"); !errors.Is(err, ErrEmailDisabled) {
+		t.Fatalf("no mailer: %v", err)
+	}
+	fm := &fakeMail{}
+	u.Mail = fm
+	if _, err := u.BeginLoginEmail(ctx, svc, "authz-1", "not-an-email", "ip"); !errors.Is(err, ErrInvalidEmail) {
+		t.Fatalf("bad email: %v", err)
+	}
+
+	// Open pool: a stranger gets a code; the account appears only once the code is right.
+	ch, err := u.BeginLoginEmail(ctx, svc, "authz-1", " New@X.test ", "ip")
+	if err != nil || fm.sent != 1 || fm.to != "new@x.test" || !strings.Contains(fm.subject, "FinForge") {
+		t.Fatalf("begin: %v sent=%d to=%q subj=%q", err, fm.sent, fm.to, fm.subject)
+	}
+	if _, _, err := u.FinishLoginEmail(ctx, svc, ch, "000000", "ip"); !errors.Is(err, ErrCodeRejected) {
+		t.Fatalf("wrong code: %v", err)
+	}
+	if _, _, err := mem.ListUsers(ctx, svc.ID, 10, ""); err != nil {
+		t.Fatal(err)
+	} else if list, _, _ := mem.ListUsers(ctx, svc.ID, 10, ""); len(list) != 0 {
+		t.Fatalf("no account before the code is right: %+v", list)
+	}
+	user, authz, err := u.FinishLoginEmail(ctx, svc, ch, " "+fm.code(t)+" ", "ip")
+	if err != nil || authz != "authz-1" || user.Method != MethodEmail || user.Identity != "emailcode:new@x.test" || !user.EmailVerified || len(user.Roles) != 1 {
+		t.Fatalf("finish: %+v %q %v", user, authz, err)
+	}
+	// Single use.
+	if _, _, err := u.FinishLoginEmail(ctx, svc, ch, fm.code(t), "ip"); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("replayed code: %v", err)
+	}
+	// Second sign-in finds the same account.
+	ch, _ = u.BeginLoginEmail(ctx, svc, "authz-2", "new@x.test", "ip")
+	again, _, err := u.FinishLoginEmail(ctx, svc, ch, fm.code(t), "ip")
+	if err != nil || again.ID != user.ID {
+		t.Fatalf("second login: %+v %v", again, err)
+	}
+	// Five wrong guesses burn the code.
+	ch, _ = u.BeginLoginEmail(ctx, svc, "authz-3", "new@x.test", "ip")
+	for i := 0; i < CodeAttempts-1; i++ {
+		if _, _, err := u.FinishLoginEmail(ctx, svc, ch, "111111", "ip"); !errors.Is(err, ErrCodeRejected) {
+			t.Fatalf("guess %d: %v", i, err)
+		}
+	}
+	if _, _, err := u.FinishLoginEmail(ctx, svc, ch, "111111", "ip"); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("last guess must burn the code: %v", err)
+	}
+	if _, _, err := u.FinishLoginEmail(ctx, svc, ch, fm.code(t), "ip"); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("right code after burn: %v", err)
+	}
+	// Wrong kind of challenge: a verification code cannot log in.
+	pk, _ := u.Create(ctx, svc, "pk@x.test", "")
+	vch, err := u.BeginVerifyEmail(ctx, svc, pk.ID, "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := u.FinishLoginEmail(ctx, svc, vch, fm.code(t), "ip"); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("verify code used for login: %v", err)
+	}
+	// Expired code.
+	ch, _ = u.BeginLoginEmail(ctx, svc, "authz-4", "new@x.test", "ip")
+	code := fm.code(t)
+	later := u.Now().Add(CodeTTL + time.Second)
+	u.Now = func() time.Time { return later }
+	if _, _, err := u.FinishLoginEmail(ctx, svc, ch, code, "ip"); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("expired code: %v", err)
+	}
+	// Mailer failure surfaces and leaves no half state the caller could use.
+	fm.err = errors.New("smtp down")
+	if _, err := u.BeginLoginEmail(ctx, svc, "authz-5", "new@x.test", "ip"); err == nil {
+		t.Fatal("mailer error must surface")
+	}
+	fm.err = nil
+
+	// Disabled account: no code is sent.
+	disabled := "disabled"
+	_, _ = u.Update(ctx, svc, user.ID, nil, &disabled, nil)
+	sent := fm.sent
+	if _, err := u.BeginLoginEmail(ctx, svc, "authz-6", "new@x.test", "ip"); !errors.Is(err, ErrDisabled) || fm.sent != sent {
+		t.Fatalf("disabled: %v sent=%d", err, fm.sent-sent)
+	}
+
+	// Closed pool: strangers are refused before any mail goes out; provisioned
+	// email accounts work.
+	_ = mem.UpdateServiceLogin(ctx, svc.ID, svc.LoginURL, svc.RPID, svc.Origins, svc.DefaultRoles, false)
+	svc, _ = mem.GetService(ctx, svc.ID)
+	if _, err := u.BeginLoginEmail(ctx, svc, "authz-7", "stranger@x.test", "ip"); !errors.Is(err, ErrSignupClosed) || fm.sent != sent {
+		t.Fatalf("closed pool stranger: %v sent=%d", err, fm.sent-sent)
+	}
+	prov, err := u.Provision(ctx, svc, MethodEmail, "me@x.test", "Me")
+	if err != nil || prov.Identity != "emailcode:me@x.test" || !prov.EmailVerified {
+		t.Fatalf("provision email: %+v %v", prov, err)
+	}
+	ch, err = u.BeginLoginEmail(ctx, svc, "authz-8", "me@x.test", "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := u.FinishLoginEmail(ctx, svc, ch, fm.code(t), "ip")
+	if err != nil || got.ID != prov.ID {
+		t.Fatalf("closed pool provisioned login: %+v %v", got, err)
+	}
+	if n := countAudit(t, mem, "user.email_code.sent"); n < 6 {
+		t.Fatalf("sent audits: %d", n)
+	}
+}
+
+func TestEmailVerification(t *testing.T) {
+	u, mem, svc := newUsers(t)
+	ctx := context.Background()
+	fm := &fakeMail{}
+	u.Mail = fm
+
+	// App-created passkey accounts start unverified and cannot sign in.
+	pk, err := u.Create(ctx, svc, "pk@x.test", "P")
+	if err != nil || pk.EmailVerified {
+		t.Fatalf("create: %+v %v", pk, err)
+	}
+	if err := u.loginAllowed(ctx, svc, pk, "passkey", "ip"); !errors.Is(err, ErrEmailUnverified) {
+		t.Fatalf("unverified login: %v", err)
+	}
+	if _, err := u.FinishVerifyEmail(ctx, svc, pk.ID, "nope", "000000", "ip"); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("bogus challenge: %v", err)
+	}
+	ch, err := u.BeginVerifyEmail(ctx, svc, pk.ID, "ip")
+	if err != nil || fm.to != "pk@x.test" || !strings.Contains(fm.subject, "Verify") {
+		t.Fatalf("begin verify: %v to=%q subj=%q", err, fm.to, fm.subject)
+	}
+	// Another user cannot consume this code.
+	other, _ := u.Create(ctx, svc, "other@x.test", "")
+	if _, err := u.FinishVerifyEmail(ctx, svc, other.ID, ch, fm.code(t), "ip"); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("code bound to another user: %v", err)
+	}
+	// The code was consumed by that attempt, so start over.
+	ch, _ = u.BeginVerifyEmail(ctx, svc, pk.ID, "ip")
+	if _, err := u.FinishVerifyEmail(ctx, svc, pk.ID, ch, "999999", "ip"); !errors.Is(err, ErrCodeRejected) {
+		t.Fatalf("wrong code: %v", err)
+	}
+	got, err := u.FinishVerifyEmail(ctx, svc, pk.ID, ch, fm.code(t), "ip")
+	if err != nil || !got.EmailVerified {
+		t.Fatalf("verify: %+v %v", got, err)
+	}
+	if err := u.loginAllowed(ctx, svc, got, "passkey", "ip"); err != nil {
+		t.Fatalf("verified login: %v", err)
+	}
+	if _, err := u.BeginVerifyEmail(ctx, svc, pk.ID, "ip"); !errors.Is(err, ErrAlreadyVerified) {
+		t.Fatalf("verify twice: %v", err)
+	}
+	if _, err := u.BeginVerifyEmail(ctx, svc, "usr_missing", "ip"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("missing user: %v", err)
+	}
+	// Google and provisioned accounts are born verified.
+	g, _ := u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "1", Email: "g@x.test", EmailVerified: true}, "ip")
+	p, _ := u.Provision(ctx, svc, MethodPasskey, "prov@x.test", "")
+	if !g.EmailVerified || !p.EmailVerified {
+		t.Fatalf("born verified: google=%v provisioned=%v", g.EmailVerified, p.EmailVerified)
+	}
+	if n := countAudit(t, mem, "user.email.verified"); n != 1 {
+		t.Fatalf("verified audits: %d", n)
+	}
+	u.Mail = nil
+	if _, err := u.BeginVerifyEmail(ctx, svc, other.ID, "ip"); !errors.Is(err, ErrEmailDisabled) {
+		t.Fatalf("no mailer: %v", err)
+	}
+}
+
+func TestRandomDigits(t *testing.T) {
+	seen := map[byte]bool{}
+	for i := 0; i < 200; i++ {
+		d := randomDigits(6)
+		if len(d) != 6 || strings.Trim(d, "0123456789") != "" {
+			t.Fatalf("bad code %q", d)
+		}
+		for j := 0; j < len(d); j++ {
+			seen[d[j]] = true
+		}
+	}
+	if len(seen) != 10 {
+		t.Fatalf("digits seen: %v", seen)
+	}
+}
