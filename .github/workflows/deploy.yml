@@ -40,7 +40,6 @@ jobs:
     name: sam deploy (prod)
     needs: check
     runs-on: ubuntu-latest
-    environment: prod
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
