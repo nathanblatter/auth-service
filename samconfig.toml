@@ -11,7 +11,7 @@ parallel = true
 
 [default.deploy.parameters]
 capabilities = "CAPABILITY_IAM"
-resolve_s3 = true
+s3_bucket = "auth-service-sam-artifacts-175284429855"
 s3_prefix = "auth-service-prod"
 confirm_changeset = false
 fail_on_empty_changeset = false

@@ -17,6 +17,26 @@ Parameters:
     Description: CI may only touch CloudFormation stacks and resources named with this prefix.
 
 Resources:
+  # Where sam deploy uploads built Lambda zips. Owned here so the deploy role
+  # never needs rights over SAM's auto-created "managed-default" stack.
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${StackPrefix}-sam-artifacts-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
     Properties:
@@ -59,10 +79,10 @@ Resources:
                 Resource: "*"
               - Sid: SamArtifacts
                 Effect: Allow
-                Action: [s3:CreateBucket, s3:PutBucketPolicy, s3:PutBucketVersioning, s3:PutEncryptionConfiguration, s3:PutBucketPublicAccessBlock, s3:GetBucketLocation, s3:ListBucket, s3:GetObject, s3:PutObject, s3:GetBucketPolicy, s3:GetEncryptionConfiguration, s3:GetBucketVersioning]
+                Action: [s3:GetBucketLocation, s3:ListBucket, s3:GetObject, s3:PutObject]
                 Resource:
-                  - arn:aws:s3:::aws-sam-cli-managed-default*
-                  - arn:aws:s3:::aws-sam-cli-managed-default*/*
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub ${ArtifactsBucket.Arn}/*
               - Sid: Lambda
                 Effect: Allow
                 Action: lambda:*
@@ -119,6 +139,9 @@ Resources:
                 Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${StackPrefix}/*
 
 Outputs:
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+    Description: s3_bucket in samconfig.toml.
   DeployRoleArn:
     Value: !GetAtt DeployRole.Arn
     Description: Put this in the repo as the AWS_DEPLOY_ROLE_ARN variable.
