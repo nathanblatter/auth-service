@@ -6,17 +6,19 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 ## check: everything CI runs (the merge gate)
 check: fmt vet lint test
 
+MODULES := . client
+
 fmt:
 	@test -z "$$(gofmt -l .)" || (gofmt -l . && echo "gofmt: files need formatting" && exit 1)
 
 vet:
-	go vet ./...
+	@for m in $(MODULES); do (cd $$m && go vet ./...) || exit 1; done
 
 lint:
-	golangci-lint run ./...
+	@for m in $(MODULES); do (cd $$m && golangci-lint run ./...) || exit 1; done
 
 test:
-	go test -race ./...
+	@for m in $(MODULES); do (cd $$m && go test -race ./...) || exit 1; done
 
 ## test-dynamo: store tests against DynamoDB Local (docker compose up -d first)
 test-dynamo:

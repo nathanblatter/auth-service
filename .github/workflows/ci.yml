@@ -30,6 +30,8 @@ jobs:
           version: v2.14
       - name: go test
         run: go test -race ./...
+      - name: client module (stdlib-only SDK)
+        run: cd client && go vet ./... && go test -race ./...
       - name: store tests against DynamoDB Local
         run: go test -race -run TestDynamoLocal ./internal/store/
         env:

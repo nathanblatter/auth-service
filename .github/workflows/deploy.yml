@@ -32,6 +32,7 @@ jobs:
         with:
           version: v2.14
       - run: go test -race ./...
+      - run: cd client && go vet ./... && go test -race ./...
       - run: go test -race -run TestDynamoLocal ./internal/store/
         env:
           AUTH_TEST_DYNAMO_ENDPOINT: http://localhost:8402

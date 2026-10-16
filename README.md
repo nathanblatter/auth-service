@@ -59,9 +59,11 @@ curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 
 ## Verifying a token in your service
 
-Fetch `/.well-known/jwks.json`, pick the key by the token's `kid`, verify ES256, then check
-`iss`, `aud`, `exp`. A Go client library that does this with caching is planned
-(flightdeck `auth-service-12`).
+Go: `go get github.com/nathanblatter/auth-service/client` and see [client/README.md](client/README.md).
+Standard library only; verifies tokens against a cached JWKS and wraps the credential exchange.
+
+Anything else: fetch `/.well-known/jwks.json`, pick the key by the token's `kid`, verify
+ES256, then check `iss`, `aud`, `exp`.
 
 ## Deploy
 

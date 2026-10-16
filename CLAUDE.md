@@ -16,6 +16,8 @@ don't invent new ones, log proposals in flightdeck (project slug `auth-service`)
   (Store interface: DynamoDB + in-memory) · `internal/signer` (Signer: KMS + local ECDSA) ·
   `internal/jwt` (ES256 compact JWS, JWKS) · `internal/owner` (passkeys + console sessions,
   go-webauthn) · `internal/config` (AUTH_* env).
+- `client/` is a separate, stdlib-only Go module (the SDK consumers import). Keep it
+  dependency-free; `make check` and CI run its tests too.
 - Infra: `infra/template.yaml` (the whole stack) · `infra/bootstrap/github-oidc.yaml`
   (one-time: OIDC provider + deploy role) · `samconfig.toml` (stack `auth-service-prod`, us-east-1).
 - Secrets: none in the repo or in GitHub. The admin token's hash lives in SSM
