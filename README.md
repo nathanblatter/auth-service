@@ -1,9 +1,122 @@
 # auth-service
 
-Auth as a service for Nathan's products. Headless API at `https://auth.nathanblatter.com`:
-products register as **services**, get a credential, and exchange it for short-lived signed
-tokens. End-user login (passkeys, Google, Apple) and the OAuth 2.1 flows the Claude
-connectors need come next; see `docs/DESIGN.md` for the full picture and what is decided.
+Auth as a service for Nathan's products, "my own Okta". Headless API at
+`https://auth.nathanblatter.com`: products register as **services**, get a credential, and
+exchange it for short-lived signed tokens. Each service can own a **user pool** (passkeys,
+Sign in with Google, emailed sign-in codes), open to the public or invite-only, and Claude
+connectors get standard OAuth 2.1 with the owner approving each one by passkey. See
+`docs/DESIGN.md` for the full picture and what is decided, `docs/API.md` for every endpoint.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph clients [Callers]
+        App["Product backend<br/>(FinForge, games, personal site…)<br/>service token"]
+        Browser["End user's browser<br/>app's own login page"]
+        Claude["Claude connector<br/>(phone / claude.ai)<br/>OAuth 2.1 + PKCE"]
+        Nathan["Nathan<br/>admin console, passkey"]
+    end
+
+    subgraph edge [Edge]
+        CF["Cloudflare DNS<br/>auth.nathanblatter.com<br/>CNAME, proxy off"]
+        APIGW["API Gateway HTTP API<br/>TLS, throttling, access logs"]
+    end
+
+    subgraph compute [Compute, us-east-1]
+        API["Lambda cmd/api<br/>Go, arm64, net/http<br/>all routes + embedded console"]
+        Worker["Lambda cmd/worker<br/>background jobs"]
+    end
+
+    subgraph state [State]
+        DDB[("DynamoDB single table<br/>services · credentials · users<br/>passkeys · OAuth clients/codes/refresh<br/>challenges · sessions · audit · rate limits<br/>PITR, TTL")]
+        KMS["KMS ECC P-256 keys<br/>ES256 signing, rotation ring<br/>private key never leaves KMS"]
+        SSM["SSM Parameter Store<br/>admin-token hash<br/>Google client secret"]
+    end
+
+    subgraph queues [Queues]
+        Jobs["SQS jobs (+DLQ)"]
+        Mail["SQS mail outbox (+DLQ)"]
+    end
+
+    subgraph homelab [Mac mini, Tailscale only]
+        Bridge["email-api sqs-bridge<br/>scoped IAM user: receive/delete"]
+        EmailAPI["email-api /send<br/>keyed, actor=auth-service"]
+    end
+
+    subgraph ext [External identity]
+        Google["Google OAuth<br/>Sign in with Google"]
+        Brevo["Brevo (via postfix relay)"]
+    end
+
+    subgraph ops [Ops]
+        CW["CloudWatch<br/>logs, 5xx alarm, DLQ alarms, $15 budget"]
+        GH["GitHub Actions<br/>gofmt · vet · lint · race tests ·<br/>DynamoDB Local · sam validate<br/>→ sam deploy via OIDC role"]
+    end
+
+    App & Browser & Claude & Nathan --> CF --> APIGW --> API
+    API --> DDB
+    API --> KMS
+    API -. cold start .-> SSM
+    API --> Jobs --> Worker --> DDB
+    API --> Mail --> Bridge --> EmailAPI --> Brevo
+    Browser <-. redirect .-> Google
+    API <-. code exchange .-> Google
+    API & Worker --> CW
+    GH -. deploy .-> API & Worker
+```
+
+**Request path.** Every route lives in one Go binary behind API Gateway. The Lambda adapts API
+Gateway events to `net/http`, so the same handler runs locally (`make dev`) and in prod. Tokens
+are ES256 JWTs signed inside KMS; verifiers only need the public JWKS. All state is one
+DynamoDB table (point-in-time recovery, TTL on short-lived rows). Email never leaves the Lambda
+directly: it is queued, and a bridge on the Mac mini relays it through email-api so every
+message still carries an actor and goes through one budget.
+
+**Trust boundaries.** The Lambda role can touch exactly: the table, the signing keys (sign and
+public key only), the two queues, two SSM parameters. The bridge's IAM user can only receive
+and delete on the mail queue. CI assumes a role via GitHub OIDC scoped to this repo's `main`;
+no AWS keys exist in GitHub. Secrets live in SSM and KMS; the repo holds none.
+
+## Why AWS, and not a Cloudflare tunnel into the homelab
+
+Almost everything else of Nathan's runs on the Mac mini behind Cloudflare tunnels, and that
+is the default he prefers: free, self-hosted, simple. Auth is the deliberate exception,
+decided on day one. The reasons, in order:
+
+1. **Reliability is the product.** If auth is down, every product that uses it is down at
+   once: FinForge, the games, the personal site, the Claude connectors. A home box has a
+   single power feed, a single ISP, a single disk, and reboots for macOS updates. Lambda,
+   API Gateway, DynamoDB and KMS are multi-AZ managed services with no host to patch, and
+   DynamoDB PITR means a bad write is recoverable to the second.
+2. **Independence from the homelab.** The products this authenticates will not all live at
+   home forever; some are meant to be sold. Their login must not depend on Nathan's house
+   having power and internet, on the Mac mini being awake, or on one Cloudflare tunnel
+   process staying up. The one homelab dependency left, the mail bridge, is deliberately
+   asynchronous: if the Mac mini is off, codes queue in SQS for a day and sign-ins by
+   passkey and Google keep working.
+3. **Key custody.** Signing keys are generated in and never leave KMS. On the Mac mini they
+   would be files on a disk in a house, with rotation and access logging left to us.
+4. **Blast radius of a compromise.** A homelab box runs a dozen services on one Docker host;
+   a hole in any of them is adjacent to the auth database. Here auth has its own account
+   boundary, its own least-privilege roles, and an audit trail in CloudWatch that an
+   attacker on the Mac mini cannot edit.
+5. **Scale without thought.** A connector approval, a burst of sign-ins, or a product that
+   takes off costs nothing to prepare for; concurrency and storage are not something to
+   provision or babysit.
+6. **It is cheap enough to break the rule.** Idle cost is about $1 to $1.50 a month (one KMS
+   key, a few hundred thousand DynamoDB and Lambda requests are inside free tiers), with a
+   $15 budget alarm as the ceiling. The homelab would not have been meaningfully cheaper for
+   this workload, only riskier.
+
+What was *not* chosen, and why: Route 53 for DNS (Cloudflare already holds the zone, a CNAME
+with proxy off is enough and keeps one DNS story); a separate staging environment (rejected:
+local DynamoDB plus the CI gates cover it at this scale); containers on ECS or a VM (a
+long-running host to patch for an idle-most-of-the-time service); a hosted IdP like Auth0 or
+Cognito (this is the résumé project, and the design is meant to be understood end to end).
+The architecture stays portable: the Go binary is plain `net/http`, the store is an interface
+with a DynamoDB and an in-memory implementation, and the signer is an interface with KMS and
+local ECDSA behind it, so a move to any other host is a new store and signer, not a rewrite.
 
 ## Run locally
 
@@ -37,9 +150,12 @@ curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 
 ## End users
 
-A service with a login URL becomes a user pool: its own app signs people in with passkeys or
-Google through `/v1/users*` and `/v1/login/*` (service token), and gets ordinary OAuth tokens
-for them. See docs/API.md "End users" and docs/DESIGN.md "End users".
+A service with a login URL becomes a user pool: its own app signs people in with passkeys,
+Google or an emailed 6-digit code through `/v1/users*` and `/v1/login/*` (service token), and
+gets ordinary OAuth tokens for them. `open_signup` decides whether anyone may create an
+account (the games) or only the owner may (the personal site). App-created passkey accounts
+verify their email with a code before they can sign in. See docs/API.md "End users" and
+docs/DESIGN.md "End users".
 
 ## Endpoints
 
@@ -88,4 +204,7 @@ ES256, then check `iss`, `aud`, `exp`.
 ## Deploy
 
 Push to `main`. GitHub Actions runs the checks, then `sam deploy` through an OIDC role.
-There are no AWS keys in GitHub. First-time account setup is in `infra/bootstrap/`.
+There are no AWS keys in GitHub. First-time account setup is in `infra/bootstrap/`: the OIDC
+provider and deploy role (`github-oidc.yaml`) and the mail bridge's IAM user
+(`mailbridge.yaml`), both deployed by hand once because the CI role deliberately cannot
+manage IAM.
