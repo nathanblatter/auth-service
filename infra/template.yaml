@@ -78,32 +78,9 @@ Resources:
         Enabled: true
 
   # ── signing keys ─────────────────────────────────────────────────────────
-  # Rotation: add SigningKeyB, put it FIRST in AUTH_SIGNING_KEY_IDS, deploy;
-  # remove A once every token it signed has expired. See docs/DESIGN.md.
-  SigningKeyA:
-    Type: AWS::KMS::Key
-    # Rotation step 2a: A is retired; Delete lets CloudFormation schedule the
-    # 30-day KMS deletion when the resource is removed in step 2b.
-    DeletionPolicy: Delete
-    UpdateReplacePolicy: Retain
-    Properties:
-      Description: auth-service JWT signing key A (ES256)
-      KeySpec: ECC_NIST_P256
-      KeyUsage: SIGN_VERIFY
-      PendingWindowInDays: 30
-      KeyPolicy:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: AccountAdmin
-            Effect: Allow
-            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root" }
-            Action: kms:*
-            Resource: "*"
-  SigningKeyAAlias:
-    Type: AWS::KMS::Alias
-    Properties:
-      AliasName: !Sub alias/${AWS::StackName}-signing-a
-      TargetKeyId: !Ref SigningKeyA
+  # Rotation (see docs/DESIGN.md): add the next key, put it FIRST in
+  # AUTH_SIGNING_KEY_IDS, deploy; remove the old key once every token it signed
+  # has expired. Key A was retired 2026-10-16 (rehearsal); B is the only signer.
   SigningKeyB:
     Type: AWS::KMS::Key
     DeletionPolicy: Retain
@@ -190,8 +167,7 @@ Resources:
         Variables:
           AUTH_ISSUER: !Ref Issuer
           AUTH_TABLE: !Ref Table
-          # B signs; A is still published so tokens it signed keep verifying (rotation step 1).
-          AUTH_SIGNING_KEY_IDS: !Join [",", [!Ref SigningKeyB, !Ref SigningKeyA]]
+          AUTH_SIGNING_KEY_IDS: !Ref SigningKeyB
           AUTH_ADMIN_TOKEN_HASH_PARAM: !Ref AdminTokenHashParam
           AUTH_GOOGLE_CLIENT_ID: !Ref GoogleClientID
           AUTH_GOOGLE_CLIENT_SECRET_PARAM: !Ref GoogleClientSecretParam
@@ -216,9 +192,7 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: [kms:Sign, kms:GetPublicKey]
-              Resource:
-                - !GetAtt SigningKeyA.Arn
-                - !GetAtt SigningKeyB.Arn
+              Resource: !GetAtt SigningKeyB.Arn
             - Effect: Allow
               Action: ssm:GetParameter
               Resource:
@@ -295,8 +269,6 @@ Outputs:
     Condition: HasDomain
     Description: CNAME target for DomainName in Cloudflare (DNS only, grey cloud)
     Value: !GetAtt ApiDomain.RegionalDomainName
-  SigningKeyAId:
-    Value: !Ref SigningKeyA
   SigningKeyBId:
     Value: !Ref SigningKeyB
   TableName:
