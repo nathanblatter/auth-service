@@ -102,6 +102,28 @@ Resources:
     Properties:
       AliasName: !Sub alias/${AWS::StackName}-signing-a
       TargetKeyId: !Ref SigningKeyA
+  SigningKeyB:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: auth-service JWT signing key B (ES256)
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+  SigningKeyBAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-signing-b
+      TargetKeyId: !Ref SigningKeyB
 
   # ── background jobs ──────────────────────────────────────────────────────
   JobQueue:
@@ -166,7 +188,8 @@ Resources:
         Variables:
           AUTH_ISSUER: !Ref Issuer
           AUTH_TABLE: !Ref Table
-          AUTH_SIGNING_KEY_IDS: !Ref SigningKeyA
+          # B signs; A is still published so tokens it signed keep verifying (rotation step 1).
+          AUTH_SIGNING_KEY_IDS: !Join [",", [!Ref SigningKeyB, !Ref SigningKeyA]]
           AUTH_ADMIN_TOKEN_HASH_PARAM: !Ref AdminTokenHashParam
           AUTH_GOOGLE_CLIENT_ID: !Ref GoogleClientID
           AUTH_GOOGLE_CLIENT_SECRET_PARAM: !Ref GoogleClientSecretParam
@@ -191,7 +214,9 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: [kms:Sign, kms:GetPublicKey]
-              Resource: !GetAtt SigningKeyA.Arn
+              Resource:
+                - !GetAtt SigningKeyA.Arn
+                - !GetAtt SigningKeyB.Arn
             - Effect: Allow
               Action: ssm:GetParameter
               Resource:
@@ -270,6 +295,8 @@ Outputs:
     Value: !GetAtt ApiDomain.RegionalDomainName
   SigningKeyAId:
     Value: !Ref SigningKeyA
+  SigningKeyBId:
+    Value: !Ref SigningKeyB
   TableName:
     Value: !Ref Table
   JobQueueUrl:
