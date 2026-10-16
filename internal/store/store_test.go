@@ -75,6 +75,63 @@ func conformance(t *testing.T, s Store) {
 	if err := s.AppendAudit(ctx, AuditEvent{At: now, Kind: "credential.mint", Actor: "admin", ServiceID: "svc_a"}); err != nil {
 		t.Fatal(err)
 	}
+
+	// Passkeys.
+	pk := Passkey{ID: "cred-1", Name: "iPhone", CreatedAt: now, Data: []byte(`{"id":"x"}`)}
+	if err := s.PutPasskey(ctx, pk); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutPasskey(ctx, pk); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup passkey: %v", err)
+	}
+	pk.Data = []byte(`{"id":"x","signCount":2}`)
+	if err := s.UpdatePasskey(ctx, pk); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdatePasskey(ctx, Passkey{ID: "ghost", Data: []byte("{}")}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update missing passkey: %v", err)
+	}
+	pks, err := s.ListPasskeys(ctx)
+	if err != nil || len(pks) != 1 || string(pks[0].Data) != `{"id":"x","signCount":2}` || pks[0].Name != "iPhone" {
+		t.Fatalf("ListPasskeys: %+v %v", pks, err)
+	}
+
+	// Challenges are single use and expire.
+	if err := s.PutChallenge(ctx, "ch1", []byte("data"), now.Add(5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	data, err := s.ConsumeChallenge(ctx, "ch1", now)
+	if err != nil || string(data) != "data" {
+		t.Fatalf("consume: %s %v", data, err)
+	}
+	if _, err := s.ConsumeChallenge(ctx, "ch1", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second consume: %v", err)
+	}
+	if err := s.PutChallenge(ctx, "ch2", []byte("late"), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ConsumeChallenge(ctx, "ch2", now.Add(2*time.Minute)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired challenge accepted: %v", err)
+	}
+
+	// Sessions expire and can be deleted.
+	sess := Session{Hash: "h1", CreatedAt: now, ExpiresAt: now.Add(time.Hour), IP: "1.2.3.4"}
+	if err := s.PutSession(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	gs, err := s.GetSession(ctx, "h1", now.Add(30*time.Minute))
+	if err != nil || gs.IP != "1.2.3.4" || !gs.ExpiresAt.Equal(sess.ExpiresAt) {
+		t.Fatalf("GetSession: %+v %v", gs, err)
+	}
+	if _, err := s.GetSession(ctx, "h1", now.Add(2*time.Hour)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired session: %v", err)
+	}
+	if err := s.DeleteSession(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetSession(ctx, "h1", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted session: %v", err)
+	}
 }
 
 func TestMemory(t *testing.T) { conformance(t, NewMemory()) }

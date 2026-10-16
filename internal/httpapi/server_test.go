@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -8,8 +9,10 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nathanblatter/auth-service/internal/core"
+	"github.com/nathanblatter/auth-service/internal/owner"
 	"github.com/nathanblatter/auth-service/internal/signer"
 	"github.com/nathanblatter/auth-service/internal/store"
 )
@@ -17,6 +20,11 @@ import (
 const adminToken = "test-admin-token"
 
 func newServer(t *testing.T) *httptest.Server {
+	ts, _ := newServerWithStore(t, "https://auth.test")
+	return ts
+}
+
+func newServerWithStore(t *testing.T, issuer string) (*httptest.Server, *store.Memory) {
 	t.Helper()
 	s, err := signer.NewLocal("t1")
 	if err != nil {
@@ -26,11 +34,16 @@ func newServer(t *testing.T) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := core.New(store.NewMemory(), ring, "https://auth.test")
-	srv := &Server{Core: c, AdminTokenHash: core.HashSecret(adminToken), Version: "test"}
+	mem := store.NewMemory()
+	c := core.New(mem, ring, issuer)
+	own, err := owner.New(mem, issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Core: c, Owner: own, AdminTokenHash: core.HashSecret(adminToken), Version: "test"}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
-	return ts
+	return ts, mem
 }
 
 func do(t *testing.T, method, rawURL, auth, contentType string, body string) (int, map[string]any) {
@@ -180,11 +193,139 @@ func TestEndToEnd(t *testing.T) {
 func TestAdminDisabledWhenNoHash(t *testing.T) {
 	s, _ := signer.NewLocal("t1")
 	ring, _ := signer.NewRing(s)
-	srv := &Server{Core: core.New(store.NewMemory(), ring, "https://auth.test")}
+	mem := store.NewMemory()
+	own, _ := owner.New(mem, "https://auth.test")
+	srv := &Server{Core: core.New(mem, ring, "https://auth.test"), Owner: own}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	// Empty hash: even an empty-string token must not match.
 	if code, _ := do(t, "GET", ts.URL+"/admin/services", "Bearer ", "", ""); code != 401 {
 		t.Fatalf("admin open without hash: %d", code)
+	}
+}
+
+// doRaw is do() with full control over headers and the raw response.
+func doRaw(t *testing.T, method, rawURL string, headers map[string]string, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, rawURL, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func TestConsoleAndSessions(t *testing.T) {
+	ts, mem := newServerWithStore(t, "https://auth.test")
+	ctx := context.Background()
+
+	// The page is served with a strict CSP.
+	resp := doRaw(t, "GET", ts.URL+"/admin", nil, "")
+	if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") ||
+		!strings.Contains(resp.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Fatalf("console page: %d %v", resp.StatusCode, resp.Header)
+	}
+	resp.Body.Close()
+
+	// Fresh install: setup required, login refused until a passkey exists.
+	if code, body := do(t, "GET", ts.URL+"/admin/session", "", "", ""); code != 200 || body["setup_required"] != true || body["authenticated"] != false {
+		t.Fatalf("session (fresh): %d %v", code, body)
+	}
+	if code, body := do(t, "POST", ts.URL+"/admin/login/begin", "", "", ""); code != 409 || body["error"] != "setup_required" {
+		t.Fatalf("login/begin without passkeys: %d %v", code, body)
+	}
+	// Registration begin needs admin auth; the bootstrap token works.
+	if code, _ := do(t, "POST", ts.URL+"/admin/passkeys/begin", "", "", ""); code != 401 {
+		t.Fatalf("passkeys/begin unauthenticated: %d", code)
+	}
+	code, begin := do(t, "POST", ts.URL+"/admin/passkeys/begin", "Bearer "+adminToken, "", "")
+	if code != 200 || begin["challenge_id"] == "" || begin["options"] == nil {
+		t.Fatalf("passkeys/begin: %d %v", code, begin)
+	}
+	if code, body := do(t, "POST", ts.URL+"/admin/passkeys/finish?challenge="+begin["challenge_id"].(string)+"&name=Phone", "Bearer "+adminToken, "application/json", `{"id":"junk"}`); code != 400 || body["error"] != "passkey_rejected" {
+		t.Fatalf("passkeys/finish junk: %d %v", code, body)
+	}
+
+	// Simulate a completed passkey login by inserting a session directly.
+	now := time.Now()
+	tok := "session-token-for-tests"
+	if err := mem.PutSession(ctx, store.Session{Hash: core.HashSecret(tok), CreatedAt: now, ExpiresAt: now.Add(owner.SessionTTL)}); err != nil {
+		t.Fatal(err)
+	}
+	cookie := map[string]string{"Cookie": sessionCookie + "=" + tok}
+
+	// Cookie authenticates reads.
+	resp = doRaw(t, "GET", ts.URL+"/admin/services", cookie, "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("cookie read: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = doRaw(t, "GET", ts.URL+"/admin/session", cookie, "")
+	var sess map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&sess)
+	resp.Body.Close()
+	if sess["authenticated"] != true || sess["method"] != "passkey" || sess["expires_at"] == nil {
+		t.Fatalf("session (cookie): %v", sess)
+	}
+
+	// Cookie on a write needs a same-origin Origin header (CSRF).
+	body := `{"name":"Svc","slug":"svc"}`
+	resp = doRaw(t, "POST", ts.URL+"/admin/services", map[string]string{"Cookie": sessionCookie + "=" + tok, "Content-Type": "application/json"}, body)
+	if resp.StatusCode != 401 {
+		t.Fatalf("cookie write without Origin: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = doRaw(t, "POST", ts.URL+"/admin/services", map[string]string{"Cookie": sessionCookie + "=" + tok, "Content-Type": "application/json", "Origin": "https://evil.test"}, body)
+	if resp.StatusCode != 401 {
+		t.Fatalf("cookie write cross-origin: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = doRaw(t, "POST", ts.URL+"/admin/services", map[string]string{"Cookie": sessionCookie + "=" + tok, "Content-Type": "application/json", "Origin": "https://auth.test"}, body)
+	if resp.StatusCode != 201 {
+		t.Fatalf("cookie write same-origin: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// The audit row names the method.
+	last := mem.Audit[len(mem.Audit)-1]
+	if last.Kind != "service.create" || last.Actor != "admin:passkey" {
+		t.Fatalf("audit actor: %+v", last)
+	}
+
+	// Bad cookie is rejected; logout kills the session.
+	resp = doRaw(t, "GET", ts.URL+"/admin/services", map[string]string{"Cookie": sessionCookie + "=nope"}, "")
+	if resp.StatusCode != 401 {
+		t.Fatalf("bad cookie: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = doRaw(t, "POST", ts.URL+"/admin/logout", cookie, "")
+	if resp.StatusCode != 204 {
+		t.Fatalf("logout: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = doRaw(t, "GET", ts.URL+"/admin/services", cookie, "")
+	if resp.StatusCode != 401 {
+		t.Fatalf("session after logout: %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestCookieFlags(t *testing.T) {
+	ts, _ := newServerWithStore(t, "https://auth.test")
+	resp := doRaw(t, "POST", ts.URL+"/admin/logout", nil, "")
+	resp.Body.Close()
+	var c *http.Cookie
+	for _, k := range resp.Cookies() {
+		if k.Name == sessionCookie {
+			c = k
+		}
+	}
+	if c == nil || !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteStrictMode || c.Path != "/admin" {
+		t.Fatalf("cookie flags: %+v", c)
 	}
 }

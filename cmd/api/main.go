@@ -23,6 +23,7 @@ import (
 	"github.com/nathanblatter/auth-service/internal/config"
 	"github.com/nathanblatter/auth-service/internal/core"
 	"github.com/nathanblatter/auth-service/internal/httpapi"
+	"github.com/nathanblatter/auth-service/internal/owner"
 	"github.com/nathanblatter/auth-service/internal/signer"
 	"github.com/nathanblatter/auth-service/internal/store"
 )
@@ -107,7 +108,12 @@ func build(ctx context.Context, log *slog.Logger) (http.Handler, config.Config, 
 
 	c := core.New(st, ring, cfg.Issuer)
 	c.Log = log
-	srv := &httpapi.Server{Core: c, AdminTokenHash: adminHash, Log: log, Version: version}
+	own, err := owner.New(st, cfg.Issuer)
+	if err != nil {
+		return nil, cfg, err
+	}
+	own.Log = log
+	srv := &httpapi.Server{Core: c, Owner: own, AdminTokenHash: adminHash, Log: log, Version: version}
 	return srv.Handler(), cfg, nil
 }
 

@@ -46,6 +46,24 @@ type AuditEvent struct {
 	IP        string
 }
 
+// Passkey is one WebAuthn credential belonging to the owner. Data is the
+// JSON-encoded webauthn.Credential; the store treats it as opaque.
+type Passkey struct {
+	ID        string // base64url credential id
+	Name      string
+	CreatedAt time.Time
+	Data      []byte
+}
+
+// Session is an owner console session. Only the SHA-256 of the cookie value
+// is stored.
+type Session struct {
+	Hash      string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	IP        string
+}
+
 // Store is everything the core needs from persistence.
 type Store interface {
 	CreateService(ctx context.Context, s Service) error // ErrConflict when the slug is taken
@@ -58,4 +76,17 @@ type Store interface {
 	RevokeCredential(ctx context.Context, serviceID, credID string, at time.Time) error
 
 	AppendAudit(ctx context.Context, e AuditEvent) error
+
+	// Owner passkeys (single owner; see docs/DESIGN.md).
+	PutPasskey(ctx context.Context, p Passkey) error // ErrConflict when the id exists
+	UpdatePasskey(ctx context.Context, p Passkey) error
+	ListPasskeys(ctx context.Context) ([]Passkey, error)
+
+	// WebAuthn ceremony state, keyed by a random id, single use, short lived.
+	PutChallenge(ctx context.Context, id string, data []byte, expires time.Time) error
+	ConsumeChallenge(ctx context.Context, id string, now time.Time) ([]byte, error) // ErrNotFound when missing or expired
+
+	PutSession(ctx context.Context, s Session) error
+	GetSession(ctx context.Context, hash string, now time.Time) (Session, error) // ErrNotFound when missing or expired
+	DeleteSession(ctx context.Context, hash string) error
 }

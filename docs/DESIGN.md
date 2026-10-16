@@ -51,10 +51,31 @@ staging environment.
 5. Local dev: `docker compose up` runs DynamoDB Local; `make dev` runs the API on
    `localhost:4400` with a throwaway in-memory signing key.
 
-**Interim admin auth (*proposed*, replaced by auth-service-2):** until the owner passkey
-exists, `/admin/*` accepts `Authorization: Bearer <admin token>`. Only the SHA-256 of the
-token is stored, in SSM Parameter Store at `/auth-service/prod/admin-token-hash`; the Lambda
-reads it at cold start. Locally, `AUTH_ADMIN_TOKEN` in `.env` is used directly.
+**Interim admin auth (*proposed*):** `/admin/*` also accepts
+`Authorization: Bearer <admin token>`. Only the SHA-256 of the token is stored, in SSM
+Parameter Store at `/auth-service/prod/admin-token-hash`; the Lambda reads it at cold start.
+Locally, `AUTH_ADMIN_TOKEN` in `.env` is used directly. It bootstraps the first passkey and
+remains as break-glass until auth-service-4; see "Owner and the admin console".
+
+## Owner and the admin console (auth-service-2)
+
+The owner (Nathan) is the one cross-tenant identity. He authenticates to the console with a
+**passkey** (WebAuthn, resident key, user verification required), implemented with
+`go-webauthn`. The RP ID is the issuer's host, so passkeys only work on
+`auth.nathanblatter.com` (or `localhost` in dev); the execute-api URL cannot register them.
+
+- `GET /admin` serves the console: one embedded HTML file, no build step, strict CSP.
+- Ceremony state (`webauthn.SessionData`) lives in the table under `CHALLENGE#<id>` for
+  5 minutes and is consumed on finish, so a challenge can't be replayed.
+- A successful login opens a **1-hour session** (**DECIDED** by Nathan, 2026-10-15): random
+  token in an `HttpOnly; Secure; SameSite=Strict; Path=/admin` cookie, SHA-256 stored under
+  `SESSION#<hash>`. Sign-in, denial and passkey registration are audited.
+- CSRF: a cookie-authenticated write must carry an `Origin` header equal to the issuer.
+- Bootstrap: with zero passkeys registered the console asks for the interim admin token and
+  uses it to register the first passkey. *Proposed, Nathan did not pick:* the bearer token
+  stays valid as break-glass alongside passkeys until auth-service-4 (backup passkey and
+  recovery codes) exists, so a lost single passkey cannot lock him out of every service.
+- Audit actors are `admin:passkey` or `admin:token`, so the log shows which path was used.
 
 ## Tokens
 
@@ -99,6 +120,9 @@ point-in-time recovery on (auth-service-9).
 | Slug lock | `SLUG#<slug>` | `META` | | | service_id (conditional put gives slug uniqueness) |
 | Credential | `SERVICE#<id>` | `CRED#<cred_id>` | `CRED#<cred_id>` | `SERVICE#<id>` | hash, last4, created_at, revoked_at |
 | Audit event | `AUDIT#<yyyy-mm>` | `<rfc3339 ts>#<rand>` | | | kind, actor, service_id, detail, ip |
+| Owner passkey | `OWNER#me` | `PASSKEY#<cred id>` | | | name, created_at, data (webauthn.Credential JSON) |
+| WebAuthn challenge | `CHALLENGE#<id>` | `META` | | | data, expires_at, ttl |
+| Console session | `SESSION#<sha256>` | `META` | | | created_at, expires_at, ip, ttl |
 
 Credential format: `nbk_<cred_id>_<secret>`. `cred_id` is 12 chars of base32, `secret` is
 32 random bytes base64url. The id lets us look up the row directly; the stored value is

@@ -24,6 +24,11 @@ const (
 	skMeta    = "META"
 	skCred    = "CRED#"
 	gsiAll    = "SERVICES"
+
+	pkOwner     = "OWNER#me"
+	skPasskey   = "PASSKEY#"
+	pkChallenge = "CHALLENGE#"
+	pkSession   = "SESSION#"
 )
 
 // DynamoAPI is the slice of the DynamoDB client the store uses.
@@ -33,6 +38,7 @@ type DynamoAPI interface {
 	Query(ctx context.Context, in *dynamodb.QueryInput, opts ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
 	UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
 	TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, opts ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+	DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
 }
 
 // Dynamo is the DynamoDB Store.
@@ -262,4 +268,163 @@ func (it credItem) toCredential() (Credential, error) {
 		c.RevokedAt = &r
 	}
 	return c, nil
+}
+
+type passkeyItem struct {
+	PK, SK    string
+	Type      string `dynamodbav:"type"`
+	ID        string `dynamodbav:"id"`
+	Name      string `dynamodbav:"name"`
+	CreatedAt string `dynamodbav:"created_at"`
+	Data      []byte `dynamodbav:"data"`
+}
+
+type expiringItem struct {
+	PK, SK    string
+	Type      string `dynamodbav:"type"`
+	CreatedAt string `dynamodbav:"created_at,omitempty"`
+	ExpiresAt string `dynamodbav:"expires_at"`
+	IP        string `dynamodbav:"ip,omitempty"`
+	Data      []byte `dynamodbav:"data,omitempty"`
+	// TTL is the table's TTL attribute: DynamoDB deletes the row within ~48h
+	// of this epoch second. Expiry is still enforced in code.
+	TTL int64 `dynamodbav:"ttl"`
+}
+
+func (d *Dynamo) PutPasskey(ctx context.Context, p Passkey) error {
+	item, err := attributevalue.MarshalMap(passkeyItem{
+		PK: pkOwner, SK: skPasskey + p.ID, Type: "passkey", ID: p.ID, Name: p.Name,
+		CreatedAt: p.CreatedAt.UTC().Format(time.RFC3339Nano), Data: p.Data,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: &d.table, Item: item, ConditionExpression: aws.String("attribute_not_exists(PK)"),
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrConflict
+	}
+	return err
+}
+
+func (d *Dynamo) UpdatePasskey(ctx context.Context, p Passkey) error {
+	if len(p.Data) == 0 {
+		return errors.New("store: passkey data required")
+	}
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                &d.table,
+		Key:                      key(pkOwner, skPasskey+p.ID),
+		UpdateExpression:         aws.String("SET #d = :d, #n = :n"),
+		ConditionExpression:      aws.String("attribute_exists(PK)"),
+		ExpressionAttributeNames: map[string]string{"#d": "data", "#n": "name"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":d": &types.AttributeValueMemberB{Value: p.Data},
+			":n": &types.AttributeValueMemberS{Value: p.Name},
+		},
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
+}
+
+func (d *Dynamo) ListPasskeys(ctx context.Context) ([]Passkey, error) {
+	out, err := d.db.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &d.table,
+		KeyConditionExpression: aws.String("PK = :p AND begins_with(SK, :s)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: pkOwner},
+			":s": &types.AttributeValueMemberS{Value: skPasskey},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var items []passkeyItem
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &items); err != nil {
+		return nil, err
+	}
+	keys := make([]Passkey, 0, len(items))
+	for _, it := range items {
+		t, err := time.Parse(time.RFC3339Nano, it.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("store: bad created_at on %s/%s: %w", it.PK, it.SK, err)
+		}
+		keys = append(keys, Passkey{ID: it.ID, Name: it.Name, CreatedAt: t, Data: it.Data})
+	}
+	return keys, nil
+}
+
+func (d *Dynamo) PutChallenge(ctx context.Context, id string, data []byte, expires time.Time) error {
+	item, err := attributevalue.MarshalMap(expiringItem{
+		PK: pkChallenge + id, SK: skMeta, Type: "challenge", Data: data,
+		ExpiresAt: expires.UTC().Format(time.RFC3339Nano), TTL: expires.Unix() + 60,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item})
+	return err
+}
+
+func (d *Dynamo) ConsumeChallenge(ctx context.Context, id string, now time.Time) ([]byte, error) {
+	out, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: &d.table, Key: key(pkChallenge+id, skMeta), ReturnValues: types.ReturnValueAllOld,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out.Attributes == nil {
+		return nil, ErrNotFound
+	}
+	var it expiringItem
+	if err := attributevalue.UnmarshalMap(out.Attributes, &it); err != nil {
+		return nil, err
+	}
+	exp, err := time.Parse(time.RFC3339Nano, it.ExpiresAt)
+	if err != nil || !now.Before(exp) {
+		return nil, ErrNotFound
+	}
+	return it.Data, nil
+}
+
+func (d *Dynamo) PutSession(ctx context.Context, s Session) error {
+	item, err := attributevalue.MarshalMap(expiringItem{
+		PK: pkSession + s.Hash, SK: skMeta, Type: "session", IP: s.IP,
+		CreatedAt: s.CreatedAt.UTC().Format(time.RFC3339Nano),
+		ExpiresAt: s.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: s.ExpiresAt.Unix() + 60,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item})
+	return err
+}
+
+func (d *Dynamo) GetSession(ctx context.Context, hash string, now time.Time) (Session, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: key(pkSession+hash, skMeta)})
+	if err != nil {
+		return Session{}, err
+	}
+	if out.Item == nil {
+		return Session{}, ErrNotFound
+	}
+	var it expiringItem
+	if err := attributevalue.UnmarshalMap(out.Item, &it); err != nil {
+		return Session{}, err
+	}
+	exp, err := time.Parse(time.RFC3339Nano, it.ExpiresAt)
+	if err != nil || !now.Before(exp) {
+		return Session{}, ErrNotFound
+	}
+	created, _ := time.Parse(time.RFC3339Nano, it.CreatedAt)
+	return Session{Hash: hash, CreatedAt: created, ExpiresAt: exp, IP: it.IP}, nil
+}
+
+func (d *Dynamo) DeleteSession(ctx context.Context, hash string) error {
+	_, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: key(pkSession+hash, skMeta)})
+	return err
 }

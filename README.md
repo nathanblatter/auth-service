@@ -12,7 +12,9 @@ make dev            # DynamoDB Local in Docker + the API on http://localhost:440
 make check          # gofmt, vet, lint, tests (what CI runs)
 ```
 
-Then, with the dev admin token from `.env`:
+Open http://localhost:4400/admin for the console. First visit asks for the admin token from
+`.env` to register a passkey (Touch ID works on localhost); after that it's passkey only, with
+the token kept as break-glass. Or drive the API directly:
 
 ```sh
 AUTH=http://localhost:4400
@@ -42,11 +44,18 @@ curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 | GET | `/.well-known/openid-configuration` | none | discovery |
 | POST | `/v1/token` | client credentials | `grant_type=client_credentials` |
 | GET | `/v1/me` | service token | who am I |
+| GET | `/admin` | none | the owner console (passkey sign-in) |
+| GET | `/admin/session` | none | signed in? setup needed? |
+| POST | `/admin/login/begin`, `/admin/login/finish` | none | passkey sign-in ceremony |
+| POST | `/admin/logout` | cookie | end the session |
+| GET/POST | `/admin/passkeys[/begin\|/finish]` | admin | list / register passkeys |
 | POST | `/admin/services` | admin | register a service |
 | GET | `/admin/services[/{id}]` | admin | list / fetch |
 | POST | `/admin/services/{id}/credentials` | admin | mint (shown once) |
 | GET | `/admin/services/{id}/credentials` | admin | list by last four |
 | DELETE | `/admin/services/{id}/credentials/{cred}` | admin | revoke |
+
+"admin" in the Auth column means a passkey session cookie or the interim admin bearer token.
 
 ## Verifying a token in your service
 

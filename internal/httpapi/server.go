@@ -5,24 +5,35 @@ package httpapi
 import (
 	"context"
 	"crypto/subtle"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/nathanblatter/auth-service/internal/core"
 	"github.com/nathanblatter/auth-service/internal/jwt"
+	"github.com/nathanblatter/auth-service/internal/owner"
 	"github.com/nathanblatter/auth-service/internal/store"
 )
+
+//go:embed console.html
+var consoleHTML []byte
+
+// sessionCookie carries the owner console session.
+const sessionCookie = "auth_admin_session"
 
 // Server holds the dependencies of the HTTP layer.
 type Server struct {
 	Core *core.Core
-	// AdminTokenHash is the hex SHA-256 of the interim admin bearer token.
-	// Empty disables /admin entirely (every call is 401).
+	// Owner handles passkey sign-in and console sessions. Required.
+	Owner *owner.Owner
+	// AdminTokenHash is the hex SHA-256 of the interim admin bearer token
+	// (break-glass until auth-service-4). Empty disables bearer admin auth.
 	AdminTokenHash string
 	Log            *slog.Logger
 	Version        string
@@ -39,6 +50,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /.well-known/openid-configuration", s.discovery)
 	mux.HandleFunc("POST /v1/token", s.token)
 	mux.HandleFunc("GET /v1/me", s.requireService(s.me))
+
+	// Owner console: the page, passkey ceremonies, sessions.
+	mux.HandleFunc("GET /admin", s.console)
+	mux.HandleFunc("GET /admin/{$}", s.console)
+	mux.HandleFunc("GET /admin/session", s.session)
+	mux.HandleFunc("POST /admin/login/begin", s.loginBegin)
+	mux.HandleFunc("POST /admin/login/finish", s.loginFinish)
+	mux.HandleFunc("POST /admin/logout", s.logout)
+	mux.HandleFunc("GET /admin/passkeys", s.requireAdmin(s.listPasskeys))
+	mux.HandleFunc("POST /admin/passkeys/begin", s.requireAdmin(s.passkeyBegin))
+	mux.HandleFunc("POST /admin/passkeys/finish", s.requireAdmin(s.passkeyFinish))
 
 	mux.HandleFunc("POST /admin/services", s.requireAdmin(s.createService))
 	mux.HandleFunc("GET /admin/services", s.requireAdmin(s.listServices))
@@ -162,11 +184,45 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 
 // ── admin ──────────────────────────────────────────────────────────────────
 
+// adminMethod reports how the request is authenticated for /admin: "passkey"
+// (session cookie), "token" (interim bearer), or "" for neither. Cookie auth
+// on a state-changing request additionally requires a same-origin Origin
+// header, which closes CSRF without a token dance.
+func (s *Server) adminMethod(r *http.Request) string {
+	if raw, ok := bearer(r); ok && s.AdminTokenHash != "" &&
+		subtle.ConstantTimeCompare([]byte(core.HashSecret(raw)), []byte(s.AdminTokenHash)) == 1 {
+		return "token"
+	}
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		if _, err := s.Owner.ValidateSession(r.Context(), c.Value); err == nil {
+			if r.Method != http.MethodGet && r.Method != http.MethodHead && !s.sameOrigin(r) {
+				return ""
+			}
+			return "passkey"
+		}
+	}
+	return ""
+}
+
+func (s *Server) sameOrigin(r *http.Request) bool {
+	o := r.Header.Get("Origin")
+	if o == "" {
+		return false
+	}
+	want, err := url.Parse(s.Core.Issuer)
+	if err != nil {
+		return false
+	}
+	got, err := url.Parse(o)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(got.Scheme, want.Scheme) && strings.EqualFold(got.Host, want.Host)
+}
+
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		raw, ok := bearer(r)
-		if !ok || s.AdminTokenHash == "" ||
-			subtle.ConstantTimeCompare([]byte(core.HashSecret(raw)), []byte(s.AdminTokenHash)) != 1 {
+		if s.adminMethod(r) == "" {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="admin"`)
 			writeJSON(w, 401, map[string]string{"error": "unauthorized"})
 			return
@@ -175,7 +231,127 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) actor(r *http.Request) core.Actor { return core.Actor{ID: "admin", IP: clientIP(r)} }
+func (s *Server) actor(r *http.Request) core.Actor {
+	return core.Actor{ID: "admin:" + s.adminMethod(r), IP: clientIP(r)}
+}
+
+// ── owner console ──────────────────────────────────────────────────────────
+
+func (s *Server) console(w http.ResponseWriter, _ *http.Request) {
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("X-Frame-Options", "DENY")
+	w.WriteHeader(200)
+	_, _ = w.Write(consoleHTML)
+}
+
+// session tells the page where it stands: signed in or not, and whether the
+// very first passkey still has to be registered.
+func (s *Server) session(w http.ResponseWriter, r *http.Request) {
+	has, err := s.Owner.HasPasskeys(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := map[string]any{"authenticated": false, "method": "", "setup_required": !has}
+	if m := s.adminMethod(r); m != "" {
+		out["authenticated"] = true
+		out["method"] = m
+		if c, err := r.Cookie(sessionCookie); err == nil && m == "passkey" {
+			if sess, err := s.Owner.ValidateSession(r.Context(), c.Value); err == nil {
+				out["expires_at"] = sess.ExpiresAt.UTC().Format(time.RFC3339)
+			}
+		}
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) loginBegin(w http.ResponseWriter, r *http.Request) {
+	opts, chID, err := s.Owner.BeginLogin(r.Context())
+	if errors.Is(err, owner.ErrNoPasskeys) {
+		writeJSON(w, 409, map[string]string{"error": "setup_required"})
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"challenge_id": chID, "options": opts})
+}
+
+func (s *Server) loginFinish(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	tok, exp, err := s.Owner.FinishLogin(r.Context(), r.URL.Query().Get("challenge"), r)
+	if errors.Is(err, owner.ErrCeremony) {
+		writeJSON(w, 401, map[string]string{"error": "passkey_rejected"})
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.SetCookie(w, s.cookie(tok, exp))
+	writeJSON(w, 200, map[string]any{"authenticated": true, "method": "passkey", "expires_at": exp.UTC().Format(time.RFC3339)})
+}
+
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		if err := s.Owner.Logout(r.Context(), c.Value); err != nil {
+			s.fail(w, err)
+			return
+		}
+	}
+	http.SetCookie(w, s.cookie("", time.Unix(0, 0)))
+	w.WriteHeader(204)
+}
+
+func (s *Server) listPasskeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := s.Owner.ListPasskeys(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, map[string]any{"id": k.ID, "name": k.Name, "created_at": k.CreatedAt.UTC().Format(time.RFC3339)})
+	}
+	writeJSON(w, 200, map[string]any{"passkeys": out})
+}
+
+func (s *Server) passkeyBegin(w http.ResponseWriter, r *http.Request) {
+	opts, chID, err := s.Owner.BeginRegistration(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"challenge_id": chID, "options": opts})
+}
+
+func (s *Server) passkeyFinish(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	q := r.URL.Query()
+	pk, err := s.Owner.FinishRegistration(r.Context(), q.Get("challenge"), q.Get("name"), r)
+	if errors.Is(err, owner.ErrCeremony) {
+		writeJSON(w, 400, map[string]string{"error": "passkey_rejected"})
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 201, map[string]any{"id": pk.ID, "name": pk.Name, "created_at": pk.CreatedAt.UTC().Format(time.RFC3339)})
+}
+
+// cookie builds the session cookie. Secure is dropped only for an http issuer
+// (local dev on localhost).
+func (s *Server) cookie(value string, expires time.Time) *http.Cookie {
+	return &http.Cookie{ //nolint:gosec // Secure is computed: true for every https issuer, false only for http://localhost dev.
+		Name: sessionCookie, Value: value, Path: "/admin", Expires: expires,
+		HttpOnly: true, Secure: strings.HasPrefix(s.Core.Issuer, "https://"), SameSite: http.SameSiteStrictMode,
+	}
+}
 
 func (s *Server) createService(w http.ResponseWriter, r *http.Request) {
 	var in struct{ Name, Slug string }

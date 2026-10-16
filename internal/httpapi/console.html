@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>auth-service admin</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #15181d; --muted: #6b7280; --line: #e3e6ea;
+    --accent: #0f62fe; --accent-ink: #ffffff; --danger: #c0392b; --ok: #1a7f37; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1216; --card: #171b21; --ink: #e8eaed; --muted: #9aa3ad; --line: #272d36; --accent: #4f8cff; --danger: #ff6b5b; --ok: #4cc26a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: .01em; }
+  header h1 span { color: var(--muted); font-weight: 400; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .grow { flex: 1 1 160px; }
+  input { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); font: inherit; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink); font: inherit; font-weight: 500; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  button.danger { color: var(--danger); }
+  button.small { padding: 5px 10px; font-size: 13px; }
+  button:disabled { opacity: .5; cursor: default; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); font-size: 13px; }
+  .svc { border-top: 1px solid var(--line); padding: 12px 0; }
+  .svc:first-of-type { border-top: 0; }
+  .svc .title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .svc .title b { font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14px; }
+  td, th { text-align: left; padding: 6px 4px; border-top: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; border-top: 0; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.off { color: var(--danger); border-color: var(--danger); }
+  .secret { margin-top: 10px; padding: 12px; border: 1px dashed var(--accent); border-radius: 10px; }
+  .secret code { display: block; word-break: break-all; font-family: var(--mono); font-size: 13px; margin: 8px 0; }
+  .msg { margin: 8px 0 0; font-size: 14px; }
+  .msg.err { color: var(--danger); }
+  .msg.ok { color: var(--ok); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>auth-service <span>/ admin</span></h1>
+  <div class="row">
+    <span id="who" class="muted" style="font-size:13px"></span>
+    <button id="logout" class="small hidden">Sign out</button>
+  </div>
+</header>
+<main>
+  <!-- Sign in -->
+  <section id="gate" class="card hidden">
+    <h2>Sign in</h2>
+    <div id="gate-login">
+      <p>This console is protected by your passkey.</p>
+      <button id="login" class="primary">Sign in with passkey</button>
+    </div>
+    <div id="gate-setup" class="hidden">
+      <p>No passkey is registered yet. Paste the bootstrap admin token to register this device as the first passkey.</p>
+      <div class="row">
+        <input id="setup-token" class="grow" type="password" autocomplete="off" placeholder="admin token">
+        <input id="setup-name" class="grow" placeholder="Passkey name (e.g. iPhone)">
+        <button id="setup" class="primary">Register passkey</button>
+      </div>
+    </div>
+    <p id="gate-msg" class="msg"></p>
+  </section>
+
+  <!-- Console -->
+  <div id="app" class="hidden">
+    <section class="card">
+      <h2>New service</h2>
+      <div class="row">
+        <input id="svc-name" class="grow" placeholder="Name (FinForge)">
+        <input id="svc-slug" class="grow" placeholder="slug (finforge)">
+        <button id="svc-create" class="primary">Create</button>
+      </div>
+      <p id="svc-msg" class="msg"></p>
+    </section>
+
+    <section class="card">
+      <h2>Services</h2>
+      <div id="services"><p class="muted">Loading…</p></div>
+    </section>
+
+    <section class="card">
+      <h2>Passkeys</h2>
+      <div id="passkeys"></div>
+      <div class="row" style="margin-top:10px">
+        <input id="pk-name" class="grow" placeholder="Name for this device">
+        <button id="pk-add">Add passkey for this device</button>
+      </div>
+      <p id="pk-msg" class="msg"></p>
+    </section>
+  </div>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const api = async (method, path, body, headers = {}) => {
+    const opts = { method, headers: { ...headers }, credentials: 'same-origin' };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = typeof body === 'string' ? body : JSON.stringify(body);
+    }
+    const res = await fetch(path, opts);
+    const text = await res.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+    if (!res.ok) throw Object.assign(new Error(data.error_description || data.detail || data.error || res.statusText), { status: res.status, data });
+    return data;
+  };
+  const say = (id, text, cls) => { const el = $(id); el.textContent = text || ''; el.className = 'msg' + (cls ? ' ' + cls : ''); };
+  const fmt = (iso) => iso ? new Date(iso).toLocaleString() : '';
+
+  // base64url <-> ArrayBuffer, the WebAuthn JSON convention.
+  const toBuf = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(s.length / 4) * 4, '=')), c => c.charCodeAt(0));
+  const toB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const decodeCreation = (pk) => ({ ...pk, challenge: toBuf(pk.challenge), user: { ...pk.user, id: toBuf(pk.user.id) },
+    excludeCredentials: (pk.excludeCredentials || []).map(c => ({ ...c, id: toBuf(c.id) })) });
+  const decodeAssertion = (pk) => ({ ...pk, challenge: toBuf(pk.challenge),
+    allowCredentials: (pk.allowCredentials || []).map(c => ({ ...c, id: toBuf(c.id) })) });
+  const encodeCredential = (cred) => {
+    const r = cred.response;
+    const out = { id: cred.id, rawId: toB64(cred.rawId), type: cred.type, clientExtensionResults: cred.getClientExtensionResults(),
+      authenticatorAttachment: cred.authenticatorAttachment || undefined,
+      response: { clientDataJSON: toB64(r.clientDataJSON) } };
+    if (r.attestationObject) {
+      out.response.attestationObject = toB64(r.attestationObject);
+      if (r.getTransports) out.response.transports = r.getTransports();
+    } else {
+      out.response.authenticatorData = toB64(r.authenticatorData);
+      out.response.signature = toB64(r.signature);
+      if (r.userHandle) out.response.userHandle = toB64(r.userHandle);
+    }
+    return out;
+  };
+
+  let state = { authenticated: false, method: '', setup_required: true };
+  let secretFor = null; // {serviceId, credential} shown exactly once
+
+  async function refreshSession() {
+    state = await api('GET', '/admin/session');
+    $('gate').classList.toggle('hidden', state.authenticated);
+    $('app').classList.toggle('hidden', !state.authenticated);
+    $('logout').classList.toggle('hidden', !state.authenticated);
+    $('gate-login').classList.toggle('hidden', state.setup_required);
+    $('gate-setup').classList.toggle('hidden', !state.setup_required);
+    $('who').textContent = state.authenticated
+      ? (state.method === 'passkey' ? 'Signed in with passkey' + (state.expires_at ? ' · until ' + new Date(state.expires_at).toLocaleTimeString() : '') : 'Using bootstrap token')
+      : '';
+    if (state.authenticated) await Promise.all([loadServices(), loadPasskeys()]);
+  }
+
+  async function registerPasskey(name, headers, msgId) {
+    if (!window.PublicKeyCredential) throw new Error('This browser does not support passkeys.');
+    const begin = await api('POST', '/admin/passkeys/begin', undefined, headers);
+    const cred = await navigator.credentials.create({ publicKey: decodeCreation(begin.options.publicKey) });
+    const q = new URLSearchParams({ challenge: begin.challenge_id, name });
+    const pk = await api('POST', '/admin/passkeys/finish?' + q, encodeCredential(cred), headers);
+    say(msgId, 'Registered "' + pk.name + '".', 'ok');
+  }
+
+  $('setup').onclick = async () => {
+    const token = $('setup-token').value.trim();
+    const name = $('setup-name').value.trim() || 'First passkey';
+    if (!token) return say('gate-msg', 'Admin token required.', 'err');
+    try {
+      await registerPasskey(name, { Authorization: 'Bearer ' + token }, 'gate-msg');
+      $('setup-token').value = '';
+      say('gate-msg', 'Passkey registered. Sign in with it now.', 'ok');
+      await refreshSession();
+    } catch (e) { say('gate-msg', e.message, 'err'); }
+  };
+
+  $('login').onclick = async () => {
+    try {
+      const begin = await api('POST', '/admin/login/begin');
+      const cred = await navigator.credentials.get({ publicKey: decodeAssertion(begin.options.publicKey) });
+      await api('POST', '/admin/login/finish?challenge=' + encodeURIComponent(begin.challenge_id), encodeCredential(cred));
+      say('gate-msg', '');
+      await refreshSession();
+    } catch (e) { say('gate-msg', e.message, 'err'); }
+  };
+
+  $('logout').onclick = async () => { await api('POST', '/admin/logout'); secretFor = null; await refreshSession(); };
+
+  $('pk-add').onclick = async () => {
+    try { await registerPasskey($('pk-name').value.trim() || 'Passkey', {}, 'pk-msg'); $('pk-name').value = ''; await loadPasskeys(); }
+    catch (e) { say('pk-msg', e.message, 'err'); }
+  };
+
+  $('svc-create').onclick = async () => {
+    try {
+      const svc = await api('POST', '/admin/services', { Name: $('svc-name').value, Slug: $('svc-slug').value });
+      $('svc-name').value = ''; $('svc-slug').value = '';
+      say('svc-msg', 'Created ' + svc.name + ' (' + svc.id + ').', 'ok');
+      await loadServices();
+    } catch (e) { say('svc-msg', e.message, 'err'); }
+  };
+
+  async function loadPasskeys() {
+    const { passkeys } = await api('GET', '/admin/passkeys');
+    const el = $('passkeys');
+    el.innerHTML = '';
+    if (!passkeys.length) { el.innerHTML = '<p class="muted">None registered. Add one below.</p>'; return; }
+    const t = document.createElement('table');
+    t.innerHTML = '<tr><th>Name</th><th>Registered</th><th>Id</th></tr>';
+    for (const k of passkeys) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td></td><td class="muted"></td><td class="mono muted"></td>`;
+      tr.children[0].textContent = k.name; tr.children[1].textContent = fmt(k.created_at); tr.children[2].textContent = k.id.slice(0, 12) + '…';
+      t.appendChild(tr);
+    }
+    el.appendChild(t);
+  }
+
+  async function loadServices() {
+    const { services } = await api('GET', '/admin/services');
+    const el = $('services');
+    el.innerHTML = '';
+    if (!services.length) { el.innerHTML = '<p class="muted">No services yet.</p>'; return; }
+    for (const svc of services) el.appendChild(await renderService(svc));
+  }
+
+  async function renderService(svc) {
+    const wrap = document.createElement('div');
+    wrap.className = 'svc';
+    const { credentials } = await api('GET', `/admin/services/${svc.id}/credentials`);
+    const live = credentials.filter(c => !c.revoked).length;
+    wrap.innerHTML = `
+      <div class="title">
+        <div><b></b> <span class="mono muted"></span></div>
+        <div class="row"><span class="pill"></span><button class="small mint">Mint credential</button></div>
+      </div>
+      <div class="secret hidden"></div>
+      <details><summary>${credentials.length} credential${credentials.length === 1 ? '' : 's'}, ${live} active</summary><div class="creds"></div></details>
+      <p class="msg"></p>`;
+    wrap.querySelector('b').textContent = svc.name;
+    wrap.querySelector('.title .mono').textContent = svc.slug + ' · ' + svc.id;
+    const pill = wrap.querySelector('.pill'); pill.textContent = svc.status; pill.classList.add(svc.status === 'active' ? 'ok' : 'off');
+    const msg = wrap.querySelector('.msg');
+
+    const creds = wrap.querySelector('.creds');
+    if (credentials.length) {
+      const t = document.createElement('table');
+      t.innerHTML = '<tr><th>Ends in</th><th>Id</th><th>Created</th><th>Status</th><th></th></tr>';
+      for (const c of credentials) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td class="mono">····<b></b></td><td class="mono muted"></td><td class="muted"></td><td></td><td style="text-align:right"></td>`;
+        tr.children[0].querySelector('b').textContent = c.last4;
+        tr.children[1].textContent = c.id;
+        tr.children[2].textContent = fmt(c.created_at);
+        tr.children[3].innerHTML = c.revoked ? '<span class="pill off">revoked</span>' : '<span class="pill ok">active</span>';
+        if (!c.revoked) {
+          const b = document.createElement('button'); b.className = 'small danger'; b.textContent = 'Revoke';
+          b.onclick = async () => {
+            if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Confirm revoke'; setTimeout(() => { b.dataset.armed = ''; b.textContent = 'Revoke'; }, 4000); return; }
+            try { await api('DELETE', `/admin/services/${svc.id}/credentials/${c.id}`); await loadServices(); }
+            catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+          };
+          tr.children[4].appendChild(b);
+        }
+        t.appendChild(tr);
+      }
+      creds.appendChild(t);
+    } else creds.innerHTML = '<p class="muted">No credentials minted.</p>';
+
+    const secret = wrap.querySelector('.secret');
+    if (secretFor && secretFor.serviceId === svc.id) showSecret(secret, secretFor.credential);
+    wrap.querySelector('.mint').onclick = async () => {
+      try {
+        const out = await api('POST', `/admin/services/${svc.id}/credentials`);
+        secretFor = { serviceId: svc.id, credential: out.credential };
+        await loadServices();
+      } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+    };
+    return wrap;
+  }
+
+  function showSecret(el, credential) {
+    el.classList.remove('hidden');
+    el.innerHTML = `<div><b>New credential.</b> This is the only time it will be shown. Store it in the service's secrets now.</div><code></code><div class="row"><button class="small copy">Copy</button><button class="small done">I have stored it</button></div>`;
+    el.querySelector('code').textContent = credential;
+    el.querySelector('.copy').onclick = async (ev) => { await navigator.clipboard.writeText(credential); ev.target.textContent = 'Copied'; };
+    el.querySelector('.done').onclick = () => { secretFor = null; el.classList.add('hidden'); el.innerHTML = ''; };
+  }
+
+  refreshSession().catch(e => { $('gate').classList.remove('hidden'); say('gate-msg', e.message, 'err'); });
+})();
+</script>
+</body>
+</html>

@@ -14,7 +14,8 @@ don't invent new ones, log proposals in flightdeck (project slug `auth-service`)
 - Layout: `cmd/api` (Lambda + local listener) · `cmd/worker` (SQS consumer) ·
   `internal/core` (business rules) · `internal/httpapi` (HTTP) · `internal/store`
   (Store interface: DynamoDB + in-memory) · `internal/signer` (Signer: KMS + local ECDSA) ·
-  `internal/jwt` (ES256 compact JWS, JWKS) · `internal/config` (AUTH_* env).
+  `internal/jwt` (ES256 compact JWS, JWKS) · `internal/owner` (passkeys + console sessions,
+  go-webauthn) · `internal/config` (AUTH_* env).
 - Infra: `infra/template.yaml` (the whole stack) · `infra/bootstrap/github-oidc.yaml`
   (one-time: OIDC provider + deploy role) · `samconfig.toml` (stack `auth-service-prod`, us-east-1).
 - Secrets: none in the repo or in GitHub. The admin token's hash lives in SSM
@@ -33,9 +34,12 @@ Never hand-deploy the stack. `make deploy` exists for the first bootstrap only.
 Custom domain: repo vars `AUTH_DOMAIN_NAME` + `AUTH_CERTIFICATE_ARN`; empty = execute-api URL.
 
 ## Gotchas
-- `/admin/*` uses an interim bearer token until the owner passkey (auth-service-2) lands.
-  Mint: `openssl rand -base64 32`, store `sha256` hex in the SSM param, keep the plain
-  value in 1Password. Locally `AUTH_ADMIN_TOKEN` is used as-is.
+- `/admin/*` accepts a passkey session cookie (1h, `internal/owner`) or the interim bearer
+  token (break-glass until auth-service-4; also bootstraps the first passkey). Passkeys bind
+  to the issuer host, so they only work on auth.nathanblatter.com or localhost, never on the
+  execute-api URL. Locally `AUTH_ADMIN_TOKEN` is used as-is.
+- The console is `internal/httpapi/console.html`, embedded, vanilla JS, strict CSP. No build
+  step; keep it that way.
 - Revoking a credential stops new token exchanges; already-issued 15-minute service tokens
   stay valid until they expire (stateless JWT). Don't "fix" this with a DB lookup per
   request; shorten the TTL if it ever matters.
