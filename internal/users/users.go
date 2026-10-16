@@ -173,6 +173,78 @@ func (u *Users) LogoutEverywhere(ctx context.Context, serviceID, id string) erro
 	return nil
 }
 
+// Delete removes the account, its identity and passkeys (auth-service-13).
+// Refresh tokens die with it: the token endpoint refuses subjects whose user
+// row is gone. Already-issued access tokens run out within the hour.
+func (u *Users) Delete(ctx context.Context, serviceID, id string) error {
+	user, err := u.Get(ctx, serviceID, id)
+	if err != nil {
+		return err
+	}
+	if err := u.Store.DeleteUser(ctx, serviceID, id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrUserNotFound
+		}
+		return err
+	}
+	u.audit(ctx, "user.delete", serviceID, id, "method="+user.Method, "")
+	return nil
+}
+
+// Export is everything this service holds about a user, for a data-portability
+// request: the account record and passkey metadata (never key material) plus
+// the audit events that name the user this month and last.
+type Export struct {
+	ExportedAt time.Time          `json:"exported_at"`
+	User       store.User         `json:"user"`
+	Passkeys   []PasskeyMeta      `json:"passkeys"`
+	Audit      []store.AuditEvent `json:"audit"`
+}
+
+// PasskeyMeta is a passkey without its public key.
+type PasskeyMeta struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Export assembles the user's data.
+func (u *Users) Export(ctx context.Context, serviceID, id string) (Export, error) {
+	user, err := u.Get(ctx, serviceID, id)
+	if err != nil {
+		return Export{}, err
+	}
+	keys, err := u.Store.ListUserPasskeys(ctx, serviceID, id)
+	if err != nil {
+		return Export{}, err
+	}
+	out := Export{ExportedAt: u.Now(), User: user, Passkeys: make([]PasskeyMeta, 0, len(keys)), Audit: []store.AuditEvent{}}
+	for _, k := range keys {
+		out.Passkeys = append(out.Passkeys, PasskeyMeta{ID: k.ID, Name: k.Name, CreatedAt: k.CreatedAt})
+	}
+	actor := "usr:" + id
+	for _, month := range []string{u.Now().UTC().Format("2006-01"), u.Now().UTC().AddDate(0, -1, 0).Format("2006-01")} {
+		cursor := ""
+		for page := 0; page < 20; page++ { // bounded: at most 20 × 200 rows per month
+			events, next, err := u.Store.ListAudit(ctx, month, 200, cursor)
+			if err != nil {
+				return Export{}, err
+			}
+			for _, e := range events {
+				if e.Actor == actor && e.ServiceID == serviceID {
+					out.Audit = append(out.Audit, e)
+				}
+			}
+			if next == "" {
+				break
+			}
+			cursor = next
+		}
+	}
+	u.audit(ctx, "user.export", serviceID, id, "", "")
+	return out, nil
+}
+
 // AllowedScopes is the union of the scopes of the user's roles, in catalog order.
 func AllowedScopes(svc store.Service, user store.User) []string {
 	have := map[string]bool{}

@@ -158,6 +158,8 @@ or `google` (created on first Google sign-in).
 | GET | `/v1/users/{id}` | `user` |
 | PATCH | `/v1/users/{id}` | any of `{"roles":[…],"status":"active|disabled","name"}`; roles must exist on the service |
 | POST | `/v1/users/{id}/logout-everywhere` | `204`; refresh tokens issued earlier are refused |
+| GET | `/v1/users/{id}/export` | data-portability JSON: `{"exported_at","user","passkeys":[meta],"audit":[events naming the user, this month and last]}` |
+| DELETE | `/v1/users/{id}` | `204`; permanent. Removes the account, identity and passkeys; refresh tokens stop working. Your app owns the confirmation step |
 | GET | `/v1/users/{id}/passkeys` | `{"passkeys":[{"id","name","created_at"}]}` |
 | POST | `/v1/users/{id}/passkeys/begin` | `{"challenge_id","options"}` WebAuthn creation options bound to the service's `rp_id`/`origins` |
 | POST | `/v1/users/{id}/passkeys/finish?challenge=&name=` | body: the browser's credential JSON → `201` |
@@ -230,7 +232,7 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 
 Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `service.login.set`,
 `user.create`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
-`user.passkey.register`, `credential.mint`, `credential.revoke`,
+`user.passkey.register`, `user.export`, `user.delete`, `credential.mint`, `credential.revoke`,
 `token.issue`, `token.denied`, `passkey.register`, `owner.login`, `owner.login_denied`,
 `owner.stepup`, `owner.stepup_denied`, `owner.logout_everywhere`, `recovery.generate`,
 `recovery.login`, `recovery.denied`, `oauth.client.register`, `oauth.authorize.request`,

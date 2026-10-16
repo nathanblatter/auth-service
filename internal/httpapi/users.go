@@ -25,6 +25,8 @@ func (s *Server) userRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/users/{id}", s.requireService(s.getUser))
 	mux.HandleFunc("PATCH /v1/users/{id}", s.requireService(s.updateUser))
 	mux.HandleFunc("POST /v1/users/{id}/logout-everywhere", s.requireService(s.userLogoutEverywhere))
+	mux.HandleFunc("DELETE /v1/users/{id}", s.requireService(s.deleteUser))
+	mux.HandleFunc("GET /v1/users/{id}/export", s.requireService(s.exportUser))
 	mux.HandleFunc("GET /v1/users/{id}/passkeys", s.requireService(s.listUserPasskeys))
 	mux.HandleFunc("POST /v1/users/{id}/passkeys/begin", s.requireService(s.userPasskeyBegin))
 	mux.HandleFunc("POST /v1/users/{id}/passkeys/finish", s.requireService(s.userPasskeyFinish))
@@ -157,6 +159,32 @@ func (s *Server) userLogoutEverywhere(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// deleteUser is permanent (auth-service-13). The product is responsible for
+// its own confirmation / step-up before calling it.
+func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	if s.userFail(w, s.Users.Delete(r.Context(), svc.ID, r.PathValue("id"))) {
+		return
+	}
+	w.WriteHeader(204)
+}
+
+func (s *Server) exportUser(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	exp, err := s.Users.Export(r.Context(), svc.ID, r.PathValue("id"))
+	if s.userFail(w, err) {
+		return
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="`+exp.User.ID+`-export.json"`)
+	writeJSON(w, 200, exp)
 }
 
 func (s *Server) listUserPasskeys(w http.ResponseWriter, r *http.Request) {

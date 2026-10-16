@@ -209,3 +209,42 @@ func TestGoogleLoginAndProvider(t *testing.T) {
 		t.Fatalf("state reuse: %v", err)
 	}
 }
+
+func TestDeleteAndExport(t *testing.T) {
+	u, mem, svc := newUsers(t)
+	ctx := context.Background()
+	user, _ := u.Create(ctx, svc, "d@x.test", "D")
+	_ = mem.PutUserPasskey(ctx, store.UserPasskey{ServiceID: svc.ID, UserID: user.ID, ID: "c1", Name: "Phone", CreatedAt: u.Now(), Data: []byte(`{"id":"x"}`)})
+
+	exp, err := u.Export(ctx, svc.ID, user.ID)
+	if err != nil || exp.User.ID != user.ID || len(exp.Passkeys) != 1 || exp.Passkeys[0].Name != "Phone" {
+		t.Fatalf("export: %+v %v", exp, err)
+	}
+	// The creation event names the user and is included; no key material leaks.
+	found := false
+	for _, e := range exp.Audit {
+		if e.Kind == "user.create" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("export audit missing user.create: %+v", exp.Audit)
+	}
+	raw, _ := json.Marshal(exp)
+	if strings.Contains(string(raw), `"data"`) || strings.Contains(string(raw), `"Data"`) {
+		t.Fatal("export leaked passkey data")
+	}
+
+	if err := u.Delete(ctx, svc.ID, user.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.Get(ctx, svc.ID, user.ID); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("deleted user: %v", err)
+	}
+	if _, err := u.Create(ctx, svc, "d@x.test", "D again"); err != nil {
+		t.Fatalf("re-register after delete: %v", err)
+	}
+	if err := u.Delete(ctx, svc.ID, "usr_ghost"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("delete missing: %v", err)
+	}
+}

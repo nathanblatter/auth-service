@@ -596,3 +596,20 @@ func (m *Memory) GetUserPasskeyByCred(_ context.Context, serviceID, credID strin
 	}
 	return p, nil
 }
+
+func (m *Memory) DeleteUser(_ context.Context, serviceID, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[ukey(serviceID, id)]
+	if !ok {
+		return ErrNotFound
+	}
+	delete(m.users, ukey(serviceID, id))
+	delete(m.idents, ukey(serviceID, u.Identity))
+	for k, p := range m.upks {
+		if p.ServiceID == serviceID && p.UserID == id {
+			delete(m.upks, k)
+		}
+	}
+	return nil
+}

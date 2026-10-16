@@ -228,7 +228,11 @@ provider interface when Nathan buys the developer account.
 ### User management (service token)
 
 `GET /v1/users`, `GET /v1/users/{id}`, `PATCH /v1/users/{id}` (`roles`, `status`),
-`POST /v1/users/{id}/logout-everywhere`. Deletion and export are auth-service-13.
+`POST /v1/users/{id}/logout-everywhere`, `GET /v1/users/{id}/export` and `DELETE /v1/users/{id}`
+(auth-service-13). Deletion removes the user row, identity lock and passkeys in one go;
+refresh tokens fail at the token endpoint because the subject no longer resolves; access
+tokens expire within the hour. The export never includes key material. The product is
+responsible for confirming the user's intent (and its own step-up) before calling delete.
 
 ## Tokens
 

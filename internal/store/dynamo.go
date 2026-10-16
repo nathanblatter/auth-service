@@ -1314,3 +1314,28 @@ func (d *Dynamo) GetUserPasskeyByCred(ctx context.Context, serviceID, credID str
 	}
 	return it.toPasskey()
 }
+
+func (d *Dynamo) DeleteUser(ctx context.Context, serviceID, id string) error {
+	u, err := d.GetUser(ctx, serviceID, id)
+	if err != nil {
+		return err
+	}
+	keys, err := d.ListUserPasskeys(ctx, serviceID, id)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if _, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkUser+serviceID+"#"+id, skPasskey+k.ID)}); err != nil {
+			return err
+		}
+	}
+	// Identity lock and user row go together so a half-deleted account can
+	// neither sign in nor block re-registration.
+	_, err = d.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{Delete: &types.Delete{TableName: &d.table, Key: dynKey(pkIdent+serviceID+"#"+u.Identity, skMeta)}},
+			{Delete: &types.Delete{TableName: &d.table, Key: dynKey(pkUser+serviceID+"#"+id, skMeta)}},
+		},
+	})
+	return err
+}

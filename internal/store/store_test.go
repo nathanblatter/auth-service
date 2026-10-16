@@ -259,6 +259,25 @@ func conformance(t *testing.T, s Store) {
 	if ks, err := s.ListUserPasskeys(ctx, "svc_a", "u2"); err != nil || len(ks) != 1 || ks[0].Name != "Phone" {
 		t.Fatalf("ListUserPasskeys: %+v %v", ks, err)
 	}
+	// Deleting a user frees the identity and removes passkeys.
+	if err := s.DeleteUser(ctx, "svc_a", "u2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetUser(ctx, "svc_a", "u2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted user: %v", err)
+	}
+	if _, err := s.GetUserByIdentity(ctx, "svc_a", "email:b@x.test"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("identity not freed: %v", err)
+	}
+	if _, err := s.GetUserPasskeyByCred(ctx, "svc_a", "ucred1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("passkey not removed: %v", err)
+	}
+	if err := s.CreateUser(ctx, u2); err != nil {
+		t.Fatalf("re-register after delete: %v", err)
+	}
+	if err := s.DeleteUser(ctx, "svc_a", "ghost"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing: %v", err)
+	}
 
 	// Resources map to services, uniquely.
 	if err := s.AddServiceResource(ctx, "svc_a", "https://finforge.test/mcp"); err != nil {

@@ -174,7 +174,8 @@ type Store interface {
 	GetUser(ctx context.Context, serviceID, id string) (User, error)
 	GetUserByIdentity(ctx context.Context, serviceID, identity string) (User, error)
 	ListUsers(ctx context.Context, serviceID string, limit int, cursor string) (users []User, next string, err error)
-	UpdateUser(ctx context.Context, u User) error // ErrNotFound; replaces Email, Name, Roles, Status, NotBefore
+	UpdateUser(ctx context.Context, u User) error               // ErrNotFound; replaces Email, Name, Roles, Status, NotBefore
+	DeleteUser(ctx context.Context, serviceID, id string) error // removes the user, its identity lock and passkeys; ErrNotFound
 	PutUserPasskey(ctx context.Context, p UserPasskey) error
 	UpdateUserPasskey(ctx context.Context, p UserPasskey) error
 	ListUserPasskeys(ctx context.Context, serviceID, userID string) ([]UserPasskey, error)

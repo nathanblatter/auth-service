@@ -806,4 +806,18 @@ func TestUserPoolHTTP(t *testing.T) {
 	if code, _ := do(t, "POST", ts.URL+"/v1/users/"+gid+"/logout-everywhere", svcTok, "", ""); code != 204 {
 		t.Fatalf("user logout everywhere: %d", code)
 	}
+	// Export then delete; the refresh token dies with the account.
+	if code, exp := do(t, "GET", ts.URL+"/v1/users/"+gid+"/export", svcTok, "", ""); code != 200 || exp["user"] == nil || exp["audit"] == nil {
+		t.Fatalf("export: %d %v", code, exp)
+	}
+	if code, _ := do(t, "DELETE", ts.URL+"/v1/users/"+gid, svcTok, "", ""); code != 204 {
+		t.Fatalf("delete user: %d", code)
+	}
+	if code, _ := do(t, "GET", ts.URL+"/v1/users/"+gid, svcTok, "", ""); code != 404 {
+		t.Fatalf("deleted user still readable: %d", code)
+	}
+	form = url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {ut["refresh_token"].(string)}}
+	if code, body := do(t, "POST", ts.URL+"/oauth/token", "", "application/x-www-form-urlencoded", form.Encode()); code != 400 || body["error"] != "invalid_grant" {
+		t.Fatalf("refresh after delete: %d %v", code, body)
+	}
 }
