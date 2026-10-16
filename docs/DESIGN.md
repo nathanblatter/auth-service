@@ -254,7 +254,7 @@ signature, `iss`, `aud`, `exp`. The Go client library (auth-service-12) will wra
 
 ## Signing keys and rotation (auth-service-5)
 
-*Proposed.* Keys are `AWS::KMS::Key` resources in the template (`ECC_NIST_P256`,
+*Rehearsed in prod 2026-10-16.* Keys are `AWS::KMS::Key` resources in the template (`ECC_NIST_P256`,
 `SIGN_VERIFY`). `AUTH_SIGNING_KEY_IDS` is a comma-separated list; the **first** key signs,
 **all** of them are published in JWKS. Rotation is a template change:
 
@@ -265,6 +265,14 @@ signature, `iss`, `aud`, `exp`. The Go client library (auth-service-12) will wra
 
 Nobody gets logged out. No private key material exists outside KMS. Cost is about
 $1 per key per month.
+
+Rehearsal notes (A → B, 2026-10-16): step 1 at 19:00Z (`AUTH_SIGNING_KEY_IDS = B,A`,
+health `keys=2`, JWKS listed both kids, an A-signed token kept verifying while new tokens
+carried B's kid). Step 2 at 21:56Z, after the 15-minute service-token lifetime had long
+passed: A, its alias, its IAM grant and its output removed; the old key needs
+`DeletionPolicy: Delete` (default is Retain) or CloudFormation leaves it enabled and
+billing. Result: health `keys=1`, A-signed tokens 401, A `PendingDeletion` (30 days).
+Next rotation adds `SigningKeyC` and retires B the same way.
 
 ## Storage (DynamoDB single table)
 
