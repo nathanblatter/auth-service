@@ -30,7 +30,7 @@ jobs:
       - run: go vet ./...
       - uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.6
+          version: v2.14
       - run: go test -race ./...
       - run: go test -race -run TestDynamoLocal ./internal/store/
         env:
