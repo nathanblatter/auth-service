@@ -146,8 +146,12 @@ locally with `make dev`. No framework; `net/http` with Go 1.22+ pattern routing.
 ## Security notes
 
 - Secrets at rest are SHA-256 hashes; comparison is constant-time.
-- API Gateway stage throttling caps requests (bill protection). Per-IP brute-force limits
-  (auth-service-6) need a shared counter; planned as DynamoDB counters with TTL in slice 2.
+- API Gateway stage throttling caps raw volume (bill protection). Brute force
+  (auth-service-6) is handled by **failure counters** in the table (`RATE#<key>` with a window
+  end): 30 failed exchanges per IP per 10 min, 10 failed exchanges per service id per 15 min
+  (locks that service's token endpoint), 20 failed passkey ceremonies per IP per 10 min.
+  Successes are never throttled. The counter store failing open is deliberate: an outage of
+  the table already stops everything else.
 - `/admin/*` additionally refuses requests whose token is missing or wrong without revealing
   which. Admin actions are audited.
 - Lambda role has least privilege: the table, the signing keys, the queue, the SSM parameter.

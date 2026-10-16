@@ -12,12 +12,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/nathanblatter/auth-service/internal/core"
 	"github.com/nathanblatter/auth-service/internal/jwt"
 	"github.com/nathanblatter/auth-service/internal/owner"
+	"github.com/nathanblatter/auth-service/internal/ratelimit"
 	"github.com/nathanblatter/auth-service/internal/store"
 )
 
@@ -32,6 +34,8 @@ type Server struct {
 	Core *core.Core
 	// Owner handles passkey sign-in and console sessions. Required.
 	Owner *owner.Owner
+	// Limit counts failures for brute-force protection. Required.
+	Limit *ratelimit.Limiter
 	// AdminTokenHash is the hex SHA-256 of the interim admin bearer token
 	// (break-glass until auth-service-4). Empty disables bearer admin auth.
 	AdminTokenHash string
@@ -138,9 +142,21 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, 401, "invalid_client", "client_id and client_secret required")
 		return
 	}
-	tok, err := s.Core.ExchangeCredential(r.Context(), clientID, secret, clientIP(r))
+	ip := clientIP(r)
+	ipKey, clientKey := "token:ip:"+ip, "token:client:"+clientID
+	if !s.Limit.Allow(r.Context(), ratelimit.TokenIP, ipKey) {
+		tooMany(w, ratelimit.TokenIP)
+		return
+	}
+	if !s.Limit.Allow(r.Context(), ratelimit.TokenClient, clientKey) {
+		tooMany(w, ratelimit.TokenClient)
+		return
+	}
+	tok, err := s.Core.ExchangeCredential(r.Context(), clientID, secret, ip)
 	switch {
 	case errors.Is(err, core.ErrCredentialInvalid):
+		s.Limit.Fail(r.Context(), ratelimit.TokenIP, ipKey)
+		s.Limit.Fail(r.Context(), ratelimit.TokenClient, clientKey)
 		oauthError(w, 401, "invalid_client", "")
 	case errors.Is(err, core.ErrServiceDisabled):
 		oauthError(w, 403, "unauthorized_client", "service is disabled")
@@ -269,6 +285,10 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) loginBegin(w http.ResponseWriter, r *http.Request) {
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, "login:ip:"+clientIP(r)) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
 	opts, chID, err := s.Owner.BeginLogin(r.Context())
 	if errors.Is(err, owner.ErrNoPasskeys) {
 		writeJSON(w, 409, map[string]string{"error": "setup_required"})
@@ -283,8 +303,14 @@ func (s *Server) loginBegin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) loginFinish(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	ipKey := "login:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, ipKey) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
 	tok, exp, err := s.Owner.FinishLogin(r.Context(), r.URL.Query().Get("challenge"), r)
 	if errors.Is(err, owner.ErrCeremony) {
+		s.Limit.Fail(r.Context(), ratelimit.LoginIP, ipKey)
 		writeJSON(w, 401, map[string]string{"error": "passkey_rejected"})
 		return
 	}
@@ -332,8 +358,14 @@ func (s *Server) passkeyBegin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) passkeyFinish(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	q := r.URL.Query()
+	ipKey := "login:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, ipKey) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
 	pk, err := s.Owner.FinishRegistration(r.Context(), q.Get("challenge"), q.Get("name"), r)
 	if errors.Is(err, owner.ErrCeremony) {
+		s.Limit.Fail(r.Context(), ratelimit.LoginIP, ipKey)
 		writeJSON(w, 400, map[string]string{"error": "passkey_rejected"})
 		return
 	}
@@ -471,6 +503,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// tooMany answers a brute-force lockout. Same body shape for OAuth and JSON
+// callers; Retry-After is the policy window.
+func tooMany(w http.ResponseWriter, p ratelimit.Policy) {
+	w.Header().Set("Retry-After", strconv.Itoa(p.RetryAfter()))
+	writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too_many_attempts",
+		"error_description": "too many failed attempts; try again later"})
 }
 
 func oauthError(w http.ResponseWriter, status int, code, desc string) {

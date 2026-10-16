@@ -16,7 +16,13 @@ type Memory struct {
 	passkeys map[string]Passkey
 	chals    map[string]challenge
 	sessions map[string]Session
+	fails    map[string]failCounter
 	Audit    []AuditEvent
+}
+
+type failCounter struct {
+	count int
+	until time.Time
 }
 
 type challenge struct {
@@ -29,6 +35,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		services: map[string]Service{}, slugs: map[string]string{}, creds: map[string]Credential{},
 		passkeys: map[string]Passkey{}, chals: map[string]challenge{}, sessions: map[string]Session{},
+		fails: map[string]failCounter{},
 	}
 }
 
@@ -192,4 +199,26 @@ func (m *Memory) DeleteSession(_ context.Context, hash string) error {
 	defer m.mu.Unlock()
 	delete(m.sessions, hash)
 	return nil
+}
+
+func (m *Memory) FailureCount(_ context.Context, key string, now time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.fails[key]
+	if !ok || !now.Before(c.until) {
+		return 0, nil
+	}
+	return c.count, nil
+}
+
+func (m *Memory) RecordFailure(_ context.Context, key string, now time.Time, window time.Duration) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.fails[key]
+	if !ok || !now.Before(c.until) {
+		c = failCounter{count: 0, until: now.Add(window)}
+	}
+	c.count++
+	m.fails[key] = c
+	return c.count, nil
 }

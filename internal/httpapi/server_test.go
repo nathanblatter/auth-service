@@ -13,6 +13,7 @@ import (
 
 	"github.com/nathanblatter/auth-service/internal/core"
 	"github.com/nathanblatter/auth-service/internal/owner"
+	"github.com/nathanblatter/auth-service/internal/ratelimit"
 	"github.com/nathanblatter/auth-service/internal/signer"
 	"github.com/nathanblatter/auth-service/internal/store"
 )
@@ -40,7 +41,7 @@ func newServerWithStore(t *testing.T, issuer string) (*httptest.Server, *store.M
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{Core: c, Owner: own, AdminTokenHash: core.HashSecret(adminToken), Version: "test"}
+	srv := &Server{Core: c, Owner: own, Limit: ratelimit.New(mem), AdminTokenHash: core.HashSecret(adminToken), Version: "test"}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, mem
@@ -195,7 +196,7 @@ func TestAdminDisabledWhenNoHash(t *testing.T) {
 	ring, _ := signer.NewRing(s)
 	mem := store.NewMemory()
 	own, _ := owner.New(mem, "https://auth.test")
-	srv := &Server{Core: core.New(mem, ring, "https://auth.test"), Owner: own}
+	srv := &Server{Core: core.New(mem, ring, "https://auth.test"), Owner: own, Limit: ratelimit.New(mem)}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	// Empty hash: even an empty-string token must not match.
@@ -327,5 +328,46 @@ func TestCookieFlags(t *testing.T) {
 	}
 	if c == nil || !c.HttpOnly || !c.Secure || c.SameSite != http.SameSiteStrictMode || c.Path != "/admin" {
 		t.Fatalf("cookie flags: %+v", c)
+	}
+}
+
+func TestBruteForceLockout(t *testing.T) {
+	ts := newServer(t)
+	admin := "Bearer " + adminToken
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"Svc","slug":"svc"}`)
+	id := svc["id"].(string)
+	_, cred := do(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", admin, "", "")
+	raw := cred["credential"].(string)
+
+	bad := url.Values{"grant_type": {"client_credentials"}, "client_id": {id}, "client_secret": {"nbk_wrong"}}
+	for i := 0; i < ratelimit.TokenClient.Limit; i++ {
+		if code, _ := do(t, "POST", ts.URL+"/v1/token", "", "application/x-www-form-urlencoded", bad.Encode()); code != 401 {
+			t.Fatalf("attempt %d: %d", i, code)
+		}
+	}
+	// The service is now locked, even for the right secret.
+	good := url.Values{"grant_type": {"client_credentials"}, "client_id": {id}, "client_secret": {raw}}
+	resp := doRaw(t, "POST", ts.URL+"/v1/token", map[string]string{"Content-Type": "application/x-www-form-urlencoded"}, good.Encode())
+	resp.Body.Close()
+	if resp.StatusCode != 429 || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("locked client: %d retry-after=%q", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	// Another service from the same IP still works until the IP limit (30) is reached.
+	_, svc2 := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"Two","slug":"two"}`)
+	_, cred2 := do(t, "POST", ts.URL+"/admin/services/"+svc2["id"].(string)+"/credentials", admin, "", "")
+	good2 := url.Values{"grant_type": {"client_credentials"}, "client_id": {svc2["id"].(string)}, "client_secret": {cred2["credential"].(string)}}
+	if code, _ := do(t, "POST", ts.URL+"/v1/token", "", "application/x-www-form-urlencoded", good2.Encode()); code != 200 {
+		t.Fatalf("other client from same ip: %d", code)
+	}
+
+	// Passkey ceremonies lock per IP after 20 failures.
+	for i := 0; i < ratelimit.LoginIP.Limit; i++ {
+		_, begin := do(t, "POST", ts.URL+"/admin/passkeys/begin", admin, "", "")
+		if code, _ := do(t, "POST", ts.URL+"/admin/passkeys/finish?challenge="+begin["challenge_id"].(string), admin, "application/json", `{"id":"junk"}`); code != 400 {
+			t.Fatalf("junk attestation %d: %d", i, code)
+		}
+	}
+	if code, body := do(t, "POST", ts.URL+"/admin/login/begin", "", "", ""); code != 429 || body["error"] != "too_many_attempts" {
+		t.Fatalf("login after lockout: %d %v", code, body)
 	}
 }

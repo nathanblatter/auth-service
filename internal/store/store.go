@@ -86,6 +86,11 @@ type Store interface {
 	PutChallenge(ctx context.Context, id string, data []byte, expires time.Time) error
 	ConsumeChallenge(ctx context.Context, id string, now time.Time) ([]byte, error) // ErrNotFound when missing or expired
 
+	// Failure counters for brute-force protection. A counter is a key plus a
+	// window; failures outside the current window are forgotten.
+	FailureCount(ctx context.Context, key string, now time.Time) (int, error)
+	RecordFailure(ctx context.Context, key string, now time.Time, window time.Duration) (int, error)
+
 	PutSession(ctx context.Context, s Session) error
 	GetSession(ctx context.Context, hash string, now time.Time) (Session, error) // ErrNotFound when missing or expired
 	DeleteSession(ctx context.Context, hash string) error

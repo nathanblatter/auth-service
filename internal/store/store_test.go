@@ -114,6 +114,25 @@ func conformance(t *testing.T, s Store) {
 		t.Fatalf("expired challenge accepted: %v", err)
 	}
 
+	// Failure counters: count inside the window, forget after it.
+	if n, err := s.FailureCount(ctx, "token:ip:1.1.1.1", now); err != nil || n != 0 {
+		t.Fatalf("fresh counter: %d %v", n, err)
+	}
+	for i := 1; i <= 3; i++ {
+		if n, err := s.RecordFailure(ctx, "token:ip:1.1.1.1", now, 10*time.Minute); err != nil || n != i {
+			t.Fatalf("record %d: %d %v", i, n, err)
+		}
+	}
+	if n, _ := s.FailureCount(ctx, "token:ip:1.1.1.1", now.Add(9*time.Minute)); n != 3 {
+		t.Fatalf("count in window: %d", n)
+	}
+	if n, _ := s.FailureCount(ctx, "token:ip:1.1.1.1", now.Add(11*time.Minute)); n != 0 {
+		t.Fatalf("count after window: %d", n)
+	}
+	if n, err := s.RecordFailure(ctx, "token:ip:1.1.1.1", now.Add(11*time.Minute), 10*time.Minute); err != nil || n != 1 {
+		t.Fatalf("new window restarts at 1: %d %v", n, err)
+	}
+
 	// Sessions expire and can be deleted.
 	sess := Session{Hash: "h1", CreatedAt: now, ExpiresAt: now.Add(time.Hour), IP: "1.2.3.4"}
 	if err := s.PutSession(ctx, sess); err != nil {

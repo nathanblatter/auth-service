@@ -29,6 +29,7 @@ const (
 	skPasskey   = "PASSKEY#"
 	pkChallenge = "CHALLENGE#"
 	pkSession   = "SESSION#"
+	pkRate      = "RATE#"
 )
 
 // DynamoAPI is the slice of the DynamoDB client the store uses.
@@ -98,7 +99,7 @@ func (d *Dynamo) CreateService(ctx context.Context, s Service) error {
 }
 
 func (d *Dynamo) GetService(ctx context.Context, id string) (Service, error) {
-	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: key(pkService+id, skMeta)})
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkService+id, skMeta)})
 	if err != nil {
 		return Service{}, err
 	}
@@ -207,7 +208,7 @@ func (d *Dynamo) ListCredentials(ctx context.Context, serviceID string) ([]Crede
 func (d *Dynamo) RevokeCredential(ctx context.Context, serviceID, credID string, at time.Time) error {
 	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:           &d.table,
-		Key:                 key(pkService+serviceID, skCred+credID),
+		Key:                 dynKey(pkService+serviceID, skCred+credID),
 		UpdateExpression:    aws.String("SET revoked_at = if_not_exists(revoked_at, :t)"),
 		ConditionExpression: aws.String("attribute_exists(PK)"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
@@ -239,7 +240,7 @@ func (d *Dynamo) AppendAudit(ctx context.Context, e AuditEvent) error {
 	return err
 }
 
-func key(pk, sk string) map[string]types.AttributeValue {
+func dynKey(pk, sk string) map[string]types.AttributeValue {
 	return map[string]types.AttributeValue{
 		"PK": &types.AttributeValueMemberS{Value: pk},
 		"SK": &types.AttributeValueMemberS{Value: sk},
@@ -315,7 +316,7 @@ func (d *Dynamo) UpdatePasskey(ctx context.Context, p Passkey) error {
 	}
 	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                &d.table,
-		Key:                      key(pkOwner, skPasskey+p.ID),
+		Key:                      dynKey(pkOwner, skPasskey+p.ID),
 		UpdateExpression:         aws.String("SET #d = :d, #n = :n"),
 		ConditionExpression:      aws.String("attribute_exists(PK)"),
 		ExpressionAttributeNames: map[string]string{"#d": "data", "#n": "name"},
@@ -372,7 +373,7 @@ func (d *Dynamo) PutChallenge(ctx context.Context, id string, data []byte, expir
 
 func (d *Dynamo) ConsumeChallenge(ctx context.Context, id string, now time.Time) ([]byte, error) {
 	out, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: &d.table, Key: key(pkChallenge+id, skMeta), ReturnValues: types.ReturnValueAllOld,
+		TableName: &d.table, Key: dynKey(pkChallenge+id, skMeta), ReturnValues: types.ReturnValueAllOld,
 	})
 	if err != nil {
 		return nil, err
@@ -405,7 +406,7 @@ func (d *Dynamo) PutSession(ctx context.Context, s Session) error {
 }
 
 func (d *Dynamo) GetSession(ctx context.Context, hash string, now time.Time) (Session, error) {
-	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: key(pkSession+hash, skMeta)})
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkSession+hash, skMeta)})
 	if err != nil {
 		return Session{}, err
 	}
@@ -425,6 +426,71 @@ func (d *Dynamo) GetSession(ctx context.Context, hash string, now time.Time) (Se
 }
 
 func (d *Dynamo) DeleteSession(ctx context.Context, hash string) error {
-	_, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: key(pkSession+hash, skMeta)})
+	_, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkSession+hash, skMeta)})
 	return err
+}
+
+type rateItem struct {
+	PK, SK string
+	Type   string `dynamodbav:"type"`
+	Count  int    `dynamodbav:"count"`
+	Until  int64  `dynamodbav:"until"` // epoch seconds the window ends
+	TTL    int64  `dynamodbav:"ttl"`
+}
+
+func (d *Dynamo) FailureCount(ctx context.Context, key string, now time.Time) (int, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkRate+key, skMeta)})
+	if err != nil {
+		return 0, err
+	}
+	if out.Item == nil {
+		return 0, nil
+	}
+	var it rateItem
+	if err := attributevalue.UnmarshalMap(out.Item, &it); err != nil {
+		return 0, err
+	}
+	if now.Unix() >= it.Until {
+		return 0, nil
+	}
+	return it.Count, nil
+}
+
+// RecordFailure increments the counter inside a live window, or starts a new
+// window when none is live. Two steps, both conditional, so concurrent
+// failures never lose a count.
+func (d *Dynamo) RecordFailure(ctx context.Context, key string, now time.Time, window time.Duration) (int, error) {
+	out, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                &d.table,
+		Key:                      dynKey(pkRate+key, skMeta),
+		UpdateExpression:         aws.String("ADD #c :one"),
+		ConditionExpression:      aws.String("attribute_exists(PK) AND #u > :now"),
+		ExpressionAttributeNames: map[string]string{"#c": "count", "#u": "until"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":one": &types.AttributeValueMemberN{Value: "1"},
+			":now": &types.AttributeValueMemberN{Value: fmt.Sprint(now.Unix())},
+		},
+		ReturnValues: types.ReturnValueAllNew,
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		// No live window: start one at 1.
+		until := now.Add(window).Unix()
+		item, err := attributevalue.MarshalMap(rateItem{PK: pkRate + key, SK: skMeta, Type: "rate", Count: 1, Until: until, TTL: until + 60})
+		if err != nil {
+			return 0, err
+		}
+		if _, err := d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item}); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var it rateItem
+	if err := attributevalue.UnmarshalMap(out.Attributes, &it); err != nil {
+		return 0, err
+	}
+	return it.Count, nil
 }
