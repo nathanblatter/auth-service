@@ -57,11 +57,16 @@ jobs:
         env:
           VERSION: ${{ github.sha }}
       - name: sam deploy
+        env:
+          DOMAIN: ${{ vars.AUTH_DOMAIN_NAME }}
+          CERT: ${{ vars.AUTH_CERTIFICATE_ARN }}
         run: |
-          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              DomainName="${{ vars.AUTH_DOMAIN_NAME }}" \
-              CertificateArn="${{ vars.AUTH_CERTIFICATE_ARN }}"
+          # Custom domain only when both repo variables are set; SAM rejects empty overrides.
+          OVERRIDES=()
+          if [ -n "$DOMAIN" ] && [ -n "$CERT" ]; then
+            OVERRIDES=(--parameter-overrides "DomainName=$DOMAIN" "CertificateArn=$CERT")
+          fi
+          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset "${OVERRIDES[@]}"
       - name: smoke test
         run: |
           URL=$(aws cloudformation describe-stacks --stack-name auth-service-prod \
