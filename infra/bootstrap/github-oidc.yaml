@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time bootstrap for auth-service CI: the GitHub OIDC identity provider and
+  a deploy role that only pushes from nathanblatter/auth-service main may assume.
+  Deployed by hand once (make bootstrap); everything else goes through CI.
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Default: nathanblatter/auth-service
+  StackPrefix:
+    Type: String
+    Default: auth-service
+    Description: CI may only touch CloudFormation stacks and resources named with this prefix.
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      # GitHub's provider is validated by AWS via its root CA now; the thumbprint
+      # is still a required field, so this is the documented placeholder.
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${StackPrefix}-github-deploy
+      Description: Assumed by GitHub Actions to run sam deploy for auth-service
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Federated: !GetAtt GitHubOidcProvider.Arn }
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/main
+      Policies:
+        - PolicyName: sam-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Stacks
+                Effect: Allow
+                Action: cloudformation:*
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackPrefix}*/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31
+              - Sid: StackRead
+                Effect: Allow
+                Action: [cloudformation:ListStacks, cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: SamArtifacts
+                Effect: Allow
+                Action: [s3:CreateBucket, s3:PutBucketPolicy, s3:PutBucketVersioning, s3:PutEncryptionConfiguration, s3:PutBucketPublicAccessBlock, s3:GetBucketLocation, s3:ListBucket, s3:GetObject, s3:PutObject, s3:GetBucketPolicy, s3:GetEncryptionConfiguration, s3:GetBucketVersioning]
+                Resource:
+                  - arn:aws:s3:::aws-sam-cli-managed-default*
+                  - arn:aws:s3:::aws-sam-cli-managed-default*/*
+              - Sid: Lambda
+                Effect: Allow
+                Action: lambda:*
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackPrefix}*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*
+              - Sid: LambdaList
+                Effect: Allow
+                Action: [lambda:ListEventSourceMappings, lambda:GetEventSourceMapping]
+                Resource: "*"
+              - Sid: ApiGateway
+                Effect: Allow
+                Action: apigateway:*
+                Resource: !Sub arn:aws:apigateway:${AWS::Region}::/*
+              - Sid: DynamoDB
+                Effect: Allow
+                Action: dynamodb:*
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackPrefix}*
+              - Sid: Sqs
+                Effect: Allow
+                Action: sqs:*
+                Resource: !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${StackPrefix}*
+              - Sid: Kms
+                Effect: Allow
+                Action: [kms:CreateKey, kms:ListAliases]
+                Resource: "*"
+              - Sid: KmsManage
+                Effect: Allow
+                Action: [kms:DescribeKey, kms:GetKeyPolicy, kms:PutKeyPolicy, kms:ScheduleKeyDeletion, kms:CancelKeyDeletion, kms:TagResource, kms:UntagResource, kms:UpdateKeyDescription, kms:EnableKey, kms:DisableKey, kms:CreateAlias, kms:DeleteAlias, kms:UpdateAlias, kms:ListResourceTags, kms:GetPublicKey]
+                Resource:
+                  - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                  - !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/${StackPrefix}*
+              - Sid: Logs
+                Effect: Allow
+                Action: logs:*
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${StackPrefix}*
+              - Sid: LogsDescribe
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: "*"
+              - Sid: Alarms
+                Effect: Allow
+                Action: cloudwatch:*
+                Resource: !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${StackPrefix}*
+              - Sid: LambdaRoles
+                Effect: Allow
+                Action: [iam:CreateRole, iam:DeleteRole, iam:GetRole, iam:UpdateRole, iam:PassRole, iam:AttachRolePolicy, iam:DetachRolePolicy, iam:PutRolePolicy, iam:DeleteRolePolicy, iam:GetRolePolicy, iam:TagRole, iam:UntagRole, iam:UpdateAssumeRolePolicy, iam:ListRolePolicies, iam:ListAttachedRolePolicies]
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${StackPrefix}*
+              - Sid: ReadSsmParam
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${StackPrefix}/*
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn
+    Description: Put this in the repo as the AWS_DEPLOY_ROLE_ARN variable.

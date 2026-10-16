@@ -1,0 +1,72 @@
+name: Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  # The gate: identical to ci.yml so a red suite never deploys.
+  check:
+    name: gofmt · vet · lint · test
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:2.5.4
+        ports: ["8402:8000"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.6
+      - run: go test -race ./...
+      - run: go test -race -run TestDynamoLocal ./internal/store/
+        env:
+          AUTH_TEST_DYNAMO_ENDPOINT: http://localhost:8402
+
+  deploy:
+    name: sam deploy (prod)
+    needs: check
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: sam build
+        run: sam build --template infra/template.yaml
+        env:
+          VERSION: ${{ github.sha }}
+      - name: sam deploy
+        run: |
+          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              DomainName="${{ vars.AUTH_DOMAIN_NAME }}" \
+              CertificateArn="${{ vars.AUTH_CERTIFICATE_ARN }}"
+      - name: smoke test
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name auth-service-prod \
+                --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)
+          echo "API: $URL"
+          curl -fsS "$URL/health" | tee /dev/stderr | grep -q '"status":"ok"'
+          curl -fsS "$URL/.well-known/jwks.json" | grep -q '"kty":"EC"'

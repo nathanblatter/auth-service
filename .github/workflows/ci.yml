@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: gofmt · vet · lint · test
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:2.5.4
+        ports: ["8402:8000"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.6
+      - name: go test
+        run: go test -race ./...
+      - name: store tests against DynamoDB Local
+        run: go test -race -run TestDynamoLocal ./internal/store/
+        env:
+          AUTH_TEST_DYNAMO_ENDPOINT: http://localhost:8402
+      - name: validate SAM template
+        run: |
+          pip install --quiet aws-sam-cli
+          sam validate --lint --template infra/template.yaml --region us-east-1

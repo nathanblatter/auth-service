@@ -1,0 +1,18 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "auth-service-prod"
+region = "us-east-1"
+
+[default.build.parameters]
+template_file = "infra/template.yaml"
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+s3_prefix = "auth-service-prod"
+confirm_changeset = false
+fail_on_empty_changeset = false
+tags = "project=\"auth-service\""

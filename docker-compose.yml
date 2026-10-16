@@ -1,0 +1,8 @@
+# Local dependencies only. The API itself runs on the host via `make dev` so
+# you get fast rebuilds; prod is Lambda, not a container.
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.5.4
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8402:8000"

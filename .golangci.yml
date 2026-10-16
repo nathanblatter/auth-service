@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  # Standard set (errcheck, govet, ineffassign, staticcheck, unused) plus a few
+  # cheap, low-noise extras. Same config as flightdeck.
+  default: standard
+  enable:
+    - misspell
+    - unconvert
+    - nolintlint
+    - gosec
+  settings:
+    errcheck:
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+  exclusions:
+    rules:
+      - linters: [errcheck]
+        source: 'defer .*\.(Close|Rollback)\('
+      # Tests build throwaway servers; error handling there is noise.
+      - linters: [gosec, errcheck]
+        path: _test\.go

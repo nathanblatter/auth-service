@@ -1,0 +1,130 @@
+package core
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nathanblatter/auth-service/internal/signer"
+	"github.com/nathanblatter/auth-service/internal/store"
+)
+
+func newCore(t *testing.T) (*Core, *store.Memory) {
+	t.Helper()
+	s, err := signer.NewLocal("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring, err := signer.NewRing(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := store.NewMemory()
+	c := New(mem, ring, "https://auth.test")
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	c.Now = func() time.Time { return now }
+	return c, mem
+}
+
+func TestServiceLifecycle(t *testing.T) {
+	c, mem := newCore(t)
+	ctx := context.Background()
+	admin := Actor{ID: "admin", IP: "127.0.0.1"}
+
+	if _, err := c.CreateService(ctx, "X", "Bad Slug!", admin); !errors.Is(err, ErrInvalidSlug) {
+		t.Fatalf("bad slug: %v", err)
+	}
+	if _, err := c.CreateService(ctx, "", "ok", admin); !errors.Is(err, ErrInvalidName) {
+		t.Fatalf("bad name: %v", err)
+	}
+	svc, err := c.CreateService(ctx, "FinForge", "FinForge", admin)
+	if err != nil || svc.Slug != "finforge" || !strings.HasPrefix(svc.ID, "svc_") {
+		t.Fatalf("create: %+v %v", svc, err)
+	}
+	if _, err := c.CreateService(ctx, "Again", "finforge", admin); !errors.Is(err, ErrSlugTaken) {
+		t.Fatalf("dup slug: %v", err)
+	}
+
+	raw, cred, err := c.MintCredential(ctx, svc.ID, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(raw, "nbk_"+cred.ID+"_") || cred.Hash != HashSecret(raw) || !strings.HasSuffix(raw, cred.Last4) {
+		t.Fatalf("credential shape: %s %+v", raw, cred)
+	}
+	if _, _, err := c.MintCredential(ctx, "svc_missing", admin); !errors.Is(err, ErrServiceNotFound) {
+		t.Fatalf("mint for missing: %v", err)
+	}
+
+	tok, err := c.ExchangeCredential(ctx, svc.ID, raw, "1.2.3.4")
+	if err != nil || tok.TokenType != "Bearer" || tok.ExpiresIn != 900 {
+		t.Fatalf("exchange: %+v %v", tok, err)
+	}
+	id, claims, err := c.VerifyServiceToken(tok.AccessToken)
+	if err != nil || id != svc.ID || claims.Scope != ScopeService {
+		t.Fatalf("verify: %s %+v %v", id, claims, err)
+	}
+
+	// Wrong secret, wrong service, garbage: all the same error.
+	for name, in := range map[string][2]string{
+		"wrong secret":  {svc.ID, raw[:len(raw)-1] + "x"},
+		"other service": {"svc_other", raw},
+		"garbage":       {svc.ID, "nope"},
+		"short":         {svc.ID, "nbk_" + cred.ID + "_short"},
+	} {
+		if _, err := c.ExchangeCredential(ctx, in[0], in[1], ""); !errors.Is(err, ErrCredentialInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+
+	if err := c.RevokeCredential(ctx, svc.ID, cred.ID, admin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ExchangeCredential(ctx, svc.ID, raw, ""); !errors.Is(err, ErrCredentialInvalid) {
+		t.Fatalf("revoked still works: %v", err)
+	}
+	if err := c.RevokeCredential(ctx, svc.ID, "nope", admin); !errors.Is(err, ErrCredentialInvalid) {
+		t.Fatalf("revoke unknown: %v", err)
+	}
+
+	// Expired token.
+	c.Now = func() time.Time { return time.Date(2026, 10, 15, 13, 0, 0, 0, time.UTC) }
+	if _, _, err := c.VerifyServiceToken(tok.AccessToken); err == nil {
+		t.Fatal("expired token verified")
+	}
+
+	kinds := map[string]int{}
+	for _, e := range mem.Audit {
+		kinds[e.Kind]++
+	}
+	if kinds["service.create"] != 1 || kinds["credential.mint"] != 1 || kinds["credential.revoke"] != 1 ||
+		kinds["token.issue"] != 1 || kinds["token.denied"] != 5 {
+		t.Fatalf("audit trail: %v", kinds)
+	}
+}
+
+func TestDisabledService(t *testing.T) {
+	c, mem := newCore(t)
+	ctx := context.Background()
+	svc, err := c.CreateService(ctx, "Old", "old", Actor{ID: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := c.MintCredential(ctx, svc.ID, Actor{ID: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Flip status directly in the store; there is no admin API for this yet.
+	s, _ := mem.GetService(ctx, svc.ID)
+	s.Status = "disabled"
+	mem2 := store.NewMemory()
+	_ = mem2.CreateService(ctx, s)
+	creds, _ := mem.ListCredentials(ctx, svc.ID)
+	_ = mem2.PutCredential(ctx, creds[0])
+	c.Store = mem2
+	if _, err := c.ExchangeCredential(ctx, svc.ID, raw, ""); !errors.Is(err, ErrServiceDisabled) {
+		t.Fatalf("disabled: %v", err)
+	}
+}

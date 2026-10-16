@@ -1,0 +1,5 @@
+.env
+.aws-sam/
+bin/
+samconfig.local.toml
+*.pem
