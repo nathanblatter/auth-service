@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time bootstrap for the mail outbox bridge: an IAM user that may only
+  receive/delete on the auth-service MailQueue. Lives outside the main stack
+  because the CI deploy role has no IAM user rights (on purpose). Deployed by
+  hand once (aws cloudformation deploy --stack-name auth-service-mailbridge --template-file infra/bootstrap/mailbridge.yaml --capabilities CAPABILITY_NAMED_IAM); the access key is created by hand and
+  lives in ~/deploy/email-api/.env on the Mac mini.
+
+Parameters:
+  StackName:
+    Type: String
+    Default: auth-service-prod
+    Description: The main stack; its MailQueue is named <StackName>-mail.
+
+Resources:
+  MailBridgeUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub ${StackName}-mailbridge
+      Policies:
+        - PolicyName: drain-mail-queue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${StackName}-mail
+
+Outputs:
+  UserName:
+    Value: !Ref MailBridgeUser

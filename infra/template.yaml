@@ -137,19 +137,8 @@ Resources:
     Properties:
       QueueName: !Sub ${AWS::StackName}-mail-dlq
       MessageRetentionPeriod: 1209600
-  # Identity for the bridge. It may only receive/delete on MailQueue; its
-  # access key is created once by hand and lives in ~/deploy/email-api/.env.
-  MailBridgeUser:
-    Type: AWS::IAM::User
-    Properties:
-      Policies:
-        - PolicyName: drain-mail-queue
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
-                Resource: !GetAtt MailQueue.Arn
+  # The bridge's identity (IAM user, receive/delete on this queue only) is
+  # infra/bootstrap/mailbridge.yaml: the CI deploy role cannot manage IAM users.
 
   # ── API ──────────────────────────────────────────────────────────────────
   HttpApi:
@@ -328,6 +317,4 @@ Outputs:
   MailQueueUrl:
     Description: SQS_QUEUE_URL for email-api's sqs-bridge
     Value: !Ref MailQueue
-  MailBridgeUserName:
-    Description: IAM user whose access key the bridge uses (create the key by hand)
-    Value: !Ref MailBridgeUser
+
