@@ -82,7 +82,9 @@ Resources:
   # remove A once every token it signed has expired. See docs/DESIGN.md.
   SigningKeyA:
     Type: AWS::KMS::Key
-    DeletionPolicy: Retain
+    # Rotation step 2a: A is retired; Delete lets CloudFormation schedule the
+    # 30-day KMS deletion when the resource is removed in step 2b.
+    DeletionPolicy: Delete
     UpdateReplacePolicy: Retain
     Properties:
       Description: auth-service JWT signing key A (ES256)
