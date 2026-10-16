@@ -552,3 +552,45 @@ func TestRecoveryFlow(t *testing.T) {
 		t.Fatalf("reused code: %d", code)
 	}
 }
+
+func TestAuditAndLogoutEverywhere(t *testing.T) {
+	ts, mem := newServerWithStore(t, "https://auth.test")
+	ctx := context.Background()
+	admin := "Bearer " + adminToken
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"Audit","slug":"audit"}`)
+	_, _ = do(t, "POST", ts.URL+"/admin/services/"+svc["id"].(string)+"/credentials", admin, "", "")
+
+	if code, _ := do(t, "GET", ts.URL+"/admin/audit", "", "", ""); code != 401 {
+		t.Fatalf("audit unauthenticated: %d", code)
+	}
+	code, body := do(t, "GET", ts.URL+"/admin/audit?limit=1", admin, "", "")
+	if code != 200 || len(body["events"].([]any)) != 1 || body["next"] == "" {
+		t.Fatalf("audit page: %d %v", code, body)
+	}
+	first := body["events"].([]any)[0].(map[string]any)
+	if first["kind"] != "credential.mint" || first["actor"] != "admin:token" {
+		t.Fatalf("newest event: %v", first)
+	}
+	if code, _ := do(t, "GET", ts.URL+"/admin/audit?month=bad", admin, "", ""); code != 400 {
+		t.Fatalf("bad month: %d", code)
+	}
+
+	// Two sessions; logout-everywhere from one kills both.
+	now := time.Now()
+	for _, tok := range []string{"s1", "s2"} {
+		_ = mem.PutSession(ctx, store.Session{Hash: core.HashSecret(tok), CreatedAt: now.Add(-time.Second), ExpiresAt: now.Add(owner.SessionTTL)})
+	}
+	hdr := map[string]string{"Cookie": sessionCookie + "=s1", "Origin": "https://auth.test"}
+	resp := doRaw(t, "POST", ts.URL+"/admin/logout-everywhere", hdr, "")
+	resp.Body.Close()
+	if resp.StatusCode != 204 {
+		t.Fatalf("logout everywhere: %d", resp.StatusCode)
+	}
+	for _, tok := range []string{"s1", "s2"} {
+		resp = doRaw(t, "GET", ts.URL+"/admin/services", map[string]string{"Cookie": sessionCookie + "=" + tok}, "")
+		resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Fatalf("session %s survived: %d", tok, resp.StatusCode)
+		}
+	}
+}

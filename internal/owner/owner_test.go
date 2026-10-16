@@ -190,3 +190,29 @@ func TestRecoveryCodes(t *testing.T) {
 		t.Fatalf("audit: %v", kinds)
 	}
 }
+
+func TestLogoutEverywhere(t *testing.T) {
+	o, mem := newOwner(t)
+	ctx := context.Background()
+	now := o.Now()
+	old := randomToken()
+	_ = mem.PutSession(ctx, store.Session{Hash: hash(old), CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(SessionTTL)})
+	if _, err := o.ValidateSession(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.LogoutEverywhere(ctx, "ip"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ValidateSession(ctx, old); !errors.Is(err, ErrSessionInvalid) {
+		t.Fatalf("old session survived logout everywhere: %v", err)
+	}
+	// A session opened afterwards is fine.
+	o.Now = func() time.Time { return now.Add(time.Second) }
+	fresh, _, err := o.openSession(ctx, "passkey", "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ValidateSession(ctx, fresh); err != nil {
+		t.Fatalf("new session after logout everywhere: %v", err)
+	}
+}

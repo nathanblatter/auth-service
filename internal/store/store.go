@@ -118,6 +118,7 @@ type RefreshToken struct {
 	ServiceID string
 	Subject   string
 	Scope     string
+	IssuedAt  time.Time
 	ExpiresAt time.Time
 	Used      bool
 }
@@ -137,6 +138,9 @@ type Store interface {
 	RevokeCredential(ctx context.Context, serviceID, credID string, at time.Time) error
 
 	AppendAudit(ctx context.Context, e AuditEvent) error
+	// ListAudit returns one month's events, newest first. cursor is the SK to
+	// continue after ("" starts at the newest); next is "" when exhausted.
+	ListAudit(ctx context.Context, month string, limit int, cursor string) (events []AuditEvent, next string, err error)
 
 	// Owner passkeys (single owner; see docs/DESIGN.md).
 	PutPasskey(ctx context.Context, p Passkey) error // ErrConflict when the id exists
@@ -155,6 +159,11 @@ type Store interface {
 	PutSession(ctx context.Context, s Session) error
 	GetSession(ctx context.Context, hash string, now time.Time) (Session, error) // ErrNotFound when missing or expired
 	DeleteSession(ctx context.Context, hash string) error
+
+	// Owner "log out everywhere": sessions and refresh tokens created before
+	// this instant are dead. Zero time means never set.
+	GetOwnerNotBefore(ctx context.Context) (time.Time, error)
+	SetOwnerNotBefore(ctx context.Context, t time.Time) error
 
 	// Recovery codes: ReplaceRecoveryCodes wipes any existing set.
 	ReplaceRecoveryCodes(ctx context.Context, hashes []string, created time.Time) error

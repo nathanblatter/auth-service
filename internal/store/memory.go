@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ type Memory struct {
 	codes     map[string]Code
 	refresh   map[string]RefreshToken
 	recovery  map[string]RecoveryCode
+	notBefore time.Time
 	Audit     []AuditEvent
 }
 
@@ -382,5 +384,46 @@ func (m *Memory) ConsumeRecoveryCode(_ context.Context, hash string, now time.Ti
 	}
 	c.UsedAt = &now
 	m.recovery[hash] = c
+	return nil
+}
+
+func (m *Memory) ListAudit(_ context.Context, month string, limit int, cursor string) ([]AuditEvent, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var all []AuditEvent
+	for _, e := range m.Audit {
+		if e.At.UTC().Format("2006-01") == month {
+			all = append(all, e)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].At.After(all[j].At) })
+	// cursor is an index encoded as a string for the in-memory store.
+	start := 0
+	if cursor != "" {
+		if _, err := fmt.Sscanf(cursor, "%d", &start); err != nil {
+			return nil, "", fmt.Errorf("store: bad cursor %q", cursor)
+		}
+	}
+	if start >= len(all) {
+		return []AuditEvent{}, "", nil
+	}
+	end := min(start+limit, len(all))
+	next := ""
+	if end < len(all) {
+		next = fmt.Sprint(end)
+	}
+	return all[start:end], next, nil
+}
+
+func (m *Memory) GetOwnerNotBefore(_ context.Context) (time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.notBefore, nil
+}
+
+func (m *Memory) SetOwnerNotBefore(_ context.Context, t time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.notBefore = t
 	return nil
 }

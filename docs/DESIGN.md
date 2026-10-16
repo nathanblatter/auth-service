@@ -84,6 +84,19 @@ The owner (Nathan) is the one cross-tenant identity. He authenticates to the con
   session** that can manage passkeys but cannot approve connectors. Codes are single use and
   attempts count against the login brute-force limit.
 
+## Log out everywhere (auth-service-11) and the audit log (auth-service-7)
+
+`POST /admin/logout-everywhere` stamps `sessions_not_before = now` on the owner row. Console
+sessions created before it fail validation; connector refresh tokens issued before it are
+refused at the token endpoint (with an audit row), so every connector must be re-approved.
+Already-issued access JWTs run out within the hour. No index or scan is needed: it is one
+timestamp compared on use.
+
+`GET /admin/audit?month=YYYY-MM&limit=&cursor=` pages one month of `AUDIT#` rows newest
+first; the console has a card for it. Events now cover sign-ins (`owner.login`,
+`owner.login_denied`, `recovery.*`), credential and key changes, every OAuth step, and
+`owner.logout_everywhere`.
+
 ## Connector OAuth (auth-service-23, slice 2)
 
 **DECIDED (Nathan, 2026-10-15):** the OAuth 2.1 authorization server for Claude connectors is

@@ -81,6 +81,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/recovery-codes", s.requireAdmin(s.recoveryStatus))
 	mux.HandleFunc("POST /admin/recovery-codes", s.requireAdmin(s.recoveryGenerate))
 	mux.HandleFunc("POST /admin/recover", s.recoverLogin)
+	mux.HandleFunc("POST /admin/logout-everywhere", s.requireAdmin(s.logoutEverywhere))
+	mux.HandleFunc("GET /admin/audit", s.requireAdmin(s.audit))
 
 	mux.HandleFunc("POST /admin/services", s.requireAdmin(s.createService))
 	mux.HandleFunc("GET /admin/services", s.requireAdmin(s.listServices))
@@ -458,6 +460,45 @@ func (s *Server) recoverLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	http.SetCookie(w, s.cookie(tok, exp))
 	writeJSON(w, 200, map[string]any{"authenticated": true, "method": "recovery", "expires_at": exp.UTC().Format(time.RFC3339)})
+}
+
+// logoutEverywhere (auth-service-11) kills every console session and every
+// connector refresh token the owner holds, including the caller's.
+func (s *Server) logoutEverywhere(w http.ResponseWriter, r *http.Request) {
+	if err := s.Owner.LogoutEverywhere(r.Context(), clientIP(r)); err != nil {
+		s.fail(w, err)
+		return
+	}
+	http.SetCookie(w, s.cookie("", time.Unix(0, 0)))
+	w.WriteHeader(204)
+}
+
+// audit (auth-service-7) pages through one month of events, newest first.
+func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	month := q.Get("month")
+	if month == "" {
+		month = s.Core.Now().UTC().Format("2006-01")
+	}
+	if _, err := time.Parse("2006-01", month); err != nil {
+		writeJSON(w, 400, map[string]string{"error": "invalid_request", "detail": "month must be YYYY-MM"})
+		return
+	}
+	limit := 50
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 && n <= 200 {
+		limit = n
+	}
+	events, next, err := s.Core.Store.ListAudit(r.Context(), month, limit, q.Get("cursor"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(events))
+	for _, e := range events {
+		out = append(out, map[string]any{"at": e.At.UTC().Format(time.RFC3339Nano), "kind": e.Kind, "actor": e.Actor,
+			"service_id": e.ServiceID, "detail": e.Detail, "ip": e.IP})
+	}
+	writeJSON(w, 200, map[string]any{"month": month, "events": out, "next": next})
 }
 
 // cookie builds the session cookie. Secure is dropped only for an http issuer

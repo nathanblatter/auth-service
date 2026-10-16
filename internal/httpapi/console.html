@@ -123,7 +123,15 @@
         <input id="pk-name" class="grow" placeholder="Name for this device">
         <button id="pk-add">Add passkey for this device (backup)</button>
       </div>
+      <div class="row" style="margin-top:10px"><button id="logout-all" class="danger">Sign out everywhere</button><span class="muted" style="font-size:13px">Kills every console session and every connector's refresh token. Connectors reconnect with a new approval.</span></div>
       <p id="pk-msg" class="msg"></p>
+    </section>
+
+    <section class="card">
+      <h2>Audit log</h2>
+      <div class="row"><input id="audit-month" class="mono" style="max-width:120px" placeholder="YYYY-MM"><button id="audit-load" class="small">Load</button></div>
+      <div id="audit"></div>
+      <div class="row" style="margin-top:8px"><button id="audit-more" class="small hidden">Load more</button></div>
     </section>
   </div>
 </main>
@@ -198,8 +206,40 @@
       if (canApprove) await loadApproval();
       return;
     }
-    if (state.authenticated) await Promise.all([loadServices(), loadPasskeys(), loadRecovery()]);
+    if (state.authenticated) await Promise.all([loadServices(), loadPasskeys(), loadRecovery(), loadAudit(true)]);
   }
+
+  let auditCursor = '';
+  async function loadAudit(reset) {
+    const el = $('audit');
+    if (reset) { el.innerHTML = ''; auditCursor = ''; }
+    const month = $('audit-month').value.trim() || new Date().toISOString().slice(0, 7);
+    $('audit-month').value = month;
+    const q = new URLSearchParams({ month, limit: '50' });
+    if (auditCursor) q.set('cursor', auditCursor);
+    const out = await api('GET', '/admin/audit?' + q);
+    let t = el.querySelector('table');
+    if (!t) { t = document.createElement('table'); t.innerHTML = '<tr><th>When</th><th>Event</th><th>Actor</th><th>Detail</th><th>IP</th></tr>'; el.appendChild(t); }
+    for (const e of out.events) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td class="muted"></td><td class="mono"></td><td class="mono muted"></td><td class="muted"></td><td class="mono muted"></td>';
+      tr.children[0].textContent = fmt(e.at); tr.children[1].textContent = e.kind; tr.children[2].textContent = e.actor;
+      tr.children[3].textContent = (e.service_id ? e.service_id + ' ' : '') + (e.detail || ''); tr.children[4].textContent = e.ip || '';
+      t.appendChild(tr);
+    }
+    if (!out.events.length && !auditCursor) el.innerHTML = '<p class="muted">No events this month.</p>';
+    auditCursor = out.next || '';
+    $('audit-more').classList.toggle('hidden', !auditCursor);
+  }
+  $('audit-load').onclick = () => loadAudit(true).catch(e => say('pk-msg', e.message, 'err'));
+  $('audit-more').onclick = () => loadAudit(false).catch(e => say('pk-msg', e.message, 'err'));
+
+  $('logout-all').onclick = async () => {
+    const b = $('logout-all');
+    if (b.dataset.armed !== '1') { b.dataset.armed = '1'; b.textContent = 'Confirm: sign out everywhere'; setTimeout(() => { b.dataset.armed = ''; b.textContent = 'Sign out everywhere'; }, 5000); return; }
+    try { await api('POST', '/admin/logout-everywhere'); secretFor = null; await refreshSession(); }
+    catch (e) { say('pk-msg', e.message, 'err'); }
+  };
 
   async function loadRecovery() {
     const st = await api('GET', '/admin/recovery-codes');

@@ -345,7 +345,8 @@ func normalizeRecovery(s string) string {
 	return sb.String()
 }
 
-// ValidateSession resolves a cookie value to a live session.
+// ValidateSession resolves a cookie value to a live session. Sessions opened
+// before the owner's "log out everywhere" instant are dead even if unexpired.
 func (o *Owner) ValidateSession(ctx context.Context, token string) (store.Session, error) {
 	if token == "" {
 		return store.Session{}, ErrSessionInvalid
@@ -354,7 +355,28 @@ func (o *Owner) ValidateSession(ctx context.Context, token string) (store.Sessio
 	if errors.Is(err, store.ErrNotFound) {
 		return store.Session{}, ErrSessionInvalid
 	}
-	return s, err
+	if err != nil {
+		return store.Session{}, err
+	}
+	nb, err := o.Store.GetOwnerNotBefore(ctx)
+	if err != nil {
+		return store.Session{}, err
+	}
+	if !nb.IsZero() && s.CreatedAt.Before(nb) {
+		return store.Session{}, ErrSessionInvalid
+	}
+	return s, nil
+}
+
+// LogoutEverywhere invalidates every console session and every connector
+// refresh token issued to the owner before now (auth-service-11). Access
+// JWTs already issued stay valid until they expire (at most 1 hour).
+func (o *Owner) LogoutEverywhere(ctx context.Context, ip string) error {
+	if err := o.Store.SetOwnerNotBefore(ctx, o.Now()); err != nil {
+		return err
+	}
+	o.audit(ctx, "owner.logout_everywhere", "", ip)
+	return nil
 }
 
 // Logout ends a session. Unknown tokens are a no-op.

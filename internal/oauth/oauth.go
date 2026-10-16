@@ -394,6 +394,16 @@ func (s *Server) refresh(ctx context.Context, c store.OAuthClient, req TokenRequ
 	if row.ClientID != c.ID {
 		return TokenResponse{}, oerr(400, "invalid_grant", "refresh token belongs to another client")
 	}
+	if row.Subject == OwnerSubject {
+		nb, err := s.Store.GetOwnerNotBefore(ctx)
+		if err != nil {
+			return TokenResponse{}, err
+		}
+		if !nb.IsZero() && row.IssuedAt.Before(nb) {
+			s.audit(ctx, "oauth.refresh.denied", OwnerSubject, row.ServiceID, "client="+c.ID+" issued before logout-everywhere", ip)
+			return TokenResponse{}, oerr(400, "invalid_grant", "session was signed out everywhere; reconnect")
+		}
+	}
 	return s.mint(ctx, c.ID, row.ServiceID, row.Subject, row.Scope, row.Family, "oauth.refresh", ip)
 }
 
@@ -409,7 +419,7 @@ func (s *Server) mint(ctx context.Context, clientID, serviceID, subject, scope, 
 	refresh := random("nbrt_")
 	if err := s.Store.CreateRefresh(ctx, store.RefreshToken{
 		Hash: core.HashSecret(refresh), Family: family, ClientID: clientID, ServiceID: serviceID, Subject: subject, Scope: scope,
-		ExpiresAt: now.Add(RefreshTTL),
+		IssuedAt: now, ExpiresAt: now.Add(RefreshTTL),
 	}); err != nil {
 		return TokenResponse{}, err
 	}

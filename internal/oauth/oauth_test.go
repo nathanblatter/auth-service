@@ -195,3 +195,25 @@ func TestVerifyPKCE(t *testing.T) {
 		t.Fatal("pkce")
 	}
 }
+
+func TestLogoutEverywhereKillsRefresh(t *testing.T) {
+	s, mem, _ := newServer(t)
+	ctx := context.Background()
+	c, secret, _ := s.Register(ctx, RegisterRequest{RedirectURIs: []string{"https://claude.ai/cb"}}, "ip")
+	verifier, challenge := pkce()
+	p := AuthzParams{ClientID: c.ID, RedirectURI: "https://claude.ai/cb", ResponseType: "code", Challenge: challenge, Method: "S256", Resource: "https://finforge.test/mcp"}
+	out, _ := s.BeginAuthorize(ctx, p, "ip")
+	loc, _ := s.Approve(ctx, strings.TrimPrefix(out.ApproveURL, "https://auth.test/admin?approve="), "ip")
+	u, _ := url.Parse(loc)
+	tok, err := s.Token(ctx, TokenRequest{GrantType: "authorization_code", ClientID: c.ID, ClientSecret: secret, Code: u.Query().Get("code"), CodeVerifier: verifier}, "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Owner signs out everywhere one second later.
+	base := s.Now()
+	s.Now = func() time.Time { return base.Add(time.Second) }
+	_ = mem.SetOwnerNotBefore(ctx, s.Now())
+	s.Now = func() time.Time { return base.Add(2 * time.Second) }
+	_, err = s.Token(ctx, TokenRequest{GrantType: "refresh_token", ClientID: c.ID, ClientSecret: secret, RefreshToken: tok.RefreshToken}, "ip")
+	oauthErr(t, err, "invalid_grant")
+}

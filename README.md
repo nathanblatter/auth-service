@@ -56,6 +56,8 @@ curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 | GET/POST | `/admin/passkeys[/begin\|/finish]` | admin | list / register passkeys |
 | GET/POST | `/admin/recovery-codes` | admin | status / generate a new set (shown once) |
 | POST | `/admin/recover` | none | sign in with a recovery code (recovery session) |
+| POST | `/admin/logout-everywhere` | admin | kill all sessions and connector refresh tokens |
+| GET | `/admin/audit?month=YYYY-MM` | admin | page the audit log, newest first |
 | POST | `/admin/services` | admin | register a service |
 | GET | `/admin/services[/{id}]` | admin | list / fetch |
 | POST | `/admin/services/{id}/credentials` | admin | mint (shown once) |

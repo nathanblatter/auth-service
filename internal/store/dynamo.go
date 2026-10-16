@@ -708,6 +708,7 @@ type refreshItem struct {
 	ServiceID              string `dynamodbav:"service_id"`
 	Subject                string `dynamodbav:"subject"`
 	Scope                  string `dynamodbav:"scope,omitempty"`
+	IssuedAt               string `dynamodbav:"issued_at,omitempty"`
 	ExpiresAt              string `dynamodbav:"expires_at"`
 	Used                   bool   `dynamodbav:"used"`
 	TTL                    int64  `dynamodbav:"ttl"`
@@ -718,14 +719,16 @@ func (it refreshItem) toToken() (RefreshToken, error) {
 	if err != nil {
 		return RefreshToken{}, fmt.Errorf("store: bad expires_at on %s: %w", it.PK, err)
 	}
+	issued, _ := time.Parse(time.RFC3339Nano, it.IssuedAt)
 	return RefreshToken{Hash: strings.TrimPrefix(it.PK, pkRefresh), Family: it.Family, ClientID: it.ClientID, ServiceID: it.ServiceID,
-		Subject: it.Subject, Scope: it.Scope, ExpiresAt: exp, Used: it.Used}, nil
+		Subject: it.Subject, Scope: it.Scope, IssuedAt: issued, ExpiresAt: exp, Used: it.Used}, nil
 }
 
 func (d *Dynamo) CreateRefresh(ctx context.Context, t RefreshToken) error {
 	item, err := attributevalue.MarshalMap(refreshItem{
 		PK: pkRefresh + t.Hash, SK: skMeta, GSI1PK: gsiFamily + t.Family, GSI1SK: pkRefresh + t.Hash, Type: "refresh",
 		Family: t.Family, ClientID: t.ClientID, ServiceID: t.ServiceID, Subject: t.Subject, Scope: t.Scope,
+		IssuedAt:  t.IssuedAt.UTC().Format(time.RFC3339Nano),
 		ExpiresAt: t.ExpiresAt.UTC().Format(time.RFC3339Nano), Used: false, TTL: t.ExpiresAt.Unix() + 60,
 	})
 	if err != nil {
@@ -882,5 +885,78 @@ func (d *Dynamo) ConsumeRecoveryCode(ctx context.Context, hash string, now time.
 	if errors.As(err, &cond) {
 		return ErrNotFound
 	}
+	return err
+}
+
+// ── audit reader ───────────────────────────────────────────────────────────
+
+type auditItem struct {
+	PK, SK    string
+	At        string `dynamodbav:"at"`
+	Kind      string `dynamodbav:"kind"`
+	Actor     string `dynamodbav:"actor"`
+	ServiceID string `dynamodbav:"service_id"`
+	Detail    string `dynamodbav:"detail"`
+	IP        string `dynamodbav:"ip"`
+}
+
+func (d *Dynamo) ListAudit(ctx context.Context, month string, limit int, cursor string) ([]AuditEvent, string, error) {
+	in := &dynamodb.QueryInput{
+		TableName:                 &d.table,
+		KeyConditionExpression:    aws.String("PK = :p"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: pkAudit + month}},
+		ScanIndexForward:          aws.Bool(false),
+		Limit:                     aws.Int32(int32(limit)), //nolint:gosec // limit is clamped by the caller
+	}
+	if cursor != "" {
+		in.ExclusiveStartKey = dynKey(pkAudit+month, cursor)
+	}
+	out, err := d.db.Query(ctx, in)
+	if err != nil {
+		return nil, "", err
+	}
+	var items []auditItem
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &items); err != nil {
+		return nil, "", err
+	}
+	events := make([]AuditEvent, 0, len(items))
+	for _, it := range items {
+		at, _ := time.Parse(time.RFC3339Nano, it.At)
+		events = append(events, AuditEvent{At: at, Kind: it.Kind, Actor: it.Actor, ServiceID: it.ServiceID, Detail: it.Detail, IP: it.IP})
+	}
+	next := ""
+	if sk, ok := out.LastEvaluatedKey["SK"].(*types.AttributeValueMemberS); ok {
+		next = sk.Value
+	}
+	return events, next, nil
+}
+
+// ── owner not-before ───────────────────────────────────────────────────────
+
+func (d *Dynamo) GetOwnerNotBefore(ctx context.Context) (time.Time, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkOwner, skMeta)})
+	if err != nil {
+		return time.Time{}, err
+	}
+	if out.Item == nil {
+		return time.Time{}, nil
+	}
+	var it struct {
+		NotBefore string `dynamodbav:"sessions_not_before"`
+	}
+	if err := attributevalue.UnmarshalMap(out.Item, &it); err != nil || it.NotBefore == "" {
+		return time.Time{}, err
+	}
+	return time.Parse(time.RFC3339Nano, it.NotBefore)
+}
+
+func (d *Dynamo) SetOwnerNotBefore(ctx context.Context, t time.Time) error {
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &d.table,
+		Key:                       dynKey(pkOwner, skMeta),
+		UpdateExpression:          aws.String("SET sessions_not_before = :t, #t = :type"),
+		ExpressionAttributeNames:  map[string]string{"#t": "type"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":t": &types.AttributeValueMemberS{Value: t.UTC().Format(time.RFC3339Nano)}, ":type": &types.AttributeValueMemberS{Value: "owner"}},
+	})
 	return err
 }

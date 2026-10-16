@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -133,6 +134,36 @@ func conformance(t *testing.T, s Store) {
 		t.Fatalf("new window restarts at 1: %d %v", n, err)
 	}
 
+	// Audit reader: newest first, paginated, per month.
+	for i := 0; i < 5; i++ {
+		_ = s.AppendAudit(ctx, AuditEvent{At: now.Add(time.Duration(i) * time.Minute), Kind: fmt.Sprintf("k%d", i), Actor: "admin"})
+	}
+	_ = s.AppendAudit(ctx, AuditEvent{At: now.AddDate(0, -1, 0), Kind: "lastmonth", Actor: "admin"})
+	page1, next, err := s.ListAudit(ctx, now.Format("2006-01"), 4, "")
+	if err != nil || len(page1) != 4 || next == "" || page1[0].Kind != "k4" || page1[3].Kind != "k1" {
+		t.Fatalf("audit page1: %+v next=%q %v", kinds(page1), next, err)
+	}
+	page2, next2, err := s.ListAudit(ctx, now.Format("2006-01"), 4, next)
+	// 2 = k0 plus the credential.mint written earlier in this test; both carry
+	// the same timestamp so their relative order is not defined.
+	if err != nil || len(page2) != 2 || next2 != "" || (page2[0].Kind != "k0" && page2[1].Kind != "k0") {
+		t.Fatalf("audit page2: %+v next=%q %v", kinds(page2), next2, err)
+	}
+	if lm, _, _ := s.ListAudit(ctx, now.AddDate(0, -1, 0).Format("2006-01"), 10, ""); len(lm) != 1 || lm[0].Kind != "lastmonth" {
+		t.Fatalf("audit other month: %+v", kinds(lm))
+	}
+
+	// Owner not-before.
+	if nb, err := s.GetOwnerNotBefore(ctx); err != nil || !nb.IsZero() {
+		t.Fatalf("not-before default: %v %v", nb, err)
+	}
+	if err := s.SetOwnerNotBefore(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if nb, err := s.GetOwnerNotBefore(ctx); err != nil || !nb.Equal(now) {
+		t.Fatalf("not-before: %v %v", nb, err)
+	}
+
 	// Resources map to services, uniquely.
 	if err := s.AddServiceResource(ctx, "svc_a", "https://finforge.test/mcp"); err != nil {
 		t.Fatal(err)
@@ -201,12 +232,12 @@ func conformance(t *testing.T, s Store) {
 	}
 
 	// Refresh tokens: rotate once, detect replay, revoke the family.
-	rt := RefreshToken{Hash: "r1", Family: "fam", ClientID: "nbc_1", ServiceID: "svc_a", Subject: "owner", Scope: "read", ExpiresAt: now.Add(24 * time.Hour)}
+	rt := RefreshToken{Hash: "r1", Family: "fam", ClientID: "nbc_1", ServiceID: "svc_a", Subject: "owner", Scope: "read", IssuedAt: now, ExpiresAt: now.Add(24 * time.Hour)}
 	if err := s.CreateRefresh(ctx, rt); err != nil {
 		t.Fatal(err)
 	}
 	got1, reused, err := s.ConsumeRefresh(ctx, "r1", now)
-	if err != nil || reused || got1.Family != "fam" || !got1.Used {
+	if err != nil || reused || got1.Family != "fam" || !got1.Used || !got1.IssuedAt.Equal(now) {
 		t.Fatalf("first consume: %+v reused=%v %v", got1, reused, err)
 	}
 	got2, reused, err := s.ConsumeRefresh(ctx, "r1", now)
@@ -280,6 +311,14 @@ func conformance(t *testing.T, s Store) {
 	if _, err := s.GetSession(ctx, "h1", now); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("deleted session: %v", err)
 	}
+}
+
+func kinds(es []AuditEvent) []string {
+	out := make([]string, 0, len(es))
+	for _, e := range es {
+		out = append(out, e.Kind)
+	}
+	return out
 }
 
 func TestMemory(t *testing.T) { conformance(t, NewMemory()) }
