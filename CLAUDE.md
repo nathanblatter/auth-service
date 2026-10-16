@@ -6,7 +6,8 @@ for when he sells Flightdeck, AI Therapist and Journal to real customers. Also a
 project. Prefer clean, generalizable, secure design over Nathan-specific hacks. Features
 that don't serve this get killed.
 
-Read `docs/DESIGN.md` before changing anything. Decisions marked DECIDED are Nathan's;
+Read `docs/DESIGN.md` before changing anything; `docs/API.md` is the public reference and
+must be updated in the same commit as any endpoint change. Decisions marked DECIDED are Nathan's;
 don't invent new ones, log proposals in flightdeck (project slug `auth-service`).
 
 ## Stack

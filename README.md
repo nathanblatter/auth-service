@@ -37,6 +37,8 @@ curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 
 ## Endpoints
 
+Full reference with request and response shapes: [docs/API.md](docs/API.md).
+
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | none | liveness, version, key count |
