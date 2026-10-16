@@ -133,6 +133,102 @@ func conformance(t *testing.T, s Store) {
 		t.Fatalf("new window restarts at 1: %d %v", n, err)
 	}
 
+	// Resources map to services, uniquely.
+	if err := s.AddServiceResource(ctx, "svc_a", "https://finforge.test/mcp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddServiceResource(ctx, "svc_a", "https://finforge.test/mcp"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup resource: %v", err)
+	}
+	if err := s.AddServiceResource(ctx, "svc_missing", "https://other.test/mcp"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("resource on missing service: %v", err)
+	}
+	if svc, err := s.GetServiceByResource(ctx, "https://finforge.test/mcp"); err != nil || svc.ID != "svc_a" || len(svc.Resources) != 1 {
+		t.Fatalf("GetServiceByResource: %+v %v", svc, err)
+	}
+	if _, err := s.GetServiceByResource(ctx, "https://nope.test"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown resource: %v", err)
+	}
+
+	// OAuth clients.
+	cl := OAuthClient{ID: "nbc_1", Name: "Claude", SecretHash: "sh", AuthMethod: "client_secret_basic", RedirectURIs: []string{"https://claude.ai/cb"}, CreatedAt: now}
+	if err := s.CreateOAuthClient(ctx, cl); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateOAuthClient(ctx, cl); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup client: %v", err)
+	}
+	if gcl, err := s.GetOAuthClient(ctx, "nbc_1"); err != nil || gcl.Name != "Claude" || len(gcl.RedirectURIs) != 1 || gcl.SecretHash != "sh" {
+		t.Fatalf("GetOAuthClient: %+v %v", gcl, err)
+	}
+	if _, err := s.GetOAuthClient(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown client: %v", err)
+	}
+
+	// Authorization requests expire and can be deleted.
+	az := AuthzRequest{ID: "az1", ClientID: "nbc_1", RedirectURI: "https://claude.ai/cb", State: "st", Scope: "read", Challenge: "ch",
+		Resource: "https://finforge.test/mcp", ServiceID: "svc_a", ExpiresAt: now.Add(10 * time.Minute)}
+	if err := s.PutAuthzRequest(ctx, az); err != nil {
+		t.Fatal(err)
+	}
+	if gaz, err := s.GetAuthzRequest(ctx, "az1", now); err != nil || gaz.ServiceID != "svc_a" || gaz.State != "st" {
+		t.Fatalf("GetAuthzRequest: %+v %v", gaz, err)
+	}
+	if _, err := s.GetAuthzRequest(ctx, "az1", now.Add(11*time.Minute)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired authz: %v", err)
+	}
+	if err := s.DeleteAuthzRequest(ctx, "az1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetAuthzRequest(ctx, "az1", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted authz: %v", err)
+	}
+
+	// Codes are single use.
+	code := Code{ClientID: "nbc_1", RedirectURI: "https://claude.ai/cb", Challenge: "ch", Scope: "read", Subject: "owner", ServiceID: "svc_a", ExpiresAt: now.Add(10 * time.Minute)}
+	if err := s.CreateCode(ctx, "codehash", code); err != nil {
+		t.Fatal(err)
+	}
+	if gc, err := s.ConsumeCode(ctx, "codehash", now); err != nil || gc.Subject != "owner" || gc.ServiceID != "svc_a" {
+		t.Fatalf("ConsumeCode: %+v %v", gc, err)
+	}
+	if _, err := s.ConsumeCode(ctx, "codehash", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("code reuse: %v", err)
+	}
+	_ = s.CreateCode(ctx, "late", code)
+	if _, err := s.ConsumeCode(ctx, "late", now.Add(time.Hour)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired code: %v", err)
+	}
+
+	// Refresh tokens: rotate once, detect replay, revoke the family.
+	rt := RefreshToken{Hash: "r1", Family: "fam", ClientID: "nbc_1", ServiceID: "svc_a", Subject: "owner", Scope: "read", ExpiresAt: now.Add(24 * time.Hour)}
+	if err := s.CreateRefresh(ctx, rt); err != nil {
+		t.Fatal(err)
+	}
+	got1, reused, err := s.ConsumeRefresh(ctx, "r1", now)
+	if err != nil || reused || got1.Family != "fam" || !got1.Used {
+		t.Fatalf("first consume: %+v reused=%v %v", got1, reused, err)
+	}
+	got2, reused, err := s.ConsumeRefresh(ctx, "r1", now)
+	if err != nil || !reused || got2.Family != "fam" {
+		t.Fatalf("replay must report reused: %+v reused=%v %v", got2, reused, err)
+	}
+	if _, _, err := s.ConsumeRefresh(ctx, "ghost", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown refresh: %v", err)
+	}
+	rt2 := rt
+	rt2.Hash = "r2"
+	_ = s.CreateRefresh(ctx, rt2)
+	if _, _, err := s.ConsumeRefresh(ctx, "r2", now.Add(48*time.Hour)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired refresh: %v", err)
+	}
+	if err := s.RevokeRefreshFamily(ctx, "fam"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ConsumeRefresh(ctx, "r1", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("family not revoked: %v", err)
+	}
+
 	// Sessions expire and can be deleted.
 	sess := Session{Hash: "h1", CreatedAt: now, ExpiresAt: now.Add(time.Hour), IP: "1.2.3.4"}
 	if err := s.PutSession(ctx, sess); err != nil {

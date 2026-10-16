@@ -18,6 +18,7 @@ import (
 
 	"github.com/nathanblatter/auth-service/internal/core"
 	"github.com/nathanblatter/auth-service/internal/jwt"
+	"github.com/nathanblatter/auth-service/internal/oauth"
 	"github.com/nathanblatter/auth-service/internal/owner"
 	"github.com/nathanblatter/auth-service/internal/ratelimit"
 	"github.com/nathanblatter/auth-service/internal/store"
@@ -36,6 +37,8 @@ type Server struct {
 	Owner *owner.Owner
 	// Limit counts failures for brute-force protection. Required.
 	Limit *ratelimit.Limiter
+	// OAuth is the connector authorization server. Required.
+	OAuth *oauth.Server
 	// AdminTokenHash is the hex SHA-256 of the interim admin bearer token
 	// (break-glass until auth-service-4). Empty disables bearer admin auth.
 	AdminTokenHash string
@@ -55,6 +58,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/token", s.token)
 	mux.HandleFunc("GET /v1/me", s.requireService(s.me))
 
+	// OAuth 2.1 for connectors (RFC 8414 metadata, RFC 7591 DCR, code + PKCE).
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.oauthMetadata)
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server/{rest...}", s.oauthMetadata)
+	mux.HandleFunc("POST /oauth/register", s.oauthRegister)
+	mux.HandleFunc("GET /oauth/authorize", s.oauthAuthorize)
+	mux.HandleFunc("POST /oauth/token", s.token)
+	mux.HandleFunc("GET /admin/authorize/{id}", s.requireAdmin(s.pendingApproval))
+	mux.HandleFunc("POST /admin/authorize/{id}/approve", s.requirePasskey(s.approve))
+	mux.HandleFunc("POST /admin/authorize/{id}/deny", s.requireAdmin(s.deny))
+
 	// Owner console: the page, passkey ceremonies, sessions.
 	mux.HandleFunc("GET /admin", s.console)
 	mux.HandleFunc("GET /admin/{$}", s.console)
@@ -72,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/services/{id}/credentials", s.requireAdmin(s.mintCredential))
 	mux.HandleFunc("GET /admin/services/{id}/credentials", s.requireAdmin(s.listCredentials))
 	mux.HandleFunc("DELETE /admin/services/{id}/credentials/{cred}", s.requireAdmin(s.revokeCredential))
+	mux.HandleFunc("POST /admin/services/{id}/resources", s.requireAdmin(s.addResource))
 	return s.withCommon(mux)
 }
 
@@ -115,27 +129,40 @@ func (s *Server) discovery(w http.ResponseWriter, _ *http.Request) {
 		"issuer":                                iss,
 		"jwks_uri":                              iss + "/.well-known/jwks.json",
 		"token_endpoint":                        iss + "/v1/token",
-		"grant_types_supported":                 []string{"client_credentials"},
+		"authorization_endpoint":                iss + "/oauth/authorize",
+		"registration_endpoint":                 iss + "/oauth/register",
+		"grant_types_supported":                 []string{"client_credentials", "authorization_code", "refresh_token"},
+		"response_types_supported":              []string{"code"},
+		"code_challenge_methods_supported":      []string{"S256"},
 		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
 		"id_token_signing_alg_values_supported": []string{"ES256"},
 	})
 }
 
-// token implements the OAuth 2.0 token endpoint for client_credentials.
-// Errors follow RFC 6749 §5.2.
+// token is the OAuth token endpoint. client_credentials is handled by the
+// core (service credentials); authorization_code and refresh_token by the
+// connector OAuth server. Errors follow RFC 6749 §5.2.
 func (s *Server) token(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if err := r.ParseForm(); err != nil {
 		oauthError(w, 400, "invalid_request", "body must be application/x-www-form-urlencoded")
-		return
-	}
-	if r.PostForm.Get("grant_type") != "client_credentials" {
-		oauthError(w, 400, "unsupported_grant_type", "only client_credentials is supported")
 		return
 	}
 	clientID, secret := r.PostForm.Get("client_id"), r.PostForm.Get("client_secret")
 	if u, p, ok := r.BasicAuth(); ok {
 		clientID, secret = u, p
+	}
+	switch g := r.PostForm.Get("grant_type"); g {
+	case "client_credentials":
+	case "authorization_code", "refresh_token":
+		s.oauthToken(w, r, oauth.TokenRequest{
+			GrantType: g, ClientID: clientID, ClientSecret: secret, Code: r.PostForm.Get("code"),
+			CodeVerifier: r.PostForm.Get("code_verifier"), RedirectURI: r.PostForm.Get("redirect_uri"), RefreshToken: r.PostForm.Get("refresh_token"),
+		})
+		return
+	default:
+		oauthError(w, 400, "unsupported_grant_type", "grant_type must be client_credentials, authorization_code or refresh_token")
+		return
 	}
 	if clientID == "" || secret == "" {
 		w.Header().Set("WWW-Authenticate", `Basic realm="auth"`)
@@ -459,6 +486,171 @@ func (s *Server) revokeCredential(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 
+// ── OAuth for connectors ───────────────────────────────────────────────────
+
+func (s *Server) oauthMetadata(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	writeJSON(w, 200, s.OAuth.Metadata())
+}
+
+func (s *Server) oauthRegister(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	// Registrations are cheap to spam; count every one against the IP.
+	key := "oauth:register:ip:" + ip
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, key) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
+	s.Limit.Fail(r.Context(), ratelimit.LoginIP, key)
+	var req oauth.RegisterRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		oauthError(w, 400, "invalid_client_metadata", "body must be JSON")
+		return
+	}
+	c, secret, err := s.OAuth.Register(r.Context(), req, ip)
+	if s.oauthFail(w, err) {
+		return
+	}
+	resp := map[string]any{
+		"client_id": c.ID, "client_id_issued_at": c.CreatedAt.Unix(), "client_name": c.Name,
+		"redirect_uris": c.RedirectURIs, "token_endpoint_auth_method": c.AuthMethod,
+		"grant_types": []string{"authorization_code", "refresh_token"}, "response_types": []string{"code"},
+	}
+	if secret != "" {
+		resp["client_secret"] = secret
+		resp["client_secret_expires_at"] = 0
+	}
+	writeJSON(w, 201, resp)
+}
+
+func (s *Server) oauthAuthorize(w http.ResponseWriter, r *http.Request) {
+	out, err := s.OAuth.BeginAuthorize(r.Context(), oauth.ParseAuthz(r.URL.Query()), clientIP(r))
+	if s.oauthFail(w, err) {
+		return
+	}
+	if out.Err != nil {
+		loc, err := oauth.RedirectWith(out.RedirectURI, url.Values{"error": {out.Err.Code}, "error_description": {out.Err.Description}, "state": {out.State}})
+		if err != nil {
+			oauthError(w, 400, "invalid_request", "bad redirect_uri")
+			return
+		}
+		http.Redirect(w, r, loc, http.StatusFound)
+		return
+	}
+	http.Redirect(w, r, out.ApproveURL, http.StatusFound)
+}
+
+func (s *Server) oauthToken(w http.ResponseWriter, r *http.Request, req oauth.TokenRequest) {
+	ip := clientIP(r)
+	ipKey := "token:ip:" + ip
+	if !s.Limit.Allow(r.Context(), ratelimit.TokenIP, ipKey) {
+		tooMany(w, ratelimit.TokenIP)
+		return
+	}
+	tok, err := s.OAuth.Token(r.Context(), req, ip)
+	var oe *oauth.Error
+	if errors.As(err, &oe) && (oe.Code == "invalid_client" || oe.Code == "invalid_grant") {
+		s.Limit.Fail(r.Context(), ratelimit.TokenIP, ipKey)
+	}
+	if s.oauthFail(w, err) {
+		return
+	}
+	writeJSON(w, 200, tok)
+}
+
+// requirePasskey is requireAdmin restricted to a live passkey session: the
+// break-glass token may manage services but may not approve connectors.
+func (s *Server) requirePasskey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.adminMethod(r) != "passkey" {
+			writeJSON(w, 401, map[string]string{"error": "passkey_required"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (s *Server) pendingApproval(w http.ResponseWriter, r *http.Request) {
+	p, err := s.OAuth.Pending(r.Context(), r.PathValue("id"))
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "this request expired or was already answered"})
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"id": p.ID, "client_name": p.ClientName, "client_id": p.ClientID, "scope": p.Scope, "resource": p.Resource,
+		"service": serviceJSON(p.Service), "expires_at": p.ExpiresAt.UTC().Format(time.RFC3339),
+	})
+}
+
+func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
+	loc, err := s.OAuth.Approve(r.Context(), r.PathValue("id"), clientIP(r))
+	s.approvalResult(w, loc, err)
+}
+
+func (s *Server) deny(w http.ResponseWriter, r *http.Request) {
+	loc, err := s.OAuth.Deny(r.Context(), r.PathValue("id"), clientIP(r))
+	s.approvalResult(w, loc, err)
+}
+
+func (s *Server) approvalResult(w http.ResponseWriter, loc string, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "this request expired or was already answered"})
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"redirect_to": loc})
+}
+
+func (s *Server) addResource(w http.ResponseWriter, r *http.Request) {
+	var in struct{ Resource string }
+	if !readJSON(w, r, &in) {
+		return
+	}
+	err := s.Core.AddResource(r.Context(), r.PathValue("id"), strings.TrimSpace(in.Resource), s.actor(r))
+	switch {
+	case errors.Is(err, core.ErrInvalidResource):
+		writeJSON(w, 400, map[string]string{"error": "invalid_request", "detail": err.Error()})
+	case errors.Is(err, core.ErrResourceTaken):
+		writeJSON(w, 409, map[string]string{"error": "resource_taken"})
+	case errors.Is(err, core.ErrServiceNotFound):
+		writeJSON(w, 404, map[string]string{"error": "not_found"})
+	case err != nil:
+		s.fail(w, err)
+	default:
+		svc, err := s.Core.GetService(r.Context(), r.PathValue("id"))
+		if err != nil {
+			s.fail(w, err)
+			return
+		}
+		writeJSON(w, 200, serviceJSON(svc))
+	}
+}
+
+// oauthFail writes an *oauth.Error or a 500; returns true when it wrote.
+func (s *Server) oauthFail(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
+	}
+	var oe *oauth.Error
+	if errors.As(err, &oe) {
+		if oe.Code == "invalid_client" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="auth"`)
+		}
+		oauthError(w, oe.Status, oe.Code, oe.Description)
+		return true
+	}
+	s.Log.Error("oauth", "err", err)
+	oauthError(w, 500, "server_error", "")
+	return true
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 func (s *Server) notFoundOrFail(w http.ResponseWriter, err error) bool {
@@ -479,8 +671,12 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 }
 
 func serviceJSON(svc store.Service) map[string]any {
+	res := svc.Resources
+	if res == nil {
+		res = []string{}
+	}
 	return map[string]any{"id": svc.ID, "slug": svc.Slug, "name": svc.Name, "status": svc.Status,
-		"created_at": svc.CreatedAt.UTC().Format(time.RFC3339)}
+		"created_at": svc.CreatedAt.UTC().Format(time.RFC3339), "resources": res}
 }
 
 func credentialJSON(c store.Credential) map[string]any {

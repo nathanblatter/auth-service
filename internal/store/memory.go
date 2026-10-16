@@ -9,15 +9,20 @@ import (
 
 // Memory is a goroutine-safe in-memory Store.
 type Memory struct {
-	mu       sync.Mutex
-	services map[string]Service
-	slugs    map[string]string
-	creds    map[string]Credential
-	passkeys map[string]Passkey
-	chals    map[string]challenge
-	sessions map[string]Session
-	fails    map[string]failCounter
-	Audit    []AuditEvent
+	mu        sync.Mutex
+	services  map[string]Service
+	slugs     map[string]string
+	creds     map[string]Credential
+	passkeys  map[string]Passkey
+	chals     map[string]challenge
+	sessions  map[string]Session
+	fails     map[string]failCounter
+	resources map[string]string // resource -> service id
+	clients   map[string]OAuthClient
+	authz     map[string]AuthzRequest
+	codes     map[string]Code
+	refresh   map[string]RefreshToken
+	Audit     []AuditEvent
 }
 
 type failCounter struct {
@@ -35,7 +40,8 @@ func NewMemory() *Memory {
 	return &Memory{
 		services: map[string]Service{}, slugs: map[string]string{}, creds: map[string]Credential{},
 		passkeys: map[string]Passkey{}, chals: map[string]challenge{}, sessions: map[string]Session{},
-		fails: map[string]failCounter{},
+		fails: map[string]failCounter{}, resources: map[string]string{}, clients: map[string]OAuthClient{},
+		authz: map[string]AuthzRequest{}, codes: map[string]Code{}, refresh: map[string]RefreshToken{},
 	}
 }
 
@@ -221,4 +227,125 @@ func (m *Memory) RecordFailure(_ context.Context, key string, now time.Time, win
 	c.count++
 	m.fails[key] = c
 	return c.count, nil
+}
+
+func (m *Memory) AddServiceResource(_ context.Context, serviceID, resource string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	svc, ok := m.services[serviceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if _, taken := m.resources[resource]; taken {
+		return ErrConflict
+	}
+	m.resources[resource] = serviceID
+	svc.Resources = append(svc.Resources, resource)
+	m.services[serviceID] = svc
+	return nil
+}
+
+func (m *Memory) GetServiceByResource(_ context.Context, resource string) (Service, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.resources[resource]
+	if !ok {
+		return Service{}, ErrNotFound
+	}
+	return m.services[id], nil
+}
+
+func (m *Memory) CreateOAuthClient(_ context.Context, c OAuthClient) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, taken := m.clients[c.ID]; taken {
+		return ErrConflict
+	}
+	m.clients[c.ID] = c
+	return nil
+}
+
+func (m *Memory) GetOAuthClient(_ context.Context, id string) (OAuthClient, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.clients[id]
+	if !ok {
+		return OAuthClient{}, ErrNotFound
+	}
+	return c, nil
+}
+
+func (m *Memory) PutAuthzRequest(_ context.Context, a AuthzRequest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.authz[a.ID] = a
+	return nil
+}
+
+func (m *Memory) GetAuthzRequest(_ context.Context, id string, now time.Time) (AuthzRequest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.authz[id]
+	if !ok || !now.Before(a.ExpiresAt) {
+		return AuthzRequest{}, ErrNotFound
+	}
+	return a, nil
+}
+
+func (m *Memory) DeleteAuthzRequest(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.authz, id)
+	return nil
+}
+
+func (m *Memory) CreateCode(_ context.Context, hash string, c Code) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.codes[hash] = c
+	return nil
+}
+
+func (m *Memory) ConsumeCode(_ context.Context, hash string, now time.Time) (Code, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.codes[hash]
+	delete(m.codes, hash)
+	if !ok || !now.Before(c.ExpiresAt) {
+		return Code{}, ErrNotFound
+	}
+	return c, nil
+}
+
+func (m *Memory) CreateRefresh(_ context.Context, t RefreshToken) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.refresh[t.Hash] = t
+	return nil
+}
+
+func (m *Memory) ConsumeRefresh(_ context.Context, hash string, now time.Time) (RefreshToken, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.refresh[hash]
+	if !ok || !now.Before(t.ExpiresAt) {
+		return RefreshToken{}, false, ErrNotFound
+	}
+	if t.Used {
+		return t, true, nil
+	}
+	t.Used = true
+	m.refresh[hash] = t
+	return t, false, nil
+}
+
+func (m *Memory) RevokeRefreshFamily(_ context.Context, family string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for h, t := range m.refresh {
+		if t.Family == family {
+			delete(m.refresh, h)
+		}
+	}
+	return nil
 }

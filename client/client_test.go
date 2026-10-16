@@ -211,3 +211,21 @@ func TestClientCachesTokens(t *testing.T) {
 		t.Fatalf("round trip claims: %+v", cl)
 	}
 }
+
+func TestResourceMetadata(t *testing.T) {
+	f := newIssuer(t)
+	v := NewVerifier(f.srv.URL, "svc_me", WithResource("https://finforge.test/mcp"))
+	h := RequireToken(v)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) }))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/mcp", nil))
+	if rec.Code != 401 || rec.Header().Get("WWW-Authenticate") != `Bearer realm="auth", resource_metadata="https://finforge.test/.well-known/oauth-protected-resource/mcp"` {
+		t.Fatalf("challenge: %d %q", rec.Code, rec.Header().Get("WWW-Authenticate"))
+	}
+	rec = httptest.NewRecorder()
+	ProtectedResourceMetadata(v, "FinForge", []string{"read"}).ServeHTTP(rec, httptest.NewRequest("GET", "/.well-known/oauth-protected-resource/mcp", nil))
+	var md map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &md)
+	if md["resource"] != "https://finforge.test/mcp" || md["authorization_servers"].([]any)[0] != f.srv.URL || md["resource_name"] != "FinForge" {
+		t.Fatalf("metadata: %v", md)
+	}
+}

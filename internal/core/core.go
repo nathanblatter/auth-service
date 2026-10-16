@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -41,6 +42,8 @@ var (
 	ErrServiceNotFound   = errors.New("core: service not found")
 	ErrCredentialInvalid = errors.New("core: invalid credential")
 	ErrServiceDisabled   = errors.New("core: service disabled")
+	ErrInvalidResource   = errors.New("core: resource must be an absolute https URL without a fragment")
+	ErrResourceTaken     = errors.New("core: resource already registered to a service")
 )
 
 var slugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
@@ -200,6 +203,36 @@ func (c *Core) ExchangeCredential(ctx context.Context, serviceID, rawCredential 
 	}
 	c.audit(ctx, "token.issue", Actor{ID: "svc:" + serviceID, IP: ip}, serviceID, "cred="+credID)
 	return Token{AccessToken: tok, TokenType: "Bearer", ExpiresIn: int(ServiceTokenTTL.Seconds()), Scope: ScopeService}, nil
+}
+
+// VerifyToken validates a token addressed to an arbitrary audience (a
+// service id). Used by tests and by any in-process consumer.
+func (c *Core) VerifyToken(token, audience string) (jwt.Claims, error) {
+	return jwt.Verify(token, c.Ring.Lookup, c.Now(), c.Issuer, audience)
+}
+
+// AddResource registers an RFC 8707 resource identifier for a service so
+// connector authorization requests can be mapped to it.
+func (c *Core) AddResource(ctx context.Context, serviceID, resource string, by Actor) error {
+	u, err := url.Parse(resource)
+	if err != nil || u.Host == "" || u.Fragment != "" {
+		return ErrInvalidResource
+	}
+	localDev := u.Scheme == "http" && u.Hostname() == "localhost"
+	if u.Scheme != "https" && !localDev {
+		return ErrInvalidResource
+	}
+	err = c.Store.AddServiceResource(ctx, serviceID, resource)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return ErrServiceNotFound
+	case errors.Is(err, store.ErrConflict):
+		return ErrResourceTaken
+	case err != nil:
+		return err
+	}
+	c.audit(ctx, "service.resource.add", by, serviceID, "resource="+resource)
+	return nil
 }
 
 // VerifyServiceToken validates a bearer token aimed at the auth API and

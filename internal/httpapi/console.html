@@ -64,7 +64,7 @@
   <section id="gate" class="card hidden">
     <h2>Sign in</h2>
     <div id="gate-login">
-      <p>This console is protected by your passkey.</p>
+      <p id="gate-intro">This console is protected by your passkey.</p>
       <button id="login" class="primary">Sign in with passkey</button>
     </div>
     <div id="gate-setup" class="hidden">
@@ -76,6 +76,13 @@
       </div>
     </div>
     <p id="gate-msg" class="msg"></p>
+  </section>
+
+  <!-- Connector approval -->
+  <section id="approve" class="card hidden">
+    <h2>Connection request</h2>
+    <div id="approve-body"></div>
+    <p id="approve-msg" class="msg"></p>
   </section>
 
   <!-- Console -->
@@ -151,6 +158,7 @@
 
   let state = { authenticated: false, method: '', setup_required: true };
   let secretFor = null; // {serviceId, credential} shown exactly once
+  const approveId = new URLSearchParams(location.search).get('approve');
 
   async function refreshSession() {
     state = await api('GET', '/admin/session');
@@ -162,7 +170,48 @@
     $('who').textContent = state.authenticated
       ? (state.method === 'passkey' ? 'Signed in with passkey' + (state.expires_at ? ' · until ' + new Date(state.expires_at).toLocaleTimeString() : '') : 'Using bootstrap token')
       : '';
+    if (approveId) {
+      // A connector is waiting. Approval needs a passkey session specifically.
+      const canApprove = state.authenticated && state.method === 'passkey';
+      $('app').classList.add('hidden');
+      $('approve').classList.toggle('hidden', !canApprove);
+      $('gate').classList.toggle('hidden', canApprove);
+      $('gate-intro').textContent = state.authenticated
+        ? 'Approving a connection requires a passkey sign-in, not the bootstrap token.'
+        : 'Sign in with your passkey to review this connection request.';
+      if (canApprove) await loadApproval();
+      return;
+    }
     if (state.authenticated) await Promise.all([loadServices(), loadPasskeys()]);
+  }
+
+  async function loadApproval() {
+    const body = $('approve-body');
+    try {
+      const p = await api('GET', '/admin/authorize/' + encodeURIComponent(approveId));
+      body.innerHTML = `
+        <p><b class="client"></b> wants to connect to <b class="svc"></b>.</p>
+        <table><tr><th>Resource</th><td class="mono res"></td></tr><tr><th>Scope</th><td class="mono scope"></td></tr><tr><th>Client id</th><td class="mono cid"></td></tr><tr><th>Expires</th><td class="exp"></td></tr></table>
+        <div class="row" style="margin-top:12px"><button class="primary ok">Approve</button><button class="danger no">Deny</button></div>`;
+      body.querySelector('.client').textContent = p.client_name;
+      body.querySelector('.svc').textContent = p.service.name;
+      body.querySelector('.res').textContent = p.resource;
+      body.querySelector('.scope').textContent = p.scope || '(none requested)';
+      body.querySelector('.cid').textContent = p.client_id;
+      body.querySelector('.exp').textContent = fmt(p.expires_at);
+      const decide = (verb) => async () => {
+        try {
+          const out = await api('POST', `/admin/authorize/${encodeURIComponent(approveId)}/${verb}`);
+          say('approve-msg', verb === 'approve' ? 'Approved. Returning to the app…' : 'Denied. Returning to the app…', 'ok');
+          location.href = out.redirect_to;
+        } catch (e) { say('approve-msg', e.message, 'err'); }
+      };
+      body.querySelector('.ok').onclick = decide('approve');
+      body.querySelector('.no').onclick = decide('deny');
+    } catch (e) {
+      body.innerHTML = '';
+      say('approve-msg', e.message, 'err');
+    }
   }
 
   async function registerPasskey(name, headers, msgId) {
@@ -248,6 +297,10 @@
       </div>
       <div class="secret hidden"></div>
       <details><summary>${credentials.length} credential${credentials.length === 1 ? '' : 's'}, ${live} active</summary><div class="creds"></div></details>
+      <details><summary>${(svc.resources || []).length} connector resource${(svc.resources || []).length === 1 ? '' : 's'}</summary>
+        <div class="resources"></div>
+        <div class="row" style="margin-top:8px"><input class="grow res-url" placeholder="https://finforge.nathanblatter.com/mcp"><button class="small res-add">Add resource</button></div>
+      </details>
       <p class="msg"></p>`;
     wrap.querySelector('b').textContent = svc.name;
     wrap.querySelector('.title .mono').textContent = svc.slug + ' · ' + svc.id;
@@ -278,6 +331,17 @@
       }
       creds.appendChild(t);
     } else creds.innerHTML = '<p class="muted">No credentials minted.</p>';
+
+    const resources = wrap.querySelector('.resources');
+    if ((svc.resources || []).length) {
+      for (const r of svc.resources) { const d = document.createElement('div'); d.className = 'mono muted'; d.textContent = r; resources.appendChild(d); }
+    } else resources.innerHTML = '<p class="muted">None. Add the MCP URL a connector will ask for.</p>';
+    wrap.querySelector('.res-add').onclick = async () => {
+      try {
+        await api('POST', `/admin/services/${svc.id}/resources`, { Resource: wrap.querySelector('.res-url').value.trim() });
+        await loadServices();
+      } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+    };
 
     const secret = wrap.querySelector('.secret');
     if (secretFor && secretFor.serviceId === svc.id) showSecret(secret, secretFor.credential);

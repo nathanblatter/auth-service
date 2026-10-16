@@ -42,7 +42,12 @@ curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 | GET | `/health` | none | liveness, version, key count |
 | GET | `/.well-known/jwks.json` | none | public signing keys |
 | GET | `/.well-known/openid-configuration` | none | discovery |
-| POST | `/v1/token` | client credentials | `grant_type=client_credentials` |
+| POST | `/v1/token`, `/oauth/token` | client | `client_credentials`, `authorization_code`, `refresh_token` |
+| GET | `/.well-known/oauth-authorization-server` | none | RFC 8414 metadata for connectors |
+| POST | `/oauth/register` | none | RFC 7591 dynamic client registration |
+| GET | `/oauth/authorize` | none | code + PKCE; parks the request, sends you to the console |
+| GET/POST | `/admin/authorize/{id}[/approve\|/deny]` | admin (approve: passkey) | review / decide a connection request |
+| POST | `/admin/services/{id}/resources` | admin | register an RFC 8707 resource URL (MCP endpoint) |
 | GET | `/v1/me` | service token | who am I |
 | GET | `/admin` | none | the owner console (passkey sign-in) |
 | GET | `/admin/session` | none | signed in? setup needed? |

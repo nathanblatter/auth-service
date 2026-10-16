@@ -83,6 +83,7 @@ func (c Claims) ExpiresAt() time.Time { return time.Unix(c.Expires, 0) }
 type Verifier struct {
 	issuer   string
 	audience string
+	resource string
 	http     *http.Client
 	now      func() time.Time
 	ttl      time.Duration
@@ -242,25 +243,68 @@ type claimsKey struct{}
 // RequireToken rejects requests without a valid bearer token and stores the
 // claims in the request context (see FromContext). Use RequireScope on top
 // when an endpoint needs a particular scope.
+//
+// When the Verifier was given a resource (WithResource), the 401 carries the
+// resource_metadata hint the MCP authorization spec expects, so a connector
+// client can discover the authorization server on its own.
 func RequireToken(v *Verifier) func(http.Handler) http.Handler {
+	challenge := `Bearer realm="auth"`
+	if v.resource != "" {
+		challenge += `, resource_metadata="` + v.resourceMetadataURL() + `"`
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 			raw = strings.TrimSpace(raw)
 			if !ok || raw == "" {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="auth"`)
+				w.Header().Set("WWW-Authenticate", challenge)
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
 			c, err := v.Verify(r.Context(), raw)
 			if err != nil {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="auth", error="invalid_token"`)
+				w.Header().Set("WWW-Authenticate", challenge+`, error="invalid_token"`)
 				http.Error(w, `{"error":"invalid_token"}`, http.StatusUnauthorized)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), claimsKey{}, c)))
 		})
 	}
+}
+
+// WithResource declares the RFC 8707 resource identifier this service is
+// known by at the auth service (for example "https://finforge.nathanblatter.com/mcp").
+// It enables ProtectedResourceMetadata and the resource_metadata hint on 401s.
+func WithResource(resource string) VerifierOption {
+	return func(v *Verifier) { v.resource = strings.TrimRight(resource, "/") }
+}
+
+// resourceMetadataURL is where this service publishes its RFC 9728 document:
+// the well-known path on the resource's own origin, suffixed with its path.
+func (v *Verifier) resourceMetadataURL() string {
+	u, err := url.Parse(v.resource)
+	if err != nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource" + u.Path
+}
+
+// ProtectedResourceMetadata serves the RFC 9728 document for this service.
+// Mount it at the path resourceMetadataURL() names, e.g.
+//
+//	mux.Handle("GET /.well-known/oauth-protected-resource/mcp", client.ProtectedResourceMetadata(v, "FinForge", []string{"read"}))
+func ProtectedResourceMetadata(v *Verifier, name string, scopes []string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"resource":                 v.resource,
+			"authorization_servers":    []string{v.issuer},
+			"bearer_methods_supported": []string{"header"},
+			"scopes_supported":         scopes,
+			"resource_name":            name,
+		})
+	})
 }
 
 // RequireScope must run after RequireToken. It answers 403 when the token

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,6 +31,12 @@ const (
 	pkChallenge = "CHALLENGE#"
 	pkSession   = "SESSION#"
 	pkRate      = "RATE#"
+	pkResource  = "RESOURCE#"
+	pkClient    = "CLIENT#"
+	pkAuthz     = "AUTHZ#"
+	pkCode      = "CODE#"
+	pkRefresh   = "REFRESH#"
+	gsiFamily   = "FAMILY#"
 )
 
 // DynamoAPI is the slice of the DynamoDB client the store uses.
@@ -53,12 +60,13 @@ func NewDynamo(db DynamoAPI, table string) *Dynamo { return &Dynamo{db: db, tabl
 
 type serviceItem struct {
 	PK, SK, GSI1PK, GSI1SK string
-	Type                   string `dynamodbav:"type"`
-	ID                     string `dynamodbav:"id"`
-	Slug                   string `dynamodbav:"slug"`
-	Name                   string `dynamodbav:"name"`
-	Status                 string `dynamodbav:"status"`
-	CreatedAt              string `dynamodbav:"created_at"`
+	Type                   string   `dynamodbav:"type"`
+	ID                     string   `dynamodbav:"id"`
+	Slug                   string   `dynamodbav:"slug"`
+	Name                   string   `dynamodbav:"name"`
+	Status                 string   `dynamodbav:"status"`
+	CreatedAt              string   `dynamodbav:"created_at"`
+	Resources              []string `dynamodbav:"resources,omitempty"`
 }
 
 type credItem struct {
@@ -252,7 +260,7 @@ func (it serviceItem) toService() (Service, error) {
 	if err != nil {
 		return Service{}, fmt.Errorf("store: bad created_at on %s: %w", it.PK, err)
 	}
-	return Service{ID: it.ID, Slug: it.Slug, Name: it.Name, Status: it.Status, CreatedAt: t}, nil
+	return Service{ID: it.ID, Slug: it.Slug, Name: it.Name, Status: it.Status, CreatedAt: t, Resources: it.Resources}, nil
 }
 
 func (it credItem) toCredential() (Credential, error) {
@@ -493,4 +501,303 @@ func (d *Dynamo) RecordFailure(ctx context.Context, key string, now time.Time, w
 		return 0, err
 	}
 	return it.Count, nil
+}
+
+// ── resources ──────────────────────────────────────────────────────────────
+
+func (d *Dynamo) AddServiceResource(ctx context.Context, serviceID, resource string) error {
+	lock, err := attributevalue.MarshalMap(map[string]string{"PK": pkResource + resource, "SK": skMeta, "type": "resource", "service_id": serviceID})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{Put: &types.Put{TableName: &d.table, Item: lock, ConditionExpression: aws.String("attribute_not_exists(PK)")}},
+			{Update: &types.Update{
+				TableName:           &d.table,
+				Key:                 dynKey(pkService+serviceID, skMeta),
+				UpdateExpression:    aws.String("SET resources = list_append(if_not_exists(resources, :empty), :r)"),
+				ConditionExpression: aws.String("attribute_exists(PK)"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{
+					":empty": &types.AttributeValueMemberL{Value: []types.AttributeValue{}},
+					":r":     &types.AttributeValueMemberL{Value: []types.AttributeValue{&types.AttributeValueMemberS{Value: resource}}},
+				},
+			}},
+		},
+	})
+	var canceled *types.TransactionCanceledException
+	if errors.As(err, &canceled) {
+		// First reason is the lock (resource taken); second is the service (missing).
+		if len(canceled.CancellationReasons) == 2 && aws.ToString(canceled.CancellationReasons[1].Code) == "ConditionalCheckFailed" {
+			return ErrNotFound
+		}
+		return ErrConflict
+	}
+	return err
+}
+
+func (d *Dynamo) GetServiceByResource(ctx context.Context, resource string) (Service, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkResource+resource, skMeta)})
+	if err != nil {
+		return Service{}, err
+	}
+	if out.Item == nil {
+		return Service{}, ErrNotFound
+	}
+	var lock struct {
+		ServiceID string `dynamodbav:"service_id"`
+	}
+	if err := attributevalue.UnmarshalMap(out.Item, &lock); err != nil {
+		return Service{}, err
+	}
+	return d.GetService(ctx, lock.ServiceID)
+}
+
+// ── oauth ──────────────────────────────────────────────────────────────────
+
+type clientItem struct {
+	PK, SK       string
+	Type         string   `dynamodbav:"type"`
+	ID           string   `dynamodbav:"id"`
+	Name         string   `dynamodbav:"name"`
+	SecretHash   string   `dynamodbav:"secret_hash,omitempty"`
+	AuthMethod   string   `dynamodbav:"auth_method"`
+	RedirectURIs []string `dynamodbav:"redirect_uris"`
+	CreatedAt    string   `dynamodbav:"created_at"`
+}
+
+func (d *Dynamo) CreateOAuthClient(ctx context.Context, c OAuthClient) error {
+	item, err := attributevalue.MarshalMap(clientItem{
+		PK: pkClient + c.ID, SK: skMeta, Type: "oauth_client", ID: c.ID, Name: c.Name, SecretHash: c.SecretHash,
+		AuthMethod: c.AuthMethod, RedirectURIs: c.RedirectURIs, CreatedAt: c.CreatedAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item, ConditionExpression: aws.String("attribute_not_exists(PK)")})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrConflict
+	}
+	return err
+}
+
+func (d *Dynamo) GetOAuthClient(ctx context.Context, id string) (OAuthClient, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkClient+id, skMeta)})
+	if err != nil {
+		return OAuthClient{}, err
+	}
+	if out.Item == nil {
+		return OAuthClient{}, ErrNotFound
+	}
+	var it clientItem
+	if err := attributevalue.UnmarshalMap(out.Item, &it); err != nil {
+		return OAuthClient{}, err
+	}
+	t, err := time.Parse(time.RFC3339Nano, it.CreatedAt)
+	if err != nil {
+		return OAuthClient{}, fmt.Errorf("store: bad created_at on %s: %w", it.PK, err)
+	}
+	return OAuthClient{ID: it.ID, Name: it.Name, SecretHash: it.SecretHash, AuthMethod: it.AuthMethod, RedirectURIs: it.RedirectURIs, CreatedAt: t}, nil
+}
+
+type authzItem struct {
+	PK, SK      string
+	Type        string `dynamodbav:"type"`
+	ID          string `dynamodbav:"id"`
+	ClientID    string `dynamodbav:"client_id"`
+	RedirectURI string `dynamodbav:"redirect_uri"`
+	State       string `dynamodbav:"state,omitempty"`
+	Scope       string `dynamodbav:"scope,omitempty"`
+	Challenge   string `dynamodbav:"challenge"`
+	Resource    string `dynamodbav:"resource"`
+	ServiceID   string `dynamodbav:"service_id"`
+	ExpiresAt   string `dynamodbav:"expires_at"`
+	TTL         int64  `dynamodbav:"ttl"`
+}
+
+func (d *Dynamo) PutAuthzRequest(ctx context.Context, a AuthzRequest) error {
+	item, err := attributevalue.MarshalMap(authzItem{
+		PK: pkAuthz + a.ID, SK: skMeta, Type: "authz", ID: a.ID, ClientID: a.ClientID, RedirectURI: a.RedirectURI, State: a.State,
+		Scope: a.Scope, Challenge: a.Challenge, Resource: a.Resource, ServiceID: a.ServiceID,
+		ExpiresAt: a.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: a.ExpiresAt.Unix() + 60,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item})
+	return err
+}
+
+func (d *Dynamo) GetAuthzRequest(ctx context.Context, id string, now time.Time) (AuthzRequest, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkAuthz+id, skMeta)})
+	if err != nil {
+		return AuthzRequest{}, err
+	}
+	if out.Item == nil {
+		return AuthzRequest{}, ErrNotFound
+	}
+	var it authzItem
+	if err := attributevalue.UnmarshalMap(out.Item, &it); err != nil {
+		return AuthzRequest{}, err
+	}
+	exp, err := time.Parse(time.RFC3339Nano, it.ExpiresAt)
+	if err != nil || !now.Before(exp) {
+		return AuthzRequest{}, ErrNotFound
+	}
+	return AuthzRequest{ID: it.ID, ClientID: it.ClientID, RedirectURI: it.RedirectURI, State: it.State, Scope: it.Scope,
+		Challenge: it.Challenge, Resource: it.Resource, ServiceID: it.ServiceID, ExpiresAt: exp}, nil
+}
+
+func (d *Dynamo) DeleteAuthzRequest(ctx context.Context, id string) error {
+	_, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkAuthz+id, skMeta)})
+	return err
+}
+
+type codeItem struct {
+	PK, SK      string
+	Type        string `dynamodbav:"type"`
+	ClientID    string `dynamodbav:"client_id"`
+	RedirectURI string `dynamodbav:"redirect_uri"`
+	Challenge   string `dynamodbav:"challenge"`
+	Scope       string `dynamodbav:"scope,omitempty"`
+	Subject     string `dynamodbav:"subject"`
+	ServiceID   string `dynamodbav:"service_id"`
+	ExpiresAt   string `dynamodbav:"expires_at"`
+	TTL         int64  `dynamodbav:"ttl"`
+}
+
+func (d *Dynamo) CreateCode(ctx context.Context, hash string, c Code) error {
+	item, err := attributevalue.MarshalMap(codeItem{
+		PK: pkCode + hash, SK: skMeta, Type: "code", ClientID: c.ClientID, RedirectURI: c.RedirectURI, Challenge: c.Challenge,
+		Scope: c.Scope, Subject: c.Subject, ServiceID: c.ServiceID, ExpiresAt: c.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: c.ExpiresAt.Unix() + 60,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item})
+	return err
+}
+
+func (d *Dynamo) ConsumeCode(ctx context.Context, hash string, now time.Time) (Code, error) {
+	out, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkCode+hash, skMeta), ReturnValues: types.ReturnValueAllOld})
+	if err != nil {
+		return Code{}, err
+	}
+	if out.Attributes == nil {
+		return Code{}, ErrNotFound
+	}
+	var it codeItem
+	if err := attributevalue.UnmarshalMap(out.Attributes, &it); err != nil {
+		return Code{}, err
+	}
+	exp, err := time.Parse(time.RFC3339Nano, it.ExpiresAt)
+	if err != nil || !now.Before(exp) {
+		return Code{}, ErrNotFound
+	}
+	return Code{ClientID: it.ClientID, RedirectURI: it.RedirectURI, Challenge: it.Challenge, Scope: it.Scope, Subject: it.Subject, ServiceID: it.ServiceID, ExpiresAt: exp}, nil
+}
+
+type refreshItem struct {
+	PK, SK, GSI1PK, GSI1SK string
+	Type                   string `dynamodbav:"type"`
+	Family                 string `dynamodbav:"family"`
+	ClientID               string `dynamodbav:"client_id"`
+	ServiceID              string `dynamodbav:"service_id"`
+	Subject                string `dynamodbav:"subject"`
+	Scope                  string `dynamodbav:"scope,omitempty"`
+	ExpiresAt              string `dynamodbav:"expires_at"`
+	Used                   bool   `dynamodbav:"used"`
+	TTL                    int64  `dynamodbav:"ttl"`
+}
+
+func (it refreshItem) toToken() (RefreshToken, error) {
+	exp, err := time.Parse(time.RFC3339Nano, it.ExpiresAt)
+	if err != nil {
+		return RefreshToken{}, fmt.Errorf("store: bad expires_at on %s: %w", it.PK, err)
+	}
+	return RefreshToken{Hash: strings.TrimPrefix(it.PK, pkRefresh), Family: it.Family, ClientID: it.ClientID, ServiceID: it.ServiceID,
+		Subject: it.Subject, Scope: it.Scope, ExpiresAt: exp, Used: it.Used}, nil
+}
+
+func (d *Dynamo) CreateRefresh(ctx context.Context, t RefreshToken) error {
+	item, err := attributevalue.MarshalMap(refreshItem{
+		PK: pkRefresh + t.Hash, SK: skMeta, GSI1PK: gsiFamily + t.Family, GSI1SK: pkRefresh + t.Hash, Type: "refresh",
+		Family: t.Family, ClientID: t.ClientID, ServiceID: t.ServiceID, Subject: t.Subject, Scope: t.Scope,
+		ExpiresAt: t.ExpiresAt.UTC().Format(time.RFC3339Nano), Used: false, TTL: t.ExpiresAt.Unix() + 60,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item})
+	return err
+}
+
+func (d *Dynamo) ConsumeRefresh(ctx context.Context, hash string, now time.Time) (RefreshToken, bool, error) {
+	out, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &d.table,
+		Key:                       dynKey(pkRefresh+hash, skMeta),
+		UpdateExpression:          aws.String("SET used = :t"),
+		ConditionExpression:       aws.String("attribute_exists(PK) AND used = :f"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":t": &types.AttributeValueMemberBOOL{Value: true}, ":f": &types.AttributeValueMemberBOOL{Value: false}},
+		ReturnValues:              types.ReturnValueAllNew,
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		// Missing, or already used: look to tell which.
+		got, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkRefresh+hash, skMeta)})
+		if err != nil {
+			return RefreshToken{}, false, err
+		}
+		if got.Item == nil {
+			return RefreshToken{}, false, ErrNotFound
+		}
+		var it refreshItem
+		if err := attributevalue.UnmarshalMap(got.Item, &it); err != nil {
+			return RefreshToken{}, false, err
+		}
+		t, err := it.toToken()
+		if err != nil || !now.Before(t.ExpiresAt) {
+			return RefreshToken{}, false, ErrNotFound
+		}
+		return t, true, nil
+	}
+	if err != nil {
+		return RefreshToken{}, false, err
+	}
+	var it refreshItem
+	if err := attributevalue.UnmarshalMap(out.Attributes, &it); err != nil {
+		return RefreshToken{}, false, err
+	}
+	t, err := it.toToken()
+	if err != nil {
+		return RefreshToken{}, false, err
+	}
+	if !now.Before(t.ExpiresAt) {
+		return RefreshToken{}, false, ErrNotFound
+	}
+	return t, false, nil
+}
+
+func (d *Dynamo) RevokeRefreshFamily(ctx context.Context, family string) error {
+	out, err := d.db.Query(ctx, &dynamodb.QueryInput{
+		TableName:                 &d.table,
+		IndexName:                 aws.String(gsi1),
+		KeyConditionExpression:    aws.String("GSI1PK = :p"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: gsiFamily + family}},
+		ProjectionExpression:      aws.String("PK, SK"),
+	})
+	if err != nil {
+		return err
+	}
+	for _, item := range out.Items {
+		pk, _ := item["PK"].(*types.AttributeValueMemberS)
+		if pk == nil {
+			continue
+		}
+		if _, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pk.Value, skMeta)}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

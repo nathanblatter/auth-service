@@ -77,6 +77,46 @@ The owner (Nathan) is the one cross-tenant identity. He authenticates to the con
   recovery codes) exists, so a lost single passkey cannot lock him out of every service.
 - Audit actors are `admin:passkey` or `admin:token`, so the log shows which path was used.
 
+## Connector OAuth (auth-service-23, slice 2)
+
+**DECIDED (Nathan, 2026-10-15):** the OAuth 2.1 authorization server for Claude connectors is
+central, in this service; apps only serve `/mcp` and verify JWTs. The approval page is the
+admin console, confirmed with the owner passkey. Tokens: 1h access, 30d rotating refresh.
+
+Flow for a connector (Claude on the phone) to reach FinForge:
+
+1. FinForge serves `/.well-known/oauth-protected-resource/mcp` naming this issuer, and
+   answers `/mcp` without a token with `WWW-Authenticate: Bearer resource_metadata=…`
+   (both come from the Go client).
+2. Claude reads `/.well-known/oauth-authorization-server` here, registers itself at
+   `POST /oauth/register` (RFC 7591; `nbc_` ids, optional `nbcs_` secret stored hashed),
+   then opens `GET /oauth/authorize` with PKCE S256 and `resource=https://finforge…/mcp`
+   (RFC 8707, mandatory; it is how the request maps to a **service**, via the resources
+   registered on that service in the console).
+3. Untrusted `client_id`/`redirect_uri` → hard 400, never a redirect. Other faults bounce to
+   the client with an OAuth error. A good request is parked (`AUTHZ#<id>`, 10 min) and the
+   browser is sent to `/admin?approve=<id>`.
+4. The console shows client, service, resource and scope. **Approve requires a live passkey
+   session**; the break-glass token may view and deny, never approve. Approve mints a
+   5-minute code (`nbac_`, hashed) and returns the client's redirect URL.
+5. `POST /oauth/token` (also reachable as `/v1/token`) exchanges the code: client auth,
+   redirect match, PKCE verify. Result: ES256 access JWT (`sub=owner`, `aud=<service id>`,
+   `scope`, `client_id`, 1h) plus an opaque refresh token (`nbrt_`, hashed, 30d) that starts
+   a **family**.
+6. Refresh rotates: the presented token is marked used and a new one issued in the same
+   family. Presenting a used token is replay → the whole family is revoked and audited.
+
+Everything is audited (`oauth.client.register`, `oauth.authorize.request`, `oauth.approve`,
+`oauth.deny`, `oauth.token`, `oauth.refresh`, `oauth.refresh.reuse`, `oauth.token.denied`).
+Registrations and failed exchanges count against the brute-force limiter.
+
+Table rows: `CLIENT#<id>`, `AUTHZ#<id>` (ttl), `CODE#<sha256>` (ttl), `REFRESH#<sha256>`
+(GSI1 `FAMILY#<id>`, ttl), `RESOURCE#<url>` lock → service id, and `resources` list on the
+service row.
+
+Slice 3 (not built): end users of a product (passkey / Google / Apple) and the Hydra-style
+redirect to a product's own login page for services that are not owner-only.
+
 ## Tokens
 
 *Proposed.* JWT, ES256, header `{"alg":"ES256","kid":"<kms key id>","typ":"at+jwt"}`.

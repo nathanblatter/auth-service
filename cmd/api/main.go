@@ -23,6 +23,7 @@ import (
 	"github.com/nathanblatter/auth-service/internal/config"
 	"github.com/nathanblatter/auth-service/internal/core"
 	"github.com/nathanblatter/auth-service/internal/httpapi"
+	"github.com/nathanblatter/auth-service/internal/oauth"
 	"github.com/nathanblatter/auth-service/internal/owner"
 	"github.com/nathanblatter/auth-service/internal/ratelimit"
 	"github.com/nathanblatter/auth-service/internal/signer"
@@ -116,7 +117,7 @@ func build(ctx context.Context, log *slog.Logger) (http.Handler, config.Config, 
 	own.Log = log
 	lim := ratelimit.New(st)
 	lim.Log = log
-	srv := &httpapi.Server{Core: c, Owner: own, Limit: lim, AdminTokenHash: adminHash, Log: log, Version: version}
+	srv := &httpapi.Server{Core: c, Owner: own, Limit: lim, OAuth: oauth.New(c), AdminTokenHash: adminHash, Log: log, Version: version}
 	return srv.Handler(), cfg, nil
 }
 

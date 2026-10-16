@@ -25,6 +25,7 @@ type Claims struct {
 	Subject  string `json:"sub"`
 	Audience string `json:"aud"`
 	Scope    string `json:"scope,omitempty"`
+	ClientID string `json:"client_id,omitempty"`
 	IssuedAt int64  `json:"iat"`
 	Expires  int64  `json:"exp"`
 	ID       string `json:"jti"`

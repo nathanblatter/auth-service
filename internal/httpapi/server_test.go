@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nathanblatter/auth-service/internal/core"
+	"github.com/nathanblatter/auth-service/internal/oauth"
 	"github.com/nathanblatter/auth-service/internal/owner"
 	"github.com/nathanblatter/auth-service/internal/ratelimit"
 	"github.com/nathanblatter/auth-service/internal/signer"
@@ -41,7 +44,7 @@ func newServerWithStore(t *testing.T, issuer string) (*httptest.Server, *store.M
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{Core: c, Owner: own, Limit: ratelimit.New(mem), AdminTokenHash: core.HashSecret(adminToken), Version: "test"}
+	srv := &Server{Core: c, Owner: own, Limit: ratelimit.New(mem), OAuth: oauth.New(c), AdminTokenHash: core.HashSecret(adminToken), Version: "test"}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts, mem
@@ -196,7 +199,8 @@ func TestAdminDisabledWhenNoHash(t *testing.T) {
 	ring, _ := signer.NewRing(s)
 	mem := store.NewMemory()
 	own, _ := owner.New(mem, "https://auth.test")
-	srv := &Server{Core: core.New(mem, ring, "https://auth.test"), Owner: own, Limit: ratelimit.New(mem)}
+	c := core.New(mem, ring, "https://auth.test")
+	srv := &Server{Core: c, Owner: own, Limit: ratelimit.New(mem), OAuth: oauth.New(c)}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	// Empty hash: even an empty-string token must not match.
@@ -369,5 +373,130 @@ func TestBruteForceLockout(t *testing.T) {
 	}
 	if code, body := do(t, "POST", ts.URL+"/admin/login/begin", "", "", ""); code != 429 || body["error"] != "too_many_attempts" {
 		t.Fatalf("login after lockout: %d %v", code, body)
+	}
+}
+
+func TestConnectorOAuthFlow(t *testing.T) {
+	ts, mem := newServerWithStore(t, "https://auth.test")
+	ctx := context.Background()
+	admin := "Bearer " + adminToken
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	// Metadata advertises the endpoints.
+	if code, md := do(t, "GET", ts.URL+"/.well-known/oauth-authorization-server", "", "", ""); code != 200 || md["registration_endpoint"] != "https://auth.test/oauth/register" {
+		t.Fatalf("metadata: %d %v", code, md)
+	}
+	if code, _ := do(t, "GET", ts.URL+"/.well-known/oauth-authorization-server/mcp", "", "", ""); code != 200 {
+		t.Fatalf("metadata with suffix: %d", code)
+	}
+
+	// Service with a resource.
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"FinForge","slug":"finforge"}`)
+	id := svc["id"].(string)
+	if code, body := do(t, "POST", ts.URL+"/admin/services/"+id+"/resources", admin, "application/json", `{"resource":"ftp://x"}`); code != 400 {
+		t.Fatalf("bad resource: %d %v", code, body)
+	}
+	code, body := do(t, "POST", ts.URL+"/admin/services/"+id+"/resources", admin, "application/json", `{"resource":"https://finforge.test/mcp"}`)
+	if code != 200 || len(body["resources"].([]any)) != 1 {
+		t.Fatalf("add resource: %d %v", code, body)
+	}
+	if code, _ := do(t, "POST", ts.URL+"/admin/services/"+id+"/resources", admin, "application/json", `{"resource":"https://finforge.test/mcp"}`); code != 409 {
+		t.Fatalf("dup resource: %d", code)
+	}
+
+	// DCR.
+	code, reg := do(t, "POST", ts.URL+"/oauth/register", "", "application/json", `{"client_name":"Claude","redirect_uris":["https://claude.ai/cb"],"token_endpoint_auth_method":"none"}`)
+	if code != 201 || reg["client_id"] == nil || reg["client_secret"] != nil {
+		t.Fatalf("register: %d %v", code, reg)
+	}
+	clientID := reg["client_id"].(string)
+
+	// Authorize: untrusted redirect is a hard 400, no bounce.
+	q := url.Values{"client_id": {clientID}, "redirect_uri": {"https://evil.test"}, "response_type": {"code"}}
+	resp, _ := noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("evil redirect: %d", resp.StatusCode)
+	}
+	// Missing PKCE bounces back with an error.
+	q = url.Values{"client_id": {clientID}, "redirect_uri": {"https://claude.ai/cb"}, "response_type": {"code"}, "state": {"s1"}, "resource": {"https://finforge.test/mcp"}}
+	resp, _ = noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+	resp.Body.Close()
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	if resp.StatusCode != 302 || loc.Host != "claude.ai" || loc.Query().Get("error") != "invalid_request" || loc.Query().Get("state") != "s1" {
+		t.Fatalf("missing pkce bounce: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	// Good request goes to the console.
+	verifier := strings.Repeat("v", 43)
+	sum := sha256.Sum256([]byte(verifier))
+	q.Set("code_challenge", base64.RawURLEncoding.EncodeToString(sum[:]))
+	q.Set("code_challenge_method", "S256")
+	q.Set("scope", "read")
+	resp, _ = noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+	resp.Body.Close()
+	loc, _ = url.Parse(resp.Header.Get("Location"))
+	if resp.StatusCode != 302 || loc.Path != "/admin" || loc.Query().Get("approve") == "" {
+		t.Fatalf("approve redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	authzID := loc.Query().Get("approve")
+
+	// Pending details need admin; the bearer token may look but not approve.
+	if code, _ := do(t, "GET", ts.URL+"/admin/authorize/"+authzID, "", "", ""); code != 401 {
+		t.Fatalf("pending unauthenticated: %d", code)
+	}
+	code, pend := do(t, "GET", ts.URL+"/admin/authorize/"+authzID, admin, "", "")
+	if code != 200 || pend["client_name"] != "Claude" || pend["service"].(map[string]any)["id"] != id {
+		t.Fatalf("pending: %d %v", code, pend)
+	}
+	if code, body := do(t, "POST", ts.URL+"/admin/authorize/"+authzID+"/approve", admin, "", ""); code != 401 || body["error"] != "passkey_required" {
+		t.Fatalf("approve with bearer: %d %v", code, body)
+	}
+
+	// Passkey session approves (cookie + same-origin).
+	now := time.Now()
+	tok := "sess"
+	_ = mem.PutSession(ctx, store.Session{Hash: core.HashSecret(tok), CreatedAt: now, ExpiresAt: now.Add(owner.SessionTTL)})
+	hdr := map[string]string{"Cookie": sessionCookie + "=" + tok, "Origin": "https://auth.test"}
+	resp = doRaw(t, "POST", ts.URL+"/admin/authorize/"+authzID+"/approve", hdr, "")
+	var out map[string]string
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.HasPrefix(out["redirect_to"], "https://claude.ai/cb?") {
+		t.Fatalf("approve: %d %v", resp.StatusCode, out)
+	}
+	cbURL, _ := url.Parse(out["redirect_to"])
+	authCode := cbURL.Query().Get("code")
+	if authCode == "" || cbURL.Query().Get("state") != "s1" {
+		t.Fatalf("callback: %s", out["redirect_to"])
+	}
+	resp = doRaw(t, "POST", ts.URL+"/admin/authorize/"+authzID+"/approve", hdr, "")
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("approve twice: %d", resp.StatusCode)
+	}
+
+	// Exchange on /oauth/token (public client: no secret).
+	form := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {authCode}, "code_verifier": {verifier}, "redirect_uri": {"https://claude.ai/cb"}}
+	code, tk := do(t, "POST", ts.URL+"/oauth/token", "", "application/x-www-form-urlencoded", form.Encode())
+	if code != 200 || tk["refresh_token"] == nil || tk["expires_in"].(float64) != 3600 {
+		t.Fatalf("exchange: %d %v", code, tk)
+	}
+	// The access token is for FinForge, not for the auth API.
+	if code, _ := do(t, "GET", ts.URL+"/v1/me", "Bearer "+tk["access_token"].(string), "", ""); code != 401 {
+		t.Fatalf("connector token on /v1/me: %d", code)
+	}
+	// Refresh on the legacy /v1/token path works too (same handler).
+	form = url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {tk["refresh_token"].(string)}}
+	if code, tk2 := do(t, "POST", ts.URL+"/v1/token", "", "application/x-www-form-urlencoded", form.Encode()); code != 200 || tk2["refresh_token"] == tk["refresh_token"] {
+		t.Fatalf("refresh: %d %v", code, tk2)
+	}
+
+	// Deny path works with the break-glass token (denying is not sensitive).
+	resp, _ = noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+	resp.Body.Close()
+	loc, _ = url.Parse(resp.Header.Get("Location"))
+	code, out2 := do(t, "POST", ts.URL+"/admin/authorize/"+loc.Query().Get("approve")+"/deny", admin, "", "")
+	if code != 200 || !strings.Contains(out2["redirect_to"].(string), "error=access_denied") {
+		t.Fatalf("deny: %d %v", code, out2)
 	}
 }
