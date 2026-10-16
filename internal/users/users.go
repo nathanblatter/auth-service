@@ -47,6 +47,7 @@ var (
 	ErrDisabled        = errors.New("users: account disabled")
 	ErrEmailUnverified = errors.New("users: provider did not verify the email")
 	ErrInvalidRole     = errors.New("users: role is not defined on the service")
+	ErrSignupClosed    = errors.New("users: sign-up is closed; accounts are created by the owner")
 )
 
 // Users wires the store with per-service WebAuthn instances.
@@ -91,18 +92,44 @@ func (u *Users) webauthnFor(svc store.Service) (*webauthn.WebAuthn, error) {
 
 // ── accounts ───────────────────────────────────────────────────────────────
 
-// Create registers an account. Passkey accounts are keyed on email (lowercased);
-// Google accounts are created by the Google flow, not here.
+// Create registers a passkey account on behalf of the app (self sign-up).
+// Passkey accounts are keyed on email (lowercased); Google accounts are
+// created by the Google flow, not here. Refused on a closed pool.
 func (u *Users) Create(ctx context.Context, svc store.Service, email, name string) (store.User, error) {
 	if svc.LoginURL == "" {
 		return store.User{}, ErrNotUserPool
 	}
+	if !svc.OpenSignup {
+		u.audit(ctx, "user.signup_denied", svc.ID, "", "method=passkey email="+strings.ToLower(strings.TrimSpace(email)), "")
+		return store.User{}, ErrSignupClosed
+	}
+	return u.newUser(ctx, svc, MethodPasskey, email, name, "user.create")
+}
+
+// Provision is the owner's path: it creates an account whatever the pool's
+// sign-up setting. A Google account is parked on google-pending:<email> and
+// bound to the real Google subject the first time that person signs in.
+func (u *Users) Provision(ctx context.Context, svc store.Service, method, email, name string) (store.User, error) {
+	if svc.LoginURL == "" {
+		return store.User{}, ErrNotUserPool
+	}
+	if method != MethodPasskey && method != MethodGoogle {
+		return store.User{}, ErrInvalidMethod
+	}
+	return u.newUser(ctx, svc, method, email, name, "user.provision")
+}
+
+func (u *Users) newUser(ctx context.Context, svc store.Service, method, email, name, auditKind string) (store.User, error) {
 	email, err := normalizeEmail(email)
 	if err != nil {
 		return store.User{}, err
 	}
+	identity := "email:" + email
+	if method == MethodGoogle {
+		identity = pendingGoogle + email
+	}
 	user := store.User{
-		ID: "usr_" + randomBase32(16), ServiceID: svc.ID, Method: MethodPasskey, Identity: "email:" + email,
+		ID: "usr_" + randomBase32(16), ServiceID: svc.ID, Method: method, Identity: identity,
 		Email: email, Name: strings.TrimSpace(name), Roles: append([]string(nil), svc.DefaultRoles...), Status: "active", CreatedAt: u.Now(),
 	}
 	if err := u.Store.CreateUser(ctx, user); err != nil {
@@ -111,7 +138,7 @@ func (u *Users) Create(ctx context.Context, svc store.Service, email, name strin
 		}
 		return store.User{}, err
 	}
-	u.audit(ctx, "user.create", svc.ID, user.ID, "method=passkey", "")
+	u.audit(ctx, auditKind, svc.ID, user.ID, "method="+method, "")
 	return user, nil
 }
 
@@ -453,7 +480,13 @@ type GoogleIdentity struct {
 	Name          string
 }
 
-// LoginGoogle finds or creates the user for a verified Google identity.
+// pendingGoogle prefixes the identity of an owner-provisioned Google account
+// that has not signed in yet; LoginGoogle rebinds it to google:<sub>.
+const pendingGoogle = "google-pending:"
+
+// LoginGoogle finds the user for a verified Google identity. An unknown
+// subject is bound to a pre-provisioned account with that verified email, or
+// created on an open pool; on a closed pool it is refused.
 func (u *Users) LoginGoogle(ctx context.Context, svc store.Service, g GoogleIdentity, ip string) (store.User, error) {
 	if svc.LoginURL == "" {
 		return store.User{}, ErrNotUserPool
@@ -466,6 +499,24 @@ func (u *Users) LoginGoogle(ctx context.Context, svc store.Service, g GoogleIden
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		email, _ := normalizeEmail(g.Email)
+		if email != "" {
+			pending, perr := u.Store.GetUserByIdentity(ctx, svc.ID, pendingGoogle+email)
+			switch {
+			case perr == nil:
+				if err := u.Store.RebindUserIdentity(ctx, svc.ID, pending.ID, pendingGoogle+email, identity); err != nil {
+					return store.User{}, err
+				}
+				pending.Identity = identity
+				u.audit(ctx, "user.google.bind", svc.ID, pending.ID, "", ip)
+				return u.finishGoogle(ctx, svc, pending, ip)
+			case !errors.Is(perr, store.ErrNotFound):
+				return store.User{}, perr
+			}
+		}
+		if !svc.OpenSignup {
+			u.audit(ctx, "user.signup_denied", svc.ID, "", "method=google email="+email, ip)
+			return store.User{}, ErrSignupClosed
+		}
 		user = store.User{
 			ID: "usr_" + randomBase32(16), ServiceID: svc.ID, Method: MethodGoogle, Identity: identity,
 			Email: email, Name: strings.TrimSpace(g.Name), Roles: append([]string(nil), svc.DefaultRoles...), Status: "active", CreatedAt: u.Now(),
@@ -480,6 +531,10 @@ func (u *Users) LoginGoogle(ctx context.Context, svc store.Service, g GoogleIden
 	case err != nil:
 		return store.User{}, err
 	}
+	return u.finishGoogle(ctx, svc, user, ip)
+}
+
+func (u *Users) finishGoogle(ctx context.Context, svc store.Service, user store.User, ip string) (store.User, error) {
 	if user.Status != "active" {
 		u.audit(ctx, "user.login_denied", svc.ID, user.ID, "disabled", ip)
 		return store.User{}, ErrDisabled

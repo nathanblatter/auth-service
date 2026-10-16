@@ -299,7 +299,7 @@ func (c *Core) SetPermissions(ctx context.Context, serviceID string, scopes []st
 
 // SetLogin configures a service as a user pool (slice 3) or, with an empty
 // login URL, back to owner-only.
-func (c *Core) SetLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string, by Actor) (store.Service, error) {
+func (c *Core) SetLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string, openSignup bool, by Actor) (store.Service, error) {
 	svc, err := c.GetService(ctx, serviceID)
 	if err != nil {
 		return store.Service{}, err
@@ -344,13 +344,16 @@ func (c *Core) SetLogin(ctx context.Context, serviceID, loginURL, rpID string, o
 		}
 		cleanRoles = append(cleanRoles, r)
 	}
-	if err := c.Store.UpdateServiceLogin(ctx, serviceID, loginURL, rpID, cleanOrigins, cleanRoles); err != nil {
+	if loginURL == "" {
+		openSignup = false // owner-only services have no sign-up at all
+	}
+	if err := c.Store.UpdateServiceLogin(ctx, serviceID, loginURL, rpID, cleanOrigins, cleanRoles, openSignup); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return store.Service{}, ErrServiceNotFound
 		}
 		return store.Service{}, err
 	}
-	c.audit(ctx, "service.login.set", by, serviceID, "login_url="+loginURL+" rp_id="+rpID)
+	c.audit(ctx, "service.login.set", by, serviceID, fmt.Sprintf("login_url=%s rp_id=%s open_signup=%t", loginURL, rpID, openSignup))
 	return c.GetService(ctx, serviceID)
 }
 

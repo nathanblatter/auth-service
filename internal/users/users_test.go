@@ -25,7 +25,7 @@ func newUsers(t *testing.T) (*Users, *store.Memory, store.Service) {
 		t.Fatal(err)
 	}
 	_ = mem.UpdateServicePermissions(ctx, svc.ID, []string{"read", "write", "admin"}, map[string][]string{"user": {"read"}, "editor": {"read", "write"}, "owner": {"admin", "read", "write"}})
-	_ = mem.UpdateServiceLogin(ctx, svc.ID, "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"user"})
+	_ = mem.UpdateServiceLogin(ctx, svc.ID, "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"user"}, true)
 	svc, _ = mem.GetService(ctx, svc.ID)
 	return u, mem, svc
 }
@@ -247,4 +247,82 @@ func TestDeleteAndExport(t *testing.T) {
 	if err := u.Delete(ctx, svc.ID, "usr_ghost"); !errors.Is(err, ErrUserNotFound) {
 		t.Fatalf("delete missing: %v", err)
 	}
+}
+
+func TestClosedSignup(t *testing.T) {
+	u, mem, svc := newUsers(t)
+	ctx := context.Background()
+	_ = mem.UpdateServiceLogin(ctx, svc.ID, svc.LoginURL, svc.RPID, svc.Origins, svc.DefaultRoles, false)
+	svc, _ = mem.GetService(ctx, svc.ID)
+
+	// The app cannot sign people up; Google first sign-in is refused.
+	if _, err := u.Create(ctx, svc, "a@x.test", "A"); !errors.Is(err, ErrSignupClosed) {
+		t.Fatalf("app sign-up on closed pool: %v", err)
+	}
+	if _, err := u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "1", Email: "g@x.test", EmailVerified: true}, "ip"); !errors.Is(err, ErrSignupClosed) {
+		t.Fatalf("unknown google identity on closed pool: %v", err)
+	}
+	if n := countAudit(t, mem, "user.signup_denied"); n != 2 {
+		t.Fatalf("signup_denied audits: %d", n)
+	}
+
+	// The owner provisions accounts regardless.
+	if _, err := u.Provision(ctx, svc, "magic-link", "a@x.test", ""); !errors.Is(err, ErrInvalidMethod) {
+		t.Fatalf("bad method: %v", err)
+	}
+	pk, err := u.Provision(ctx, svc, MethodPasskey, "A@x.test", "A")
+	if err != nil || pk.Method != MethodPasskey || pk.Identity != "email:a@x.test" || len(pk.Roles) != 1 {
+		t.Fatalf("provision passkey: %+v %v", pk, err)
+	}
+	g, err := u.Provision(ctx, svc, MethodGoogle, "G@x.test", "G")
+	if err != nil || g.Method != MethodGoogle || g.Identity != "google-pending:g@x.test" {
+		t.Fatalf("provision google: %+v %v", g, err)
+	}
+	if _, err := u.Provision(ctx, svc, MethodGoogle, "g@x.test", ""); !errors.Is(err, ErrIdentityTaken) {
+		t.Fatalf("dup pending google: %v", err)
+	}
+
+	// First Google sign-in binds the pending account to the real subject, once.
+	if _, err := u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "77", Email: "g@x.test", EmailVerified: false}, "ip"); !errors.Is(err, ErrEmailUnverified) {
+		t.Fatalf("unverified email must not bind: %v", err)
+	}
+	bound, err := u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "77", Email: "G@x.test", EmailVerified: true, Name: "G"}, "ip")
+	if err != nil || bound.ID != g.ID || bound.Identity != "google:77" {
+		t.Fatalf("bind on first login: %+v %v", bound, err)
+	}
+	again, err := u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "77", Email: "other@x.test", EmailVerified: true}, "ip")
+	if err != nil || again.ID != g.ID {
+		t.Fatalf("second login by subject: %+v %v", again, err)
+	}
+	// Same email, different Google subject: the pending slot is gone, so it is a stranger.
+	if _, err := u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "78", Email: "g@x.test", EmailVerified: true}, "ip"); !errors.Is(err, ErrSignupClosed) {
+		t.Fatalf("second subject with the same email: %v", err)
+	}
+	if n := countAudit(t, mem, "user.google.bind"); n != 1 {
+		t.Fatalf("bind audits: %d", n)
+	}
+
+	// Open pools bind pending accounts too, instead of creating a duplicate.
+	_ = mem.UpdateServiceLogin(ctx, svc.ID, svc.LoginURL, svc.RPID, svc.Origins, svc.DefaultRoles, true)
+	svc, _ = mem.GetService(ctx, svc.ID)
+	p2, _ := u.Provision(ctx, svc, MethodGoogle, "p2@x.test", "")
+	b2, err := u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "99", Email: "p2@x.test", EmailVerified: true}, "ip")
+	if err != nil || b2.ID != p2.ID {
+		t.Fatalf("bind on open pool: %+v %v", b2, err)
+	}
+}
+
+func countAudit(t *testing.T, mem *store.Memory, kind string) int {
+	t.Helper()
+	events, _, err := mem.ListAudit(context.Background(), "2026-10", 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range events {
+		if e.Kind == kind {
+			n++
+		}
+	}
+	return n
 }

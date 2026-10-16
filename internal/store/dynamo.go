@@ -78,6 +78,7 @@ type serviceItem struct {
 	RPID                   string              `dynamodbav:"rp_id,omitempty"`
 	Origins                []string            `dynamodbav:"origins,omitempty"`
 	DefaultRoles           []string            `dynamodbav:"default_roles,omitempty"`
+	OpenSignup             bool                `dynamodbav:"open_signup,omitempty"`
 }
 
 type credItem struct {
@@ -272,7 +273,7 @@ func (it serviceItem) toService() (Service, error) {
 		return Service{}, fmt.Errorf("store: bad created_at on %s: %w", it.PK, err)
 	}
 	return Service{ID: it.ID, Slug: it.Slug, Name: it.Name, Status: it.Status, CreatedAt: t, Resources: it.Resources, Scopes: it.Scopes, Roles: it.Roles,
-		LoginURL: it.LoginURL, RPID: it.RPID, Origins: it.Origins, DefaultRoles: it.DefaultRoles}, nil
+		LoginURL: it.LoginURL, RPID: it.RPID, Origins: it.Origins, DefaultRoles: it.DefaultRoles, OpenSignup: it.OpenSignup}, nil
 }
 
 func (it credItem) toCredential() (Credential, error) {
@@ -1031,7 +1032,7 @@ func (d *Dynamo) UpdateServicePermissions(ctx context.Context, serviceID string,
 	return err
 }
 
-func (d *Dynamo) UpdateServiceLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string) error {
+func (d *Dynamo) UpdateServiceLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string, openSignup bool) error {
 	strList := func(xs []string) types.AttributeValue {
 		out := make([]types.AttributeValue, 0, len(xs))
 		for _, x := range xs {
@@ -1042,13 +1043,14 @@ func (d *Dynamo) UpdateServiceLogin(ctx context.Context, serviceID, loginURL, rp
 	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:           &d.table,
 		Key:                 dynKey(pkService+serviceID, skMeta),
-		UpdateExpression:    aws.String("SET login_url = :l, rp_id = :r, origins = :o, default_roles = :d"),
+		UpdateExpression:    aws.String("SET login_url = :l, rp_id = :r, origins = :o, default_roles = :d, open_signup = :s"),
 		ConditionExpression: aws.String("attribute_exists(PK)"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":l": &types.AttributeValueMemberS{Value: loginURL},
 			":r": &types.AttributeValueMemberS{Value: rpID},
 			":o": strList(origins),
 			":d": strList(defaultRoles),
+			":s": &types.AttributeValueMemberBOOL{Value: openSignup},
 		},
 	})
 	var cond *types.ConditionalCheckFailedException
@@ -1207,6 +1209,38 @@ func (d *Dynamo) UpdateUser(ctx context.Context, u User) error {
 	})
 	var cond *types.ConditionalCheckFailedException
 	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
+}
+
+func (d *Dynamo) RebindUserIdentity(ctx context.Context, serviceID, userID, oldIdentity, newIdentity string) error {
+	lock, err := attributevalue.MarshalMap(map[string]string{"PK": pkIdent + serviceID + "#" + newIdentity, "SK": skMeta, "type": "identity", "user_id": userID})
+	if err != nil {
+		return err
+	}
+	// Old lock (must belong to this user), new lock (must be free) and the user
+	// row move together, so a failure leaves the account exactly as it was.
+	_, err = d.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{Delete: &types.Delete{TableName: &d.table, Key: dynKey(pkIdent+serviceID+"#"+oldIdentity, skMeta),
+				ConditionExpression:       aws.String("attribute_exists(PK) AND user_id = :u"),
+				ExpressionAttributeValues: map[string]types.AttributeValue{":u": &types.AttributeValueMemberS{Value: userID}}}},
+			{Put: &types.Put{TableName: &d.table, Item: lock, ConditionExpression: aws.String("attribute_not_exists(PK)")}},
+			{Update: &types.Update{TableName: &d.table, Key: dynKey(pkUser+serviceID+"#"+userID, skMeta),
+				UpdateExpression:          aws.String("SET #i = :i"),
+				ConditionExpression:       aws.String("attribute_exists(PK) AND #i = :o"),
+				ExpressionAttributeNames:  map[string]string{"#i": "identity"},
+				ExpressionAttributeValues: map[string]types.AttributeValue{":i": &types.AttributeValueMemberS{Value: newIdentity}, ":o": &types.AttributeValueMemberS{Value: oldIdentity}}}},
+		},
+	})
+	var canceled *types.TransactionCanceledException
+	if errors.As(err, &canceled) {
+		for i, r := range canceled.CancellationReasons {
+			if r.Code != nil && *r.Code == "ConditionalCheckFailed" && i == 1 {
+				return ErrConflict
+			}
+		}
 		return ErrNotFound
 	}
 	return err

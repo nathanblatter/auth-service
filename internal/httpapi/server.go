@@ -880,7 +880,7 @@ func serviceJSON(svc store.Service) map[string]any {
 	}
 	return map[string]any{"id": svc.ID, "slug": svc.Slug, "name": svc.Name, "status": svc.Status,
 		"created_at": svc.CreatedAt.UTC().Format(time.RFC3339), "resources": res, "scopes": scopes, "roles": roles,
-		"login_url": svc.LoginURL, "rp_id": svc.RPID, "origins": origins, "default_roles": defRoles}
+		"login_url": svc.LoginURL, "rp_id": svc.RPID, "origins": origins, "default_roles": defRoles, "open_signup": svc.OpenSignup}
 }
 
 func credentialJSON(c store.Credential) map[string]any {

@@ -409,11 +409,14 @@
         <div class="row" style="margin-top:6px"><textarea class="grow mono perm-roles" rows="3" placeholder="one role per line: admin = read write"></textarea></div>
         <div class="row" style="margin-top:6px"><button class="small perm-save">Save permissions</button><span class="muted" style="font-size:13px">Connector tokens may only carry catalog scopes; empty request = whole catalog.</span></div>
       </details>
-      <details><summary>Users: ${svc.login_url ? 'user pool · ' + svc.login_url : 'owner-only (no login URL)'}</summary>
+      <details><summary>Users: ${svc.login_url ? 'user pool · ' + (svc.open_signup ? 'open to the public' : 'invite-only') + ' · ' + svc.login_url : 'owner-only (no login URL)'}</summary>
         <div class="row" style="margin-top:8px"><input class="grow login-url" placeholder="login URL the app hosts, e.g. https://finforge.nathanblatter.com/login"></div>
         <div class="row" style="margin-top:6px"><input class="grow mono login-rp" placeholder="rp_id, e.g. finforge.nathanblatter.com"><input class="grow mono login-origins" placeholder="origins, space separated: https://finforge.nathanblatter.com"></div>
         <div class="row" style="margin-top:6px"><input class="grow mono login-roles" placeholder="default roles for new users: user"><button class="small login-save">Save user pool</button></div>
+        <label class="row muted" style="font-size:13px;margin-top:6px;gap:6px;align-items:center"><input type="checkbox" class="login-open"> Open to the public: anyone can sign up (Google, or the app's sign-up form). Off = invite-only, you add every account below.</label>
         <p class="muted" style="font-size:13px;margin:6px 0 0">Leave the login URL empty for an owner-only service (connectors approved by you). With a login URL, the app's own page signs users in with passkeys or Google.</p>
+        <div class="users"></div>
+        <div class="row user-add${svc.login_url ? '' : ' hidden'}" style="margin-top:8px"><input class="grow user-email" placeholder="email"><input class="grow user-name" placeholder="name (optional)"><select class="user-method"><option value="passkey">passkey</option><option value="google">google</option></select><button class="small user-create">Add account</button></div>
       </details>
       <details><summary>${(svc.resources || []).length} connector resource${(svc.resources || []).length === 1 ? '' : 's'}</summary>
         <div class="resources"></div>
@@ -467,15 +470,53 @@
     wrap.querySelector('.login-rp').value = svc.rp_id || '';
     wrap.querySelector('.login-origins').value = (svc.origins || []).join(' ');
     wrap.querySelector('.login-roles').value = (svc.default_roles || []).join(' ');
+    wrap.querySelector('.login-open').checked = !!svc.open_signup;
     wrap.querySelector('.login-save').onclick = async () => {
       try {
         await api('PUT', `/admin/services/${svc.id}/login`, {
           login_url: wrap.querySelector('.login-url').value.trim(), rp_id: wrap.querySelector('.login-rp').value.trim(),
           origins: wrap.querySelector('.login-origins').value.split(/\s+/).filter(Boolean),
-          default_roles: wrap.querySelector('.login-roles').value.split(/\s+/).filter(Boolean) });
+          default_roles: wrap.querySelector('.login-roles').value.split(/\s+/).filter(Boolean),
+          open_signup: wrap.querySelector('.login-open').checked });
         await loadServices();
       } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
     };
+
+    const usersEl = wrap.querySelector('.users');
+    if (svc.login_url) {
+      const details = wrap.querySelector('.users').closest('details');
+      let loaded = false;
+      const loadUsers = async () => {
+        try {
+          const { users } = await api('GET', `/admin/services/${svc.id}/users?limit=200`);
+          usersEl.innerHTML = '';
+          if (!users.length) { usersEl.innerHTML = '<p class="muted">No accounts yet.</p>'; return; }
+          const t = document.createElement('table');
+          t.innerHTML = '<tr><th>Email</th><th>Name</th><th>Method</th><th>Roles</th><th>Status</th><th>Created</th></tr>';
+          for (const u of users) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = '<td class="mono"></td><td></td><td class="mono muted"></td><td class="mono muted"></td><td></td><td class="muted"></td>';
+            tr.children[0].textContent = u.email; tr.children[1].textContent = u.name || '';
+            tr.children[2].textContent = u.method; tr.children[3].textContent = (u.roles || []).join(' ');
+            tr.children[4].innerHTML = u.status === 'active' ? '<span class="pill ok">active</span>' : '<span class="pill off">disabled</span>';
+            tr.children[5].textContent = fmt(u.created_at);
+            t.appendChild(tr);
+          }
+          usersEl.appendChild(t);
+        } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+      };
+      details.addEventListener('toggle', () => { if (details.open && !loaded) { loaded = true; loadUsers(); } });
+      wrap.querySelector('.user-create').onclick = async () => {
+        try {
+          await api('POST', `/admin/services/${svc.id}/users`, {
+            email: wrap.querySelector('.user-email').value.trim(), name: wrap.querySelector('.user-name').value.trim(),
+            method: wrap.querySelector('.user-method').value });
+          wrap.querySelector('.user-email').value = ''; wrap.querySelector('.user-name').value = '';
+          msg.textContent = ''; msg.className = 'msg';
+          await loadUsers();
+        } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+      };
+    }
 
     const resources = wrap.querySelector('.resources');
     if ((svc.resources || []).length) {

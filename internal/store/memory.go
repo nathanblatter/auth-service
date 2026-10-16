@@ -459,7 +459,7 @@ func (m *Memory) UpdateServicePermissions(_ context.Context, serviceID string, s
 	return nil
 }
 
-func (m *Memory) UpdateServiceLogin(_ context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string) error {
+func (m *Memory) UpdateServiceLogin(_ context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string, openSignup bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	svc, ok := m.services[serviceID]
@@ -469,6 +469,7 @@ func (m *Memory) UpdateServiceLogin(_ context.Context, serviceID, loginURL, rpID
 	svc.LoginURL, svc.RPID = loginURL, rpID
 	svc.Origins = append([]string(nil), origins...)
 	svc.DefaultRoles = append([]string(nil), defaultRoles...)
+	svc.OpenSignup = openSignup
 	m.services[serviceID] = svc
 	return nil
 }
@@ -551,6 +552,23 @@ func (m *Memory) UpdateUser(_ context.Context, u User) error {
 	cur.Email, cur.Name, cur.Status, cur.NotBefore = u.Email, u.Name, u.Status, u.NotBefore
 	cur.Roles = append([]string(nil), u.Roles...)
 	m.users[ukey(u.ServiceID, u.ID)] = cur
+	return nil
+}
+
+func (m *Memory) RebindUserIdentity(_ context.Context, serviceID, userID, oldIdentity, newIdentity string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.users[ukey(serviceID, userID)]
+	if !ok || cur.Identity != oldIdentity || m.idents[ukey(serviceID, oldIdentity)] != userID {
+		return ErrNotFound
+	}
+	if _, taken := m.idents[ukey(serviceID, newIdentity)]; taken {
+		return ErrConflict
+	}
+	delete(m.idents, ukey(serviceID, oldIdentity))
+	m.idents[ukey(serviceID, newIdentity)] = userID
+	cur.Identity = newIdentity
+	m.users[ukey(serviceID, userID)] = cur
 	return nil
 }
 

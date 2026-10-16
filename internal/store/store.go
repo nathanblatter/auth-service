@@ -33,6 +33,9 @@ type Service struct {
 	RPID         string
 	Origins      []string
 	DefaultRoles []string
+	// OpenSignup lets anyone create an account (Google first sign-in, the
+	// app's POST /v1/users). False = invite-only: accounts come from the owner.
+	OpenSignup bool
 }
 
 // User is an end user of one service. Method is fixed for life (no linking).
@@ -165,16 +168,20 @@ type Store interface {
 	GetService(ctx context.Context, id string) (Service, error)
 	ListServices(ctx context.Context) ([]Service, error)
 
-	AddServiceResource(ctx context.Context, serviceID, resource string) error                                         // ErrConflict when taken
-	UpdateServicePermissions(ctx context.Context, serviceID string, scopes []string, roles map[string][]string) error // ErrNotFound
-	UpdateServiceLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string) error   // ErrNotFound
+	AddServiceResource(ctx context.Context, serviceID, resource string) error                                                        // ErrConflict when taken
+	UpdateServicePermissions(ctx context.Context, serviceID string, scopes []string, roles map[string][]string) error                // ErrNotFound
+	UpdateServiceLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string, openSignup bool) error // ErrNotFound
 
 	// End users (slice 3).
 	CreateUser(ctx context.Context, u User) error // ErrConflict when the identity is taken
 	GetUser(ctx context.Context, serviceID, id string) (User, error)
 	GetUserByIdentity(ctx context.Context, serviceID, identity string) (User, error)
 	ListUsers(ctx context.Context, serviceID string, limit int, cursor string) (users []User, next string, err error)
-	UpdateUser(ctx context.Context, u User) error               // ErrNotFound; replaces Email, Name, Roles, Status, NotBefore
+	UpdateUser(ctx context.Context, u User) error // ErrNotFound; replaces Email, Name, Roles, Status, NotBefore
+	// RebindUserIdentity moves a user's identity lock (e.g. a pre-provisioned
+	// google-pending:<email> onto the real google:<sub>). ErrNotFound when the
+	// user or old lock is missing; ErrConflict when the new identity is taken.
+	RebindUserIdentity(ctx context.Context, serviceID, userID, oldIdentity, newIdentity string) error
 	DeleteUser(ctx context.Context, serviceID, id string) error // removes the user, its identity lock and passkeys; ErrNotFound
 	PutUserPasskey(ctx context.Context, p UserPasskey) error
 	UpdateUserPasskey(ctx context.Context, p UserPasskey) error

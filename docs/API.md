@@ -151,9 +151,20 @@ A **user-pool** service (one with a `login_url`) has its own users. All `/v1/use
 the calling service. A user has one method for life: `passkey` (created via `POST /v1/users`)
 or `google` (created on first Google sign-in).
 
+**Who may create accounts** is the service's `open_signup` flag (default `false`):
+
+| `open_signup` | `POST /v1/users` (the app) | Unknown Google identity | Owner (`POST /admin/services/{id}/users`) |
+|---|---|---|---|
+| `true` (public, e.g. the games) | creates the account | creates the account | always works |
+| `false` (invite-only, e.g. the personal site) | `403 signup_closed` | sent back to `login_url?error=signup_closed` | always works |
+
+An owner-provisioned `google` account is bound to the real Google subject the first time
+that person signs in with a verified matching email; until then it cannot log in. Both
+refusals are audited as `user.signup_denied`.
+
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/v1/users` | `{"email","name"?}` → `201 user` (method `passkey`, roles = service `default_roles`). `409 identity_taken` |
+| POST | `/v1/users` | `{"email","name"?}` → `201 user` (method `passkey`, roles = service `default_roles`). `409 identity_taken`, `403 signup_closed` |
 | GET | `/v1/users?limit=50&cursor=` | `{"users":[user],"next"}` |
 | GET | `/v1/users/{id}` | `user` |
 | PATCH | `/v1/users/{id}` | any of `{"roles":[…],"status":"active|disabled","name"}`; roles must exist on the service |
@@ -210,13 +221,15 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | GET | `/admin/services` | `{"services":[service]}` |
 | GET | `/admin/services/{id}` | `service` |
 | POST | `/admin/services/{id}/resources` | `{"resource":"https://finforge.nathanblatter.com/mcp"}` → `200 service`. Absolute https URL, unique across services |
-| PUT | `/admin/services/{id}/login` | `{"login_url","rp_id","origins":[…],"default_roles":[…]}` → `200 service`. Empty `login_url` = owner-only. `rp_id` must be a registrable suffix of every origin; default roles must exist |
+| PUT | `/admin/services/{id}/login` | `{"login_url","rp_id","origins":[…],"default_roles":[…],"open_signup":false}` → `200 service`. Empty `login_url` = owner-only (and `open_signup` is forced off). `rp_id` must be a registrable suffix of every origin; default roles must exist |
+| POST | `/admin/services/{id}/users` | `{"email","name"?,"method":"passkey|google"}` (default `passkey`) → `201 user`, whatever `open_signup` says. `409 identity_taken`, `409 service_not_configured` on an owner-only service |
+| GET | `/admin/services/{id}/users?limit=50&cursor=` | `{"users":[user],"next"}` |
 | PUT | `/admin/services/{id}/permissions` | `{"scopes":["read","write"],"roles":{"admin":["read","write"],"viewer":["read"]}}` → `200 service`. Scopes `^[a-z][a-z0-9:._-]{0,39}$` (≤50); role names `^[a-z][a-z0-9-]{0,39}$` (≤20) bundling catalog scopes only. Replaces the whole catalog |
 | POST | `/admin/services/{id}/credentials` | **fresh**. `201 {"credential":"nbk_…", "id","service_id","last4","created_at","revoked":false}` |
 | GET | `/admin/services/{id}/credentials` | `{"credentials":[{"id","service_id","last4","created_at","revoked","revoked_at"?}]}` (never the secret or its hash) |
 | DELETE | `/admin/services/{id}/credentials/{cred}` | `204`; idempotent. Already-issued 15-minute service tokens finish their lifetime |
 
-`service` = `{"id","slug","name","status":"active|disabled","created_at","resources":[…],"scopes":[…],"roles":{name:[…]},"login_url","rp_id","origins":[…],"default_roles":[…]}`.
+`service` = `{"id","slug","name","status":"active|disabled","created_at","resources":[…],"scopes":[…],"roles":{name:[…]},"login_url","rp_id","origins":[…],"default_roles":[…],"open_signup":bool}`.
 
 ### Connector approvals
 | Method | Path | Notes |
@@ -231,7 +244,7 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | GET | `/admin/audit?month=YYYY-MM&limit=50&cursor=` | `{"month","events":[{"at","kind","actor","service_id","detail","ip"}],"next"}` newest first; pass `next` back as `cursor` |
 
 Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `service.login.set`,
-`user.create`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
+`user.create`, `user.provision`, `user.signup_denied`, `user.google.bind`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
 `user.passkey.register`, `user.export`, `user.delete`, `credential.mint`, `credential.revoke`,
 `token.issue`, `token.denied`, `passkey.register`, `owner.login`, `owner.login_denied`,
 `owner.stepup`, `owner.stepup_denied`, `owner.logout_everywhere`, `recovery.generate`,

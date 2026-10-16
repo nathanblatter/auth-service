@@ -236,7 +236,7 @@ func TestLogoutEverywhereKillsRefresh(t *testing.T) {
 func TestUserPoolFlow(t *testing.T) {
 	s, mem, svc := newServer(t)
 	ctx := context.Background()
-	_ = mem.UpdateServiceLogin(ctx, svc.ID, "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"viewer"})
+	_ = mem.UpdateServiceLogin(ctx, svc.ID, "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"viewer"}, true)
 	c, secret, _ := s.Register(ctx, RegisterRequest{RedirectURIs: []string{"https://finforge.test/cb"}, ClientName: "FinForge web"}, "ip")
 	verifier, challenge := pkce()
 	p := AuthzParams{ClientID: c.ID, RedirectURI: "https://finforge.test/cb", ResponseType: "code", State: "s", Scope: "read write",

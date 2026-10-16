@@ -35,6 +35,8 @@ func (s *Server) userRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/login/google/start", s.googleStart)
 	mux.HandleFunc("GET /v1/login/google/callback", s.googleCallback)
 	mux.HandleFunc("PUT /admin/services/{id}/login", s.requireAdmin(s.setLogin))
+	mux.HandleFunc("POST /admin/services/{id}/users", s.requireAdmin(s.adminCreateUser))
+	mux.HandleFunc("GET /admin/services/{id}/users", s.requireAdmin(s.adminListUsers))
 }
 
 // callerService loads the service behind the request's service token.
@@ -59,8 +61,10 @@ func (s *Server) userFail(w http.ResponseWriter, err error) bool {
 		writeJSON(w, 409, map[string]string{"error": "identity_taken"})
 	case errors.Is(err, users.ErrNotUserPool), errors.Is(err, users.ErrNoWebAuthn):
 		writeJSON(w, 409, map[string]string{"error": "service_not_configured", "detail": err.Error()})
-	case errors.Is(err, users.ErrInvalidEmail), errors.Is(err, users.ErrInvalidRole), errors.Is(err, users.ErrWrongMethod):
+	case errors.Is(err, users.ErrInvalidEmail), errors.Is(err, users.ErrInvalidRole), errors.Is(err, users.ErrWrongMethod), errors.Is(err, users.ErrInvalidMethod):
 		writeJSON(w, 400, map[string]string{"error": "invalid_request", "detail": err.Error()})
+	case errors.Is(err, users.ErrSignupClosed):
+		writeJSON(w, 403, map[string]string{"error": "signup_closed", "detail": "this service does not accept sign-ups; the owner creates accounts"})
 	case errors.Is(err, users.ErrDisabled):
 		writeJSON(w, 403, map[string]string{"error": "account_disabled"})
 	case errors.Is(err, users.ErrEmailUnverified):
@@ -372,6 +376,9 @@ func (s *Server) googleCallback(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, users.ErrEmailUnverified):
 		backToLogin("email_unverified")
 		return
+	case errors.Is(err, users.ErrSignupClosed):
+		backToLogin("signup_closed")
+		return
 	case err != nil:
 		s.fail(w, err)
 		return
@@ -393,11 +400,12 @@ func (s *Server) setLogin(w http.ResponseWriter, r *http.Request) {
 		RPID         string   `json:"rp_id"`
 		Origins      []string `json:"origins"`
 		DefaultRoles []string `json:"default_roles"`
+		OpenSignup   bool     `json:"open_signup"`
 	}
 	if !readJSON(w, r, &in) {
 		return
 	}
-	svc, err := s.Core.SetLogin(r.Context(), r.PathValue("id"), in.LoginURL, in.RPID, in.Origins, in.DefaultRoles, s.actor(r))
+	svc, err := s.Core.SetLogin(r.Context(), r.PathValue("id"), in.LoginURL, in.RPID, in.Origins, in.DefaultRoles, in.OpenSignup, s.actor(r))
 	switch {
 	case errors.Is(err, core.ErrInvalidLogin):
 		writeJSON(w, 400, map[string]string{"error": "invalid_request", "detail": err.Error()})
@@ -408,4 +416,59 @@ func (s *Server) setLogin(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, 200, serviceJSON(svc))
 	}
+}
+
+// adminService loads the service named in the path for the owner's user routes.
+func (s *Server) adminService(w http.ResponseWriter, r *http.Request) (store.Service, bool) {
+	svc, err := s.Core.GetService(r.Context(), r.PathValue("id"))
+	if errors.Is(err, core.ErrServiceNotFound) {
+		writeJSON(w, 404, map[string]string{"error": "not_found"})
+		return store.Service{}, false
+	}
+	if err != nil {
+		s.fail(w, err)
+		return store.Service{}, false
+	}
+	return svc, true
+}
+
+// adminCreateUser provisions an account from the console, open pool or not.
+func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.adminService(w, r)
+	if !ok {
+		return
+	}
+	var in struct{ Email, Name, Method string }
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if in.Method == "" {
+		in.Method = users.MethodPasskey
+	}
+	u, err := s.Users.Provision(r.Context(), svc, in.Method, in.Email, in.Name)
+	if s.userFail(w, err) {
+		return
+	}
+	writeJSON(w, 201, userJSON(u))
+}
+
+func (s *Server) adminListUsers(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.adminService(w, r)
+	if !ok {
+		return
+	}
+	limit := 50
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n <= 200 {
+		limit = n
+	}
+	list, next, err := s.Users.List(r.Context(), svc.ID, limit, r.URL.Query().Get("cursor"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(list))
+	for _, u := range list {
+		out = append(out, userJSON(u))
+	}
+	writeJSON(w, 200, map[string]any{"users": out, "next": next})
 }

@@ -182,13 +182,19 @@ func conformance(t *testing.T, s Store) {
 	}
 
 	// User-pool login config.
-	if err := s.UpdateServiceLogin(ctx, "svc_a", "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"user"}); err != nil {
+	if err := s.UpdateServiceLogin(ctx, "svc_a", "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"user"}, true); err != nil {
 		t.Fatal(err)
 	}
-	if ls, _ := s.GetService(ctx, "svc_a"); ls.LoginURL != "https://finforge.test/login" || ls.RPID != "finforge.test" || len(ls.Origins) != 1 || len(ls.DefaultRoles) != 1 {
+	if ls, _ := s.GetService(ctx, "svc_a"); ls.LoginURL != "https://finforge.test/login" || ls.RPID != "finforge.test" || len(ls.Origins) != 1 || len(ls.DefaultRoles) != 1 || !ls.OpenSignup {
 		t.Fatalf("login config: %+v", ls)
 	}
-	if err := s.UpdateServiceLogin(ctx, "svc_missing", "", "", nil, nil); !errors.Is(err, ErrNotFound) {
+	if err := s.UpdateServiceLogin(ctx, "svc_a", "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"user"}, false); err != nil {
+		t.Fatal(err)
+	}
+	if ls, _ := s.GetService(ctx, "svc_a"); ls.OpenSignup {
+		t.Fatalf("open_signup must clear: %+v", ls)
+	}
+	if err := s.UpdateServiceLogin(ctx, "svc_missing", "", "", nil, nil, false); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("login config on missing: %v", err)
 	}
 
@@ -211,6 +217,29 @@ func conformance(t *testing.T, s Store) {
 	}
 	if _, err := s.GetUser(ctx, "svc_b", "u1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("user from another service: %v", err)
+	}
+	// Rebinding moves the identity lock atomically.
+	u3 := User{ID: "u3", ServiceID: "svc_a", Method: "google", Identity: "google-pending:c@x.test", Email: "c@x.test", Status: "active", CreatedAt: now.Add(2 * time.Second)}
+	if err := s.CreateUser(ctx, u3); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RebindUserIdentity(ctx, "svc_a", "u3", "google-pending:c@x.test", "google:123"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("rebind onto a taken identity: %v", err)
+	}
+	if err := s.RebindUserIdentity(ctx, "svc_a", "u3", "google-pending:nope", "google:777"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rebind with wrong old identity: %v", err)
+	}
+	if err := s.RebindUserIdentity(ctx, "svc_a", "u3", "google-pending:c@x.test", "google:777"); err != nil {
+		t.Fatalf("rebind: %v", err)
+	}
+	if gu, err := s.GetUserByIdentity(ctx, "svc_a", "google:777"); err != nil || gu.ID != "u3" || gu.Identity != "google:777" {
+		t.Fatalf("rebound lookup: %+v %v", gu, err)
+	}
+	if _, err := s.GetUserByIdentity(ctx, "svc_a", "google-pending:c@x.test"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old identity must be released: %v", err)
+	}
+	if err := s.DeleteUser(ctx, "svc_a", "u3"); err != nil {
+		t.Fatal(err)
 	}
 	if gu, err := s.GetUserByIdentity(ctx, "svc_a", "google:123"); err != nil || gu.ID != "u1" {
 		t.Fatalf("GetUserByIdentity: %+v %v", gu, err)

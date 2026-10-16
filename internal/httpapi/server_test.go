@@ -687,8 +687,12 @@ func TestUserPoolHTTP(t *testing.T) {
 		t.Fatalf("bad default role: %d %v", code, body)
 	}
 	code, body := do(t, "PUT", ts.URL+"/admin/services/"+id+"/login", admin, "application/json", `{"login_url":"https://finforge.test/login","rp_id":"finforge.test","origins":["https://finforge.test"],"default_roles":["user"]}`)
-	if code != 200 || body["login_url"] != "https://finforge.test/login" {
-		t.Fatalf("set login: %d %v", code, body)
+	if code != 200 || body["login_url"] != "https://finforge.test/login" || body["open_signup"] != false {
+		t.Fatalf("set login (default invite-only): %d %v", code, body)
+	}
+	code, body = do(t, "PUT", ts.URL+"/admin/services/"+id+"/login", admin, "application/json", `{"login_url":"https://finforge.test/login","rp_id":"finforge.test","origins":["https://finforge.test"],"default_roles":["user"],"open_signup":true}`)
+	if code != 200 || body["open_signup"] != true {
+		t.Fatalf("open signup: %d %v", code, body)
 	}
 	_, cred := do(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", admin, "", "")
 	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {id}, "client_secret": {cred["credential"].(string)}}
@@ -819,5 +823,130 @@ func TestUserPoolHTTP(t *testing.T) {
 	form = url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {ut["refresh_token"].(string)}}
 	if code, body := do(t, "POST", ts.URL+"/oauth/token", "", "application/x-www-form-urlencoded", form.Encode()); code != 400 || body["error"] != "invalid_grant" {
 		t.Fatalf("refresh after delete: %d %v", code, body)
+	}
+}
+
+// TestClosedSignupHTTP: an invite-only pool refuses the app's sign-up and
+// strangers at Google; the owner provisions accounts and a provisioned Google
+// account binds on first sign-in.
+func TestClosedSignupHTTP(t *testing.T) {
+	ts, _ := newServerWithStore(t, "https://auth.test")
+	srv := lastServer
+	admin := "Bearer " + adminToken
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"Personal Site","slug":"personal-site"}`)
+	id := svc["id"].(string)
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/permissions", admin, "application/json", `{"scopes":["read"],"roles":{"user":["read"]}}`)
+	do(t, "POST", ts.URL+"/admin/services/"+id+"/resources", admin, "application/json", `{"resource":"https://site.test/api"}`)
+	// Owner-only service: no accounts at all.
+	if code, body := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", admin, "application/json", `{"email":"me@x.test"}`); code != 409 || body["error"] != "service_not_configured" {
+		t.Fatalf("provision on owner-only service: %d %v", code, body)
+	}
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/login", admin, "application/json", `{"login_url":"https://site.test/login","rp_id":"site.test","origins":["https://site.test"],"default_roles":["user"]}`)
+	_, cred := do(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", admin, "", "")
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {id}, "client_secret": {cred["credential"].(string)}}
+	_, tk := do(t, "POST", ts.URL+"/v1/token", "", "application/x-www-form-urlencoded", form.Encode())
+	svcTok := "Bearer " + tk["access_token"].(string)
+
+	// The app cannot sign anyone up.
+	if code, body := do(t, "POST", ts.URL+"/v1/users", svcTok, "application/json", `{"email":"stranger@x.test"}`); code != 403 || body["error"] != "signup_closed" {
+		t.Fatalf("app sign-up on closed pool: %d %v", code, body)
+	}
+	// The owner can, with either method; the list needs admin, not a service token.
+	if code, _ := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", svcTok, "application/json", `{"email":"me@x.test"}`); code != 401 {
+		t.Fatalf("provision with service token: %d", code)
+	}
+	code, me := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", admin, "application/json", `{"email":"Me@x.test","name":"Nathan"}`)
+	if code != 201 || me["method"] != "passkey" || me["email"] != "me@x.test" {
+		t.Fatalf("provision passkey: %d %v", code, me)
+	}
+	if code, body := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", admin, "application/json", `{"email":"me@x.test","method":"sms"}`); code != 400 || body["error"] != "invalid_request" {
+		t.Fatalf("bad method: %d %v", code, body)
+	}
+	code, g := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", admin, "application/json", `{"email":"g@x.test","method":"google"}`)
+	if code != 201 || g["method"] != "google" {
+		t.Fatalf("provision google: %d %v", code, g)
+	}
+	if code, list := do(t, "GET", ts.URL+"/admin/services/"+id+"/users", admin, "", ""); code != 200 || len(list["users"].([]any)) != 2 {
+		t.Fatalf("admin list: %d %v", code, list)
+	}
+	if code, _ := do(t, "GET", ts.URL+"/admin/services/nope/users", admin, "", ""); code != 404 {
+		t.Fatalf("list on missing service: %d", code)
+	}
+
+	// Google: a stranger is sent back to the login page with signup_closed;
+	// the provisioned person binds and completes the authorization.
+	_, reg := do(t, "POST", ts.URL+"/oauth/register", "", "application/json", `{"client_name":"Site","redirect_uris":["https://site.test/cb"],"token_endpoint_auth_method":"none"}`)
+	clientID := reg["client_id"].(string)
+	verifier := strings.Repeat("v", 43)
+	sum := sha256.Sum256([]byte(verifier))
+	authorize := func() string {
+		q := url.Values{"client_id": {clientID}, "redirect_uri": {"https://site.test/cb"}, "response_type": {"code"}, "state": {"s1"},
+			"resource": {"https://site.test/api"}, "scope": {"read"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}}
+		resp, _ := noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+		resp.Body.Close()
+		loc, _ := url.Parse(resp.Header.Get("Location"))
+		if lc := loc.Query().Get("login_challenge"); lc != "" {
+			return lc
+		}
+		t.Fatalf("authorize: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+		return ""
+	}
+	who := map[string]any{"sub": "stranger-1", "email": "stranger@x.test", "email_verified": true}
+	gmux := http.NewServeMux()
+	gmux.HandleFunc("POST /token", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "at"})
+	})
+	gmux.HandleFunc("GET /userinfo", func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(who) })
+	fake := httptest.NewServer(gmux)
+	defer fake.Close()
+	srv.Google = users.NewGoogle("cid", "sec", "https://auth.test/v1/login/google/callback")
+	srv.Google.AuthURL, srv.Google.TokenURL, srv.Google.UserinfoURL = fake.URL+"/auth", fake.URL+"/token", fake.URL+"/userinfo"
+	callback := func() *url.URL {
+		resp, _ := noRedirect.Get(ts.URL + "/v1/login/google/start?login_challenge=" + authorize())
+		resp.Body.Close()
+		gloc, _ := url.Parse(resp.Header.Get("Location"))
+		resp, _ = noRedirect.Get(ts.URL + "/v1/login/google/callback?state=" + url.QueryEscape(gloc.Query().Get("state")) + "&code=good")
+		resp.Body.Close()
+		loc, _ := url.Parse(resp.Header.Get("Location"))
+		if resp.StatusCode != 302 {
+			t.Fatalf("callback: %d", resp.StatusCode)
+		}
+		return loc
+	}
+	if loc := callback(); loc.Path != "/login" || loc.Query().Get("error") != "signup_closed" || loc.Query().Get("login_challenge") == "" {
+		t.Fatalf("stranger at google: %s", loc)
+	}
+	who = map[string]any{"sub": "g-77", "email": "G@x.test", "email_verified": true, "name": "G"}
+	loc := callback()
+	if loc.Path != "/cb" || loc.Query().Get("code") == "" {
+		t.Fatalf("provisioned google user: %s", loc)
+	}
+	form = url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {loc.Query().Get("code")}, "code_verifier": {verifier}, "redirect_uri": {"https://site.test/cb"}}
+	code, ut := do(t, "POST", ts.URL+"/oauth/token", "", "application/x-www-form-urlencoded", form.Encode())
+	if code != 200 {
+		t.Fatalf("token for bound user: %d %v", code, ut)
+	}
+	if claims, err := srv.Core.VerifyToken(ut["access_token"].(string), id); err != nil || claims.Subject != "usr:"+g["id"].(string) {
+		t.Fatalf("bound user claims: %+v %v", claims, err)
+	}
+	// Same email from another Google account is a stranger again.
+	who = map[string]any{"sub": "g-78", "email": "g@x.test", "email_verified": true}
+	if loc := callback(); loc.Query().Get("error") != "signup_closed" {
+		t.Fatalf("second subject with the same email: %s", loc)
+	}
+	_, audit := do(t, "GET", ts.URL+"/admin/audit?month="+time.Now().UTC().Format("2006-01")+"&limit=50", admin, "", "")
+	var denied, bound int
+	for _, e := range audit["events"].([]any) {
+		switch e.(map[string]any)["kind"] {
+		case "user.signup_denied":
+			denied++
+		case "user.google.bind":
+			bound++
+		}
+	}
+	if denied != 3 || bound != 1 {
+		t.Fatalf("audit: denied=%d bound=%d", denied, bound)
 	}
 }

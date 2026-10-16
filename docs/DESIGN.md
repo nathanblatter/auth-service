@@ -174,6 +174,18 @@ slice 2) or a **user pool** (has a `login_url`). A user-pool service is itself a
 OAuth client of this server: its web app runs the normal authorization-code + PKCE flow and gets
 tokens for the signed-in user. Users belong to exactly one service: `USER#<svc>#<id>`.
 
+**DECIDED (Nathan, 2026-10-16): a user pool is either open to the public or invite-only**, a
+boolean `open_signup` on the service (default off). The games (codenames, secret hitler,
+impostor) are open: anyone can create an account by signing in with Google or through the
+app's sign-up form (`POST /v1/users`). The personal site is invite-only: both of those are
+refused with `signup_closed` (audited `user.signup_denied`) and every account is created by
+the owner in the console (`POST /admin/services/{id}/users`, method `passkey` or `google`).
+The rule is enforced here, not in app code, so a closed pool can only ever contain accounts
+Nathan made. An owner-provisioned Google account is parked on the identity
+`google-pending:<email>` and rebound to `google:<sub>` (one atomic store operation) the first
+time that person signs in with a verified matching email; a second Google subject with the
+same email is a stranger.
+
 ### Login flow (Hydra-style: the app owns the screen, we own the ceremony)
 
 1. App → `GET /oauth/authorize` (its own `client_id`, PKCE, `resource` = its resource URL).
@@ -210,7 +222,7 @@ users get the service's `default_roles`. Refresh tokens carry `sub` and honour a
 | Entity | PK | SK | GSI1PK | GSI1SK |
 |---|---|---|---|---|
 | User | `USER#<svc>#<id>` | `META` | `USERS#<svc>` | `<created_at>` |
-| Identity lock (one method, one identity) | `IDENT#<svc>#google:<sub>` or `IDENT#<svc>#email:<email>` | `META` → user id | | |
+| Identity lock (one method, one identity) | `IDENT#<svc>#google:<sub>`, `IDENT#<svc>#email:<email>` or `IDENT#<svc>#google-pending:<email>` (provisioned, not yet signed in) | `META` → user id | | |
 | User passkey | `USER#<svc>#<id>` | `PASSKEY#<cred id>` | `UPK#<svc>#<cred id>` | user id |
 
 Service row gains `login_url`, `rp_id`, `origins`, `default_roles`.
