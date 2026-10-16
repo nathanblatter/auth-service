@@ -455,8 +455,17 @@ func TestConnectorOAuthFlow(t *testing.T) {
 	// Passkey session approves (cookie + same-origin).
 	now := time.Now()
 	tok := "sess"
-	_ = mem.PutSession(ctx, store.Session{Hash: core.HashSecret(tok), CreatedAt: now, ExpiresAt: now.Add(owner.SessionTTL)})
+	_ = mem.PutSession(ctx, store.Session{Hash: core.HashSecret(tok), CreatedAt: now, ExpiresAt: now.Add(owner.SessionTTL), Method: "passkey"})
 	hdr := map[string]string{"Cookie": sessionCookie + "=" + tok, "Origin": "https://auth.test"}
+	// Session without a recent assertion must step up first.
+	resp = doRaw(t, "POST", ts.URL+"/admin/authorize/"+authzID+"/approve", hdr, "")
+	var stale map[string]string
+	_ = json.NewDecoder(resp.Body).Decode(&stale)
+	resp.Body.Close()
+	if resp.StatusCode != 401 || stale["error"] != "step_up_required" {
+		t.Fatalf("approve with stale session: %d %v", resp.StatusCode, stale)
+	}
+	_ = mem.TouchSessionVerified(ctx, core.HashSecret(tok), now)
 	resp = doRaw(t, "POST", ts.URL+"/admin/authorize/"+authzID+"/approve", hdr, "")
 	var out map[string]string
 	_ = json.NewDecoder(resp.Body).Decode(&out)
@@ -592,5 +601,59 @@ func TestAuditAndLogoutEverywhere(t *testing.T) {
 		if resp.StatusCode != 401 {
 			t.Fatalf("session %s survived: %d", tok, resp.StatusCode)
 		}
+	}
+}
+
+func TestStepUp(t *testing.T) {
+	ts, mem := newServerWithStore(t, "https://auth.test")
+	ctx := context.Background()
+	admin := "Bearer " + adminToken
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"S","slug":"stepup"}`)
+	id := svc["id"].(string)
+	now := time.Now()
+	tok := "stale"
+	_ = mem.PutSession(ctx, store.Session{Hash: core.HashSecret(tok), CreatedAt: now.Add(-20 * time.Minute), ExpiresAt: now.Add(owner.SessionTTL),
+		Method: "passkey", VerifiedAt: now.Add(-20 * time.Minute)})
+	hdr := map[string]string{"Cookie": sessionCookie + "=" + tok, "Origin": "https://auth.test"}
+
+	// Reads are fine; minting needs a fresh assertion.
+	resp := doRaw(t, "GET", ts.URL+"/admin/services", hdr, "")
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("read with stale session: %d", resp.StatusCode)
+	}
+	resp = doRaw(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", hdr, "")
+	var body map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if resp.StatusCode != 401 || body["error"] != "step_up_required" {
+		t.Fatalf("mint with stale session: %d %v", resp.StatusCode, body)
+	}
+	resp = doRaw(t, "GET", ts.URL+"/admin/session", hdr, "")
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if body["fresh"] != false {
+		t.Fatalf("session fresh flag: %v", body)
+	}
+	// Step-up begin needs passkeys registered; with none it is a 500-free 409 via BeginLogin.
+	resp = doRaw(t, "POST", ts.URL+"/admin/step-up/begin", hdr, "")
+	resp.Body.Close()
+	if resp.StatusCode != 500 && resp.StatusCode != 200 && resp.StatusCode != 409 {
+		t.Fatalf("step-up begin: %d", resp.StatusCode)
+	}
+	// Simulate a completed step-up.
+	_ = mem.TouchSessionVerified(ctx, core.HashSecret(tok), now)
+	resp = doRaw(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", hdr, "")
+	resp.Body.Close()
+	if resp.StatusCode != 201 {
+		t.Fatalf("mint after step-up: %d", resp.StatusCode)
+	}
+	// A recovery session can never mint.
+	_ = mem.PutSession(ctx, store.Session{Hash: core.HashSecret("rec"), CreatedAt: now, ExpiresAt: now.Add(owner.SessionTTL), Method: "recovery", VerifiedAt: now})
+	resp = doRaw(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", map[string]string{"Cookie": sessionCookie + "=rec", "Origin": "https://auth.test"}, "")
+	_ = json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if resp.StatusCode != 401 || body["error"] != "passkey_required" {
+		t.Fatalf("mint with recovery session: %d %v", resp.StatusCode, body)
 	}
 }

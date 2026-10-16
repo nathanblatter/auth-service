@@ -139,7 +139,7 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const api = async (method, path, body, headers = {}) => {
+  const rawApi = async (method, path, body, headers = {}) => {
     const opts = { method, headers: { ...headers }, credentials: 'same-origin' };
     if (body !== undefined) {
       opts.headers['Content-Type'] = 'application/json';
@@ -152,6 +152,23 @@
     if (!res.ok) throw Object.assign(new Error(data.error_description || data.detail || data.error || res.statusText), { status: res.status, data });
     return data;
   };
+  // api() transparently re-runs Face ID when a sensitive action says the
+  // session's last passkey assertion is too old, then retries once.
+  const api = async (method, path, body, headers) => {
+    try { return await rawApi(method, path, body, headers); }
+    catch (e) {
+      if (e.data && e.data.error === 'step_up_required') {
+        await stepUp();
+        return rawApi(method, path, body, headers);
+      }
+      throw e;
+    }
+  };
+  async function stepUp() {
+    const begin = await rawApi('POST', '/admin/step-up/begin');
+    const cred = await navigator.credentials.get({ publicKey: decodeAssertion(begin.options.publicKey) });
+    await rawApi('POST', '/admin/step-up/finish?challenge=' + encodeURIComponent(begin.challenge_id), encodeCredential(cred));
+  }
   const say = (id, text, cls) => { const el = $(id); el.textContent = text || ''; el.className = 'msg' + (cls ? ' ' + cls : ''); };
   const fmt = (iso) => iso ? new Date(iso).toLocaleString() : '';
 

@@ -67,6 +67,9 @@ type Session struct {
 	IP        string
 	// Method is how the session was opened: "passkey" (default) or "recovery".
 	Method string
+	// VerifiedAt is the last passkey assertion on this session (login or
+	// step-up). Sensitive actions require it to be recent.
+	VerifiedAt time.Time
 }
 
 // RecoveryCode is one offline recovery code, stored hashed.
@@ -159,6 +162,7 @@ type Store interface {
 	PutSession(ctx context.Context, s Session) error
 	GetSession(ctx context.Context, hash string, now time.Time) (Session, error) // ErrNotFound when missing or expired
 	DeleteSession(ctx context.Context, hash string) error
+	TouchSessionVerified(ctx context.Context, hash string, at time.Time) error // ErrNotFound when missing
 
 	// Owner "log out everywhere": sessions and refresh tokens created before
 	// this instant are dead. Zero time means never set.

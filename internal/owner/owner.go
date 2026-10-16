@@ -31,6 +31,9 @@ const (
 	SessionTTL = time.Hour
 	// ChallengeTTL bounds a WebAuthn ceremony.
 	ChallengeTTL = 5 * time.Minute
+	// StepUpWindow is how recent a passkey assertion must be for a sensitive
+	// action (auth-service-17).
+	StepUpWindow = 5 * time.Minute
 )
 
 var (
@@ -250,8 +253,74 @@ func (o *Owner) openSession(ctx context.Context, method, ip string) (string, tim
 	token := randomToken()
 	now := o.Now()
 	expires := now.Add(SessionTTL)
-	err := o.Store.PutSession(ctx, store.Session{Hash: hash(token), CreatedAt: now, ExpiresAt: expires, IP: ip, Method: method})
+	sess := store.Session{Hash: hash(token), CreatedAt: now, ExpiresAt: expires, IP: ip, Method: method}
+	if method == "passkey" {
+		sess.VerifiedAt = now // a login is itself a fresh assertion
+	}
+	err := o.Store.PutSession(ctx, sess)
 	return token, expires, err
+}
+
+// ── step-up (auth-service-17) ──────────────────────────────────────────────
+
+// Fresh reports whether the session's last passkey assertion is recent
+// enough for a sensitive action.
+func (o *Owner) Fresh(s store.Session) bool {
+	return s.Method == "passkey" && !s.VerifiedAt.IsZero() && o.Now().Sub(s.VerifiedAt) <= StepUpWindow
+}
+
+// BeginStepUp starts a passkey re-verification for an existing session.
+func (o *Owner) BeginStepUp(ctx context.Context) (*protocol.CredentialAssertion, string, error) {
+	return o.BeginLogin(ctx)
+}
+
+// FinishStepUp verifies the assertion and refreshes the session's VerifiedAt.
+func (o *Owner) FinishStepUp(ctx context.Context, challengeID, sessionToken string, r *http.Request) error {
+	ip := clientIP(r)
+	sess, err := o.loadChallenge(ctx, challengeID)
+	if err != nil {
+		return err
+	}
+	u, keys, err := o.loadUser(ctx)
+	if err != nil {
+		return err
+	}
+	handler := func(rawID, userHandle []byte) (webauthn.User, error) {
+		if string(userHandle) != string(ownerHandle) {
+			return nil, errors.New("unknown user handle")
+		}
+		for _, c := range u.creds {
+			if string(c.ID) == string(rawID) {
+				return u, nil
+			}
+		}
+		return nil, errors.New("unknown credential")
+	}
+	cred, err := o.WA.FinishDiscoverableLogin(handler, sess, r)
+	if err != nil || cred.Authenticator.CloneWarning {
+		o.audit(ctx, "owner.stepup_denied", "webauthn", ip)
+		return ErrCeremony
+	}
+	for _, k := range keys {
+		if k.ID == b64(cred.ID) {
+			data, err := json.Marshal(cred)
+			if err != nil {
+				return err
+			}
+			k.Data = data
+			if err := o.Store.UpdatePasskey(ctx, k); err != nil {
+				return err
+			}
+		}
+	}
+	if err := o.Store.TouchSessionVerified(ctx, hash(sessionToken), o.Now()); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrSessionInvalid
+		}
+		return err
+	}
+	o.audit(ctx, "owner.stepup", "pk="+b64(cred.ID), ip)
+	return nil
 }
 
 // ── recovery codes (auth-service-4) ────────────────────────────────────────

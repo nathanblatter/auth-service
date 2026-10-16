@@ -302,6 +302,15 @@ func conformance(t *testing.T, s Store) {
 	if err != nil || gs.IP != "1.2.3.4" || gs.Method != "recovery" || !gs.ExpiresAt.Equal(sess.ExpiresAt) {
 		t.Fatalf("GetSession: %+v %v", gs, err)
 	}
+	if err := s.TouchSessionVerified(ctx, "h1", now.Add(10*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if gs, _ := s.GetSession(ctx, "h1", now.Add(30*time.Minute)); !gs.VerifiedAt.Equal(now.Add(10 * time.Minute)) {
+		t.Fatalf("verified_at: %v", gs.VerifiedAt)
+	}
+	if err := s.TouchSessionVerified(ctx, "ghost", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("touch missing session: %v", err)
+	}
 	if _, err := s.GetSession(ctx, "h1", now.Add(2*time.Hour)); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expired session: %v", err)
 	}

@@ -84,6 +84,16 @@ The owner (Nathan) is the one cross-tenant identity. He authenticates to the con
   session** that can manage passkeys but cannot approve connectors. Codes are single use and
   attempts count against the login brute-force limit.
 
+## Step-up verification (auth-service-17)
+
+Sessions record `verified_at`, the time of the last passkey assertion (login or step-up).
+Sensitive actions (mint a credential, approve a connector, generate recovery codes) require a
+**passkey session verified within 5 minutes**; otherwise they answer `401 step_up_required`
+and the console re-runs Face ID via `/admin/step-up/begin` + `/finish`, then retries. Recovery
+sessions never pass. The break-glass token passes for minting and recovery codes (bootstrap
+needs it) but never for connector approval. Everything else (reads, revoke, deny, logout) works
+on any live session.
+
 ## Log out everywhere (auth-service-11) and the audit log (auth-service-7)
 
 `POST /admin/logout-everywhere` stamps `sessions_not_before = now` on the owner row. Console

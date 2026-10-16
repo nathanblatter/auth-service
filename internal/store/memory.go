@@ -427,3 +427,15 @@ func (m *Memory) SetOwnerNotBefore(_ context.Context, t time.Time) error {
 	m.notBefore = t
 	return nil
 }
+
+func (m *Memory) TouchSessionVerified(_ context.Context, hash string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[hash]
+	if !ok {
+		return ErrNotFound
+	}
+	s.VerifiedAt = at
+	m.sessions[hash] = s
+	return nil
+}

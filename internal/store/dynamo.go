@@ -290,13 +290,14 @@ type passkeyItem struct {
 }
 
 type expiringItem struct {
-	PK, SK    string
-	Type      string `dynamodbav:"type"`
-	CreatedAt string `dynamodbav:"created_at,omitempty"`
-	ExpiresAt string `dynamodbav:"expires_at"`
-	IP        string `dynamodbav:"ip,omitempty"`
-	Method    string `dynamodbav:"method,omitempty"`
-	Data      []byte `dynamodbav:"data,omitempty"`
+	PK, SK     string
+	Type       string `dynamodbav:"type"`
+	CreatedAt  string `dynamodbav:"created_at,omitempty"`
+	ExpiresAt  string `dynamodbav:"expires_at"`
+	IP         string `dynamodbav:"ip,omitempty"`
+	Method     string `dynamodbav:"method,omitempty"`
+	VerifiedAt string `dynamodbav:"verified_at,omitempty"`
+	Data       []byte `dynamodbav:"data,omitempty"`
 	// TTL is the table's TTL attribute: DynamoDB deletes the row within ~48h
 	// of this epoch second. Expiry is still enforced in code.
 	TTL int64 `dynamodbav:"ttl"`
@@ -405,8 +406,9 @@ func (d *Dynamo) ConsumeChallenge(ctx context.Context, id string, now time.Time)
 func (d *Dynamo) PutSession(ctx context.Context, s Session) error {
 	item, err := attributevalue.MarshalMap(expiringItem{
 		PK: pkSession + s.Hash, SK: skMeta, Type: "session", IP: s.IP, Method: s.Method,
-		CreatedAt: s.CreatedAt.UTC().Format(time.RFC3339Nano),
-		ExpiresAt: s.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: s.ExpiresAt.Unix() + 60,
+		VerifiedAt: fmtTime(s.VerifiedAt),
+		CreatedAt:  s.CreatedAt.UTC().Format(time.RFC3339Nano),
+		ExpiresAt:  s.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: s.ExpiresAt.Unix() + 60,
 	})
 	if err != nil {
 		return err
@@ -432,7 +434,8 @@ func (d *Dynamo) GetSession(ctx context.Context, hash string, now time.Time) (Se
 		return Session{}, ErrNotFound
 	}
 	created, _ := time.Parse(time.RFC3339Nano, it.CreatedAt)
-	return Session{Hash: hash, CreatedAt: created, ExpiresAt: exp, IP: it.IP, Method: it.Method}, nil
+	verified, _ := time.Parse(time.RFC3339Nano, it.VerifiedAt)
+	return Session{Hash: hash, CreatedAt: created, ExpiresAt: exp, IP: it.IP, Method: it.Method, VerifiedAt: verified}, nil
 }
 
 func (d *Dynamo) DeleteSession(ctx context.Context, hash string) error {
@@ -959,4 +962,27 @@ func (d *Dynamo) SetOwnerNotBefore(ctx context.Context, t time.Time) error {
 		ExpressionAttributeValues: map[string]types.AttributeValue{":t": &types.AttributeValueMemberS{Value: t.UTC().Format(time.RFC3339Nano)}, ":type": &types.AttributeValueMemberS{Value: "owner"}},
 	})
 	return err
+}
+
+func (d *Dynamo) TouchSessionVerified(ctx context.Context, hash string, at time.Time) error {
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &d.table,
+		Key:                       dynKey(pkSession+hash, skMeta),
+		UpdateExpression:          aws.String("SET verified_at = :t"),
+		ConditionExpression:       aws.String("attribute_exists(PK)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":t": &types.AttributeValueMemberS{Value: at.UTC().Format(time.RFC3339Nano)}},
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
+}
+
+// fmtTime renders a time for storage; zero becomes "" (omitted).
+func fmtTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }

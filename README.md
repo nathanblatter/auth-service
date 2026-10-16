@@ -57,14 +57,16 @@ curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 | GET/POST | `/admin/recovery-codes` | admin | status / generate a new set (shown once) |
 | POST | `/admin/recover` | none | sign in with a recovery code (recovery session) |
 | POST | `/admin/logout-everywhere` | admin | kill all sessions and connector refresh tokens |
+| POST | `/admin/step-up/begin`, `/finish` | passkey session | re-verify with Face ID for sensitive actions |
 | GET | `/admin/audit?month=YYYY-MM` | admin | page the audit log, newest first |
 | POST | `/admin/services` | admin | register a service |
 | GET | `/admin/services[/{id}]` | admin | list / fetch |
-| POST | `/admin/services/{id}/credentials` | admin | mint (shown once) |
+| POST | `/admin/services/{id}/credentials` | admin, fresh | mint (shown once) |
 | GET | `/admin/services/{id}/credentials` | admin | list by last four |
 | DELETE | `/admin/services/{id}/credentials/{cred}` | admin | revoke |
 
-"admin" in the Auth column means a passkey session cookie or the interim admin bearer token.
+"admin" in the Auth column means a passkey session cookie or the interim admin bearer token;
+"fresh" means the passkey was used within the last 5 minutes (the console re-prompts Face ID).
 
 ## Verifying a token in your service
 

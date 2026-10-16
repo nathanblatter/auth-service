@@ -216,3 +216,20 @@ func TestLogoutEverywhere(t *testing.T) {
 		t.Fatalf("new session after logout everywhere: %v", err)
 	}
 }
+
+func TestFresh(t *testing.T) {
+	o, _ := newOwner(t)
+	now := o.Now()
+	if !o.Fresh(store.Session{Method: "passkey", VerifiedAt: now.Add(-time.Minute)}) {
+		t.Fatal("recent passkey assertion should be fresh")
+	}
+	if o.Fresh(store.Session{Method: "passkey", VerifiedAt: now.Add(-StepUpWindow - time.Second)}) {
+		t.Fatal("stale assertion should not be fresh")
+	}
+	if o.Fresh(store.Session{Method: "recovery", VerifiedAt: now}) {
+		t.Fatal("recovery sessions are never fresh")
+	}
+	if o.Fresh(store.Session{Method: "passkey"}) {
+		t.Fatal("never-verified session should not be fresh")
+	}
+}

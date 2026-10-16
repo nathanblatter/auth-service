@@ -65,7 +65,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /oauth/authorize", s.oauthAuthorize)
 	mux.HandleFunc("POST /oauth/token", s.token)
 	mux.HandleFunc("GET /admin/authorize/{id}", s.requireAdmin(s.pendingApproval))
-	mux.HandleFunc("POST /admin/authorize/{id}/approve", s.requirePasskey(s.approve))
+	mux.HandleFunc("POST /admin/authorize/{id}/approve", s.requireFresh(false, s.approve))
 	mux.HandleFunc("POST /admin/authorize/{id}/deny", s.requireAdmin(s.deny))
 
 	// Owner console: the page, passkey ceremonies, sessions.
@@ -79,15 +79,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/passkeys/begin", s.requireAdmin(s.passkeyBegin))
 	mux.HandleFunc("POST /admin/passkeys/finish", s.requireAdmin(s.passkeyFinish))
 	mux.HandleFunc("GET /admin/recovery-codes", s.requireAdmin(s.recoveryStatus))
-	mux.HandleFunc("POST /admin/recovery-codes", s.requireAdmin(s.recoveryGenerate))
+	mux.HandleFunc("POST /admin/recovery-codes", s.requireFresh(true, s.recoveryGenerate))
 	mux.HandleFunc("POST /admin/recover", s.recoverLogin)
 	mux.HandleFunc("POST /admin/logout-everywhere", s.requireAdmin(s.logoutEverywhere))
+	mux.HandleFunc("POST /admin/step-up/begin", s.requireAdmin(s.stepUpBegin))
+	mux.HandleFunc("POST /admin/step-up/finish", s.requireAdmin(s.stepUpFinish))
 	mux.HandleFunc("GET /admin/audit", s.requireAdmin(s.audit))
 
 	mux.HandleFunc("POST /admin/services", s.requireAdmin(s.createService))
 	mux.HandleFunc("GET /admin/services", s.requireAdmin(s.listServices))
 	mux.HandleFunc("GET /admin/services/{id}", s.requireAdmin(s.getService))
-	mux.HandleFunc("POST /admin/services/{id}/credentials", s.requireAdmin(s.mintCredential))
+	mux.HandleFunc("POST /admin/services/{id}/credentials", s.requireFresh(true, s.mintCredential))
 	mux.HandleFunc("GET /admin/services/{id}/credentials", s.requireAdmin(s.listCredentials))
 	mux.HandleFunc("DELETE /admin/services/{id}/credentials/{cred}", s.requireAdmin(s.revokeCredential))
 	mux.HandleFunc("POST /admin/services/{id}/resources", s.requireAdmin(s.addResource))
@@ -313,6 +315,7 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 		if c, err := r.Cookie(sessionCookie); err == nil && m != "token" {
 			if sess, err := s.Owner.ValidateSession(r.Context(), c.Value); err == nil {
 				out["expires_at"] = sess.ExpiresAt.UTC().Format(time.RFC3339)
+				out["fresh"] = s.Owner.Fresh(sess)
 			}
 		}
 	}
@@ -656,16 +659,74 @@ func (s *Server) oauthToken(w http.ResponseWriter, r *http.Request, req oauth.To
 	writeJSON(w, 200, tok)
 }
 
-// requirePasskey is requireAdmin restricted to a live passkey session: the
-// break-glass token may manage services but may not approve connectors.
-func (s *Server) requirePasskey(next http.HandlerFunc) http.HandlerFunc {
+// requireFresh guards sensitive actions (auth-service-17): a passkey session
+// whose last assertion is within StepUpWindow. A stale passkey session gets
+// 401 step_up_required and the console re-runs Face ID. allowToken lets the
+// break-glass bearer through (minting, recovery codes: needed for bootstrap);
+// connector approval never accepts it (Nathan: approval is the passkey).
+func (s *Server) requireFresh(allowToken bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.adminMethod(r) != "passkey" {
+		switch s.adminMethod(r) {
+		case "token":
+			if allowToken {
+				next(w, r)
+				return
+			}
 			writeJSON(w, 401, map[string]string{"error": "passkey_required"})
 			return
+		case "passkey":
+			if c, err := r.Cookie(sessionCookie); err == nil {
+				if sess, err := s.Owner.ValidateSession(r.Context(), c.Value); err == nil && s.Owner.Fresh(sess) {
+					next(w, r)
+					return
+				}
+			}
+			writeJSON(w, 401, map[string]string{"error": "step_up_required"})
+		case "recovery":
+			writeJSON(w, 401, map[string]string{"error": "passkey_required", "detail": "register a passkey and sign in with it"})
+		default:
+			w.Header().Set("WWW-Authenticate", `Bearer realm="admin"`)
+			writeJSON(w, 401, map[string]string{"error": "unauthorized"})
 		}
-		next(w, r)
 	}
+}
+
+func (s *Server) stepUpBegin(w http.ResponseWriter, r *http.Request) {
+	if s.adminMethod(r) != "passkey" {
+		writeJSON(w, 400, map[string]string{"error": "passkey_required"})
+		return
+	}
+	opts, chID, err := s.Owner.BeginStepUp(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"challenge_id": chID, "options": opts})
+}
+
+func (s *Server) stepUpFinish(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	c, err := r.Cookie(sessionCookie)
+	if err != nil || s.adminMethod(r) != "passkey" {
+		writeJSON(w, 400, map[string]string{"error": "passkey_required"})
+		return
+	}
+	ipKey := "login:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, ipKey) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
+	err = s.Owner.FinishStepUp(r.Context(), r.URL.Query().Get("challenge"), c.Value, r)
+	if errors.Is(err, owner.ErrCeremony) {
+		s.Limit.Fail(r.Context(), ratelimit.LoginIP, ipKey)
+		writeJSON(w, 401, map[string]string{"error": "passkey_rejected"})
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"verified": true})
 }
 
 func (s *Server) pendingApproval(w http.ResponseWriter, r *http.Request) {
