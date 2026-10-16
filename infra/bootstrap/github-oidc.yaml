@@ -5,9 +5,12 @@ Description: >
   Deployed by hand once (make bootstrap); everything else goes through CI.
 
 Parameters:
-  GitHubRepo:
+  GitHubSubject:
     Type: String
-    Default: nathanblatter/auth-service
+    Default: repo:nathanblatter@281824272/auth-service@1421580348:ref:refs/heads/main
+    Description: >
+      Exact OIDC sub claim GitHub sends for pushes to main. This org's tokens carry the
+      immutable owner and repo IDs, so a renamed or re-created repo can never match.
   StackPrefix:
     Type: String
     Default: auth-service
@@ -38,7 +41,7 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepo}:ref:refs/heads/main
+                token.actions.githubusercontent.com:sub: !Ref GitHubSubject
       Policies:
         - PolicyName: sam-deploy
           PolicyDocument:
