@@ -133,7 +133,8 @@ The Go client does all of this: `client.NewVerifier(issuer, serviceID)` + `clien
    `201 {"client_id":"nbc_…","client_secret":"nbcs_…"?,"client_id_issued_at":…,"redirect_uris":[…],"token_endpoint_auth_method":"…","grant_types":[…],"response_types":["code"]}`
 3. The client opens **`GET /oauth/authorize`** with
    `response_type=code`, `client_id`, `redirect_uri` (must be registered), `state`,
-   `scope`, `code_challenge`, `code_challenge_method=S256`, and **`resource`** (required;
+   `scope` (⊆ the service's scope catalog, else `invalid_scope`; empty = whole catalog),
+   `code_challenge`, `code_challenge_method=S256`, and **`resource`** (required;
    must equal a resource registered on a service). Unknown client or unregistered redirect →
    `400`, no redirect. Other problems → `302` back to `redirect_uri` with `error`.
    Otherwise `302` to the console, where the owner approves with a passkey.
@@ -175,11 +176,12 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | GET | `/admin/services` | `{"services":[service]}` |
 | GET | `/admin/services/{id}` | `service` |
 | POST | `/admin/services/{id}/resources` | `{"resource":"https://finforge.nathanblatter.com/mcp"}` → `200 service`. Absolute https URL, unique across services |
+| PUT | `/admin/services/{id}/permissions` | `{"scopes":["read","write"],"roles":{"admin":["read","write"],"viewer":["read"]}}` → `200 service`. Scopes `^[a-z][a-z0-9:._-]{0,39}$` (≤50); role names `^[a-z][a-z0-9-]{0,39}$` (≤20) bundling catalog scopes only. Replaces the whole catalog |
 | POST | `/admin/services/{id}/credentials` | **fresh**. `201 {"credential":"nbk_…", "id","service_id","last4","created_at","revoked":false}` |
 | GET | `/admin/services/{id}/credentials` | `{"credentials":[{"id","service_id","last4","created_at","revoked","revoked_at"?}]}` (never the secret or its hash) |
 | DELETE | `/admin/services/{id}/credentials/{cred}` | `204`; idempotent. Already-issued 15-minute service tokens finish their lifetime |
 
-`service` = `{"id","slug","name","status":"active|disabled","created_at","resources":[…]}`.
+`service` = `{"id","slug","name","status":"active|disabled","created_at","resources":[…],"scopes":[…],"roles":{name:[…]}}`.
 
 ### Connector approvals
 | Method | Path | Notes |
@@ -193,7 +195,7 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 |---|---|---|
 | GET | `/admin/audit?month=YYYY-MM&limit=50&cursor=` | `{"month","events":[{"at","kind","actor","service_id","detail","ip"}],"next"}` newest first; pass `next` back as `cursor` |
 
-Event kinds: `service.create`, `service.resource.add`, `credential.mint`, `credential.revoke`,
+Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `credential.mint`, `credential.revoke`,
 `token.issue`, `token.denied`, `passkey.register`, `owner.login`, `owner.login_denied`,
 `owner.stepup`, `owner.stepup_denied`, `owner.logout_everywhere`, `recovery.generate`,
 `recovery.login`, `recovery.denied`, `oauth.client.register`, `oauth.authorize.request`,

@@ -93,6 +93,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/services/{id}/credentials", s.requireAdmin(s.listCredentials))
 	mux.HandleFunc("DELETE /admin/services/{id}/credentials/{cred}", s.requireAdmin(s.revokeCredential))
 	mux.HandleFunc("POST /admin/services/{id}/resources", s.requireAdmin(s.addResource))
+	mux.HandleFunc("PUT /admin/services/{id}/permissions", s.requireAdmin(s.setPermissions))
 	return s.withCommon(mux)
 }
 
@@ -792,6 +793,27 @@ func (s *Server) addResource(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) setPermissions(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Scopes []string
+		Roles  map[string][]string
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	svc, err := s.Core.SetPermissions(r.Context(), r.PathValue("id"), in.Scopes, in.Roles, s.actor(r))
+	switch {
+	case errors.Is(err, core.ErrInvalidScope), errors.Is(err, core.ErrInvalidRole):
+		writeJSON(w, 400, map[string]string{"error": "invalid_request", "detail": err.Error()})
+	case errors.Is(err, core.ErrServiceNotFound):
+		writeJSON(w, 404, map[string]string{"error": "not_found"})
+	case err != nil:
+		s.fail(w, err)
+	default:
+		writeJSON(w, 200, serviceJSON(svc))
+	}
+}
+
 // oauthFail writes an *oauth.Error or a 500; returns true when it wrote.
 func (s *Server) oauthFail(w http.ResponseWriter, err error) bool {
 	if err == nil {
@@ -834,8 +856,16 @@ func serviceJSON(svc store.Service) map[string]any {
 	if res == nil {
 		res = []string{}
 	}
+	scopes := svc.Scopes
+	if scopes == nil {
+		scopes = []string{}
+	}
+	roles := svc.Roles
+	if roles == nil {
+		roles = map[string][]string{}
+	}
 	return map[string]any{"id": svc.ID, "slug": svc.Slug, "name": svc.Name, "status": svc.Status,
-		"created_at": svc.CreatedAt.UTC().Format(time.RFC3339), "resources": res}
+		"created_at": svc.CreatedAt.UTC().Format(time.RFC3339), "resources": res, "scopes": scopes, "roles": roles}
 }
 
 func credentialJSON(c store.Credential) map[string]any {

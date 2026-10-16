@@ -439,3 +439,19 @@ func (m *Memory) TouchSessionVerified(_ context.Context, hash string, at time.Ti
 	m.sessions[hash] = s
 	return nil
 }
+
+func (m *Memory) UpdateServicePermissions(_ context.Context, serviceID string, scopes []string, roles map[string][]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	svc, ok := m.services[serviceID]
+	if !ok {
+		return ErrNotFound
+	}
+	svc.Scopes = append([]string(nil), scopes...)
+	svc.Roles = map[string][]string{}
+	for k, v := range roles {
+		svc.Roles[k] = append([]string(nil), v...)
+	}
+	m.services[serviceID] = svc
+	return nil
+}

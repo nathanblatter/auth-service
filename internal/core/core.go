@@ -44,6 +44,13 @@ var (
 	ErrServiceDisabled   = errors.New("core: service disabled")
 	ErrInvalidResource   = errors.New("core: resource must be an absolute https URL without a fragment")
 	ErrResourceTaken     = errors.New("core: resource already registered to a service")
+	ErrInvalidScope      = errors.New("core: scopes are 1-40 chars of a-z, 0-9, ':', '.', '_', '-' starting with a letter; max 50")
+	ErrInvalidRole       = errors.New("core: role names are 1-40 chars of a-z, 0-9, '-', max 20 roles, and may only bundle catalog scopes")
+)
+
+var (
+	scopeRe = regexp.MustCompile(`^[a-z][a-z0-9:._-]{0,39}$`)
+	roleRe  = regexp.MustCompile(`^[a-z][a-z0-9-]{0,39}$`)
 )
 
 var slugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
@@ -233,6 +240,91 @@ func (c *Core) AddResource(ctx context.Context, serviceID, resource string, by A
 	}
 	c.audit(ctx, "service.resource.add", by, serviceID, "resource="+resource)
 	return nil
+}
+
+// SetPermissions replaces a service's scope catalog and roles
+// (auth-service-10). Roles may only bundle scopes from the catalog.
+func (c *Core) SetPermissions(ctx context.Context, serviceID string, scopes []string, roles map[string][]string, by Actor) (store.Service, error) {
+	clean := make([]string, 0, len(scopes))
+	seen := map[string]bool{}
+	for _, sc := range scopes {
+		sc = strings.TrimSpace(sc)
+		if sc == "" || seen[sc] {
+			continue
+		}
+		if !scopeRe.MatchString(sc) {
+			return store.Service{}, ErrInvalidScope
+		}
+		seen[sc] = true
+		clean = append(clean, sc)
+	}
+	if len(clean) > 50 {
+		return store.Service{}, ErrInvalidScope
+	}
+	cleanRoles := make(map[string][]string, len(roles))
+	for name, rs := range roles {
+		name = strings.TrimSpace(name)
+		if !roleRe.MatchString(name) {
+			return store.Service{}, ErrInvalidRole
+		}
+		var bundle []string
+		rseen := map[string]bool{}
+		for _, sc := range rs {
+			sc = strings.TrimSpace(sc)
+			if sc == "" || rseen[sc] {
+				continue
+			}
+			if !seen[sc] {
+				return store.Service{}, ErrInvalidRole
+			}
+			rseen[sc] = true
+			bundle = append(bundle, sc)
+		}
+		cleanRoles[name] = bundle
+	}
+	if len(cleanRoles) > 20 {
+		return store.Service{}, ErrInvalidRole
+	}
+	err := c.Store.UpdateServicePermissions(ctx, serviceID, clean, cleanRoles)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Service{}, ErrServiceNotFound
+	}
+	if err != nil {
+		return store.Service{}, err
+	}
+	c.audit(ctx, "service.permissions.set", by, serviceID, fmt.Sprintf("scopes=%d roles=%d", len(clean), len(cleanRoles)))
+	return c.GetService(ctx, serviceID)
+}
+
+// GrantScope computes the scope a token may carry: the requested scopes
+// intersected with what is allowed. An empty request means "everything
+// allowed". The result keeps catalog order. ok is false when the request
+// names a scope outside allowed.
+func GrantScope(requested string, allowed []string) (granted string, ok bool) {
+	want := strings.Fields(requested)
+	if len(want) == 0 {
+		return strings.Join(allowed, " "), true
+	}
+	set := map[string]bool{}
+	for _, a := range allowed {
+		set[a] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			return "", false
+		}
+	}
+	wantSet := map[string]bool{}
+	for _, w := range want {
+		wantSet[w] = true
+	}
+	out := make([]string, 0, len(want))
+	for _, a := range allowed {
+		if wantSet[a] {
+			out = append(out, a)
+		}
+	}
+	return strings.Join(out, " "), true
 }
 
 // VerifyServiceToken validates a bearer token aimed at the auth API and

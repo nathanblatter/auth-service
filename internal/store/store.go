@@ -24,6 +24,10 @@ type Service struct {
 	// Resources are the RFC 8707 resource identifiers (e.g. an MCP URL) that
 	// map an OAuth authorization request to this service.
 	Resources []string
+	// Scopes is the service's permission catalog; tokens may only carry
+	// scopes from it. Roles are named bundles of those scopes.
+	Scopes []string
+	Roles  map[string][]string
 }
 
 // Credential is a hashed service credential.
@@ -132,7 +136,8 @@ type Store interface {
 	GetService(ctx context.Context, id string) (Service, error)
 	ListServices(ctx context.Context) ([]Service, error)
 
-	AddServiceResource(ctx context.Context, serviceID, resource string) error // ErrConflict when taken
+	AddServiceResource(ctx context.Context, serviceID, resource string) error                                         // ErrConflict when taken
+	UpdateServicePermissions(ctx context.Context, serviceID string, scopes []string, roles map[string][]string) error // ErrNotFound
 	GetServiceByResource(ctx context.Context, resource string) (Service, error)
 
 	PutCredential(ctx context.Context, c Credential) error

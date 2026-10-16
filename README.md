@@ -50,6 +50,7 @@ Full reference with request and response shapes: [docs/API.md](docs/API.md).
 | GET | `/oauth/authorize` | none | code + PKCE; parks the request, sends you to the console |
 | GET/POST | `/admin/authorize/{id}[/approve\|/deny]` | admin (approve: passkey) | review / decide a connection request |
 | POST | `/admin/services/{id}/resources` | admin | register an RFC 8707 resource URL (MCP endpoint) |
+| PUT | `/admin/services/{id}/permissions` | admin | set the scope catalog and roles |
 | GET | `/v1/me` | service token | who am I |
 | GET | `/admin` | none | the owner console (passkey sign-in) |
 | GET | `/admin/session` | none | signed in? setup needed? |

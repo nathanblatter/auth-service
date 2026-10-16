@@ -217,8 +217,14 @@ func (s *Server) BeginAuthorize(ctx context.Context, p AuthzParams, ip string) (
 	if svc.Status != "active" {
 		return bounce("invalid_target", "service is disabled"), nil
 	}
+	// The owner may be granted anything in the service's catalog; a request
+	// for a scope the service never declared is an error, not a silent trim.
+	granted, ok := core.GrantScope(p.Scope, svc.Scopes)
+	if !ok {
+		return bounce("invalid_scope", "requested scope is not in this service's catalog"), nil
+	}
 	a := store.AuthzRequest{
-		ID: random(""), ClientID: c.ID, RedirectURI: p.RedirectURI, State: p.State, Scope: strings.Join(strings.Fields(p.Scope), " "),
+		ID: random(""), ClientID: c.ID, RedirectURI: p.RedirectURI, State: p.State, Scope: granted,
 		Challenge: p.Challenge, Resource: p.Resource, ServiceID: svc.ID, ExpiresAt: s.Now().Add(AuthzTTL),
 	}
 	if err := s.Store.PutAuthzRequest(ctx, a); err != nil {

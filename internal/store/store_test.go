@@ -164,6 +164,23 @@ func conformance(t *testing.T, s Store) {
 		t.Fatalf("not-before: %v %v", nb, err)
 	}
 
+	// Permissions catalog.
+	if err := s.UpdateServicePermissions(ctx, "svc_a", []string{"read", "write"}, map[string][]string{"admin": {"read", "write"}, "user": {"read"}}); err != nil {
+		t.Fatal(err)
+	}
+	if ps, _ := s.GetService(ctx, "svc_a"); len(ps.Scopes) != 2 || len(ps.Roles["admin"]) != 2 || len(ps.Roles["user"]) != 1 {
+		t.Fatalf("permissions: %+v", ps)
+	}
+	if err := s.UpdateServicePermissions(ctx, "svc_a", nil, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if ps, _ := s.GetService(ctx, "svc_a"); len(ps.Scopes) != 0 || len(ps.Roles) != 0 {
+		t.Fatalf("cleared permissions: %+v", ps)
+	}
+	if err := s.UpdateServicePermissions(ctx, "svc_missing", []string{"x"}, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("permissions on missing service: %v", err)
+	}
+
 	// Resources map to services, uniquely.
 	if err := s.AddServiceResource(ctx, "svc_a", "https://finforge.test/mcp"); err != nil {
 		t.Fatal(err)

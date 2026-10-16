@@ -31,6 +31,10 @@ func newServer(t *testing.T) (*Server, *store.Memory, store.Service) {
 	if err := mem.AddServiceResource(context.Background(), svc.ID, "https://finforge.test/mcp"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := c.SetPermissions(context.Background(), svc.ID, []string{"read", "write"}, map[string][]string{"viewer": {"read"}}, core.Actor{ID: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	svc, _ = c.GetService(context.Background(), svc.ID)
 	return s, mem, svc
 }
 
@@ -94,6 +98,17 @@ func TestFullFlow(t *testing.T) {
 		if err != nil || out.Err == nil || out.RedirectURI != base.RedirectURI || out.State != "xyz" {
 			t.Fatalf("%s: %+v %v", name, out, err)
 		}
+	}
+
+	// No scope requested means the whole catalog; order follows the catalog.
+	all := base
+	all.Scope = ""
+	outAll, err := s.BeginAuthorize(ctx, all, "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pend, _ := s.Pending(ctx, strings.TrimPrefix(outAll.ApproveURL, "https://auth.test/admin?approve=")); pend.Scope != "read write" {
+		t.Fatalf("default grant: %q", pend.Scope)
 	}
 
 	// Good request parks and points at the console.

@@ -128,3 +128,47 @@ func TestDisabledService(t *testing.T) {
 		t.Fatalf("disabled: %v", err)
 	}
 }
+
+func TestPermissions(t *testing.T) {
+	c, _ := newCore(t)
+	ctx := context.Background()
+	admin := Actor{ID: "admin"}
+	svc, _ := c.CreateService(ctx, "FinForge", "finforge", admin)
+
+	got, err := c.SetPermissions(ctx, svc.ID, []string{"read", " write ", "read"}, map[string][]string{"admin": {"read", "write"}, "viewer": {"read"}}, admin)
+	if err != nil || len(got.Scopes) != 2 || len(got.Roles) != 2 || len(got.Roles["admin"]) != 2 {
+		t.Fatalf("set: %+v %v", got, err)
+	}
+	if _, err := c.SetPermissions(ctx, svc.ID, []string{"Bad Scope"}, nil, admin); !errors.Is(err, ErrInvalidScope) {
+		t.Fatalf("bad scope: %v", err)
+	}
+	if _, err := c.SetPermissions(ctx, svc.ID, []string{"read"}, map[string][]string{"admin": {"write"}}, admin); !errors.Is(err, ErrInvalidRole) {
+		t.Fatalf("role outside catalog: %v", err)
+	}
+	if _, err := c.SetPermissions(ctx, svc.ID, []string{"read"}, map[string][]string{"Admin!": {"read"}}, admin); !errors.Is(err, ErrInvalidRole) {
+		t.Fatalf("bad role name: %v", err)
+	}
+	if _, err := c.SetPermissions(ctx, "svc_nope", []string{"read"}, nil, admin); !errors.Is(err, ErrServiceNotFound) {
+		t.Fatalf("missing service: %v", err)
+	}
+
+	cases := []struct {
+		req     string
+		allowed []string
+		want    string
+		ok      bool
+	}{
+		{"", []string{"read", "write"}, "read write", true},
+		{"write read", []string{"read", "write"}, "read write", true},
+		{"read", []string{"read", "write"}, "read", true},
+		{"read admin", []string{"read", "write"}, "", false},
+		{"", nil, "", true},
+		{"read", nil, "", false},
+	}
+	for _, tc := range cases {
+		got, ok := GrantScope(tc.req, tc.allowed)
+		if got != tc.want || ok != tc.ok {
+			t.Fatalf("GrantScope(%q, %v) = %q,%v want %q,%v", tc.req, tc.allowed, got, ok, tc.want, tc.ok)
+		}
+	}
+}

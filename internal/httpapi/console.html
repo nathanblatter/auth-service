@@ -24,7 +24,8 @@
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .grow { flex: 1 1 160px; }
   input { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); font: inherit; }
-  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+  textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); font: inherit; resize: vertical; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
   button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink); font: inherit; font-weight: 500; cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
   button.danger { color: var(--danger); }
@@ -403,6 +404,11 @@
       </div>
       <div class="secret hidden"></div>
       <details><summary>${credentials.length} credential${credentials.length === 1 ? '' : 's'}, ${live} active</summary><div class="creds"></div></details>
+      <details><summary>Permissions: ${(svc.scopes || []).length} scope${(svc.scopes || []).length === 1 ? '' : 's'}, ${Object.keys(svc.roles || {}).length} role${Object.keys(svc.roles || {}).length === 1 ? '' : 's'}</summary>
+        <div class="row" style="margin-top:8px"><input class="grow mono perm-scopes" placeholder="scopes, space separated: read write"></div>
+        <div class="row" style="margin-top:6px"><textarea class="grow mono perm-roles" rows="3" placeholder="one role per line: admin = read write"></textarea></div>
+        <div class="row" style="margin-top:6px"><button class="small perm-save">Save permissions</button><span class="muted" style="font-size:13px">Connector tokens may only carry catalog scopes; empty request = whole catalog.</span></div>
+      </details>
       <details><summary>${(svc.resources || []).length} connector resource${(svc.resources || []).length === 1 ? '' : 's'}</summary>
         <div class="resources"></div>
         <div class="row" style="margin-top:8px"><input class="grow res-url" placeholder="https://finforge.nathanblatter.com/mcp"><button class="small res-add">Add resource</button></div>
@@ -437,6 +443,19 @@
       }
       creds.appendChild(t);
     } else creds.innerHTML = '<p class="muted">No credentials minted.</p>';
+
+    wrap.querySelector('.perm-scopes').value = (svc.scopes || []).join(' ');
+    wrap.querySelector('.perm-roles').value = Object.entries(svc.roles || {}).map(([k, v]) => `${k} = ${v.join(' ')}`).join('\n');
+    wrap.querySelector('.perm-save').onclick = async () => {
+      const scopes = wrap.querySelector('.perm-scopes').value.split(/\s+/).filter(Boolean);
+      const roles = {};
+      for (const line of wrap.querySelector('.perm-roles').value.split('\n')) {
+        const [name, rest] = line.split('=');
+        if (name && name.trim()) roles[name.trim()] = (rest || '').split(/\s+/).filter(Boolean);
+      }
+      try { await api('PUT', `/admin/services/${svc.id}/permissions`, { Scopes: scopes, Roles: roles }); await loadServices(); }
+      catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+    };
 
     const resources = wrap.querySelector('.resources');
     if ((svc.resources || []).length) {

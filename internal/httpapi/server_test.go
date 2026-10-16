@@ -404,6 +404,14 @@ func TestConnectorOAuthFlow(t *testing.T) {
 		t.Fatalf("dup resource: %d", code)
 	}
 
+	// Permissions catalog.
+	if code, body := do(t, "PUT", ts.URL+"/admin/services/"+id+"/permissions", admin, "application/json", `{"scopes":["read","write"],"roles":{"viewer":["read"]}}`); code != 200 || len(body["scopes"].([]any)) != 2 {
+		t.Fatalf("set permissions: %d %v", code, body)
+	}
+	if code, _ := do(t, "PUT", ts.URL+"/admin/services/"+id+"/permissions", admin, "application/json", `{"scopes":["read"],"roles":{"x":["write"]}}`); code != 400 {
+		t.Fatalf("role outside catalog: %d", code)
+	}
+
 	// DCR.
 	code, reg := do(t, "POST", ts.URL+"/oauth/register", "", "application/json", `{"client_name":"Claude","redirect_uris":["https://claude.ai/cb"],"token_endpoint_auth_method":"none"}`)
 	if code != 201 || reg["client_id"] == nil || reg["client_secret"] != nil {

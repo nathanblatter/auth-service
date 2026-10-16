@@ -84,6 +84,23 @@ The owner (Nathan) is the one cross-tenant identity. He authenticates to the con
   session** that can manage passkeys but cannot approve connectors. Codes are single use and
   attempts count against the login brute-force limit.
 
+## Permissions: scopes and roles (auth-service-10)
+
+**DECIDED (Nathan, 2026-10-15):** per-service scope catalog, roles as named bundles.
+
+- A service declares `scopes` (its permission catalog, e.g. `read write`) and `roles`
+  (`admin = read write`, `viewer = read`) in the console (`PUT /admin/services/{id}/permissions`).
+  Roles may only bundle catalog scopes.
+- A connector authorization's scope = requested ∩ allowed; empty request = everything allowed.
+  Requesting a scope outside the catalog is `invalid_scope`, not a silent trim. For the owner,
+  "allowed" is the whole catalog. The approval screen shows the exact grant.
+- Service (machine) tokens keep the fixed scope `service`: they identify a backend to this API,
+  not a person to a product.
+- Roles are stored now and become live in slice 3: each user of a service holds roles, and
+  "allowed" for that user is the union of their roles' scopes. Teams (auth-service-15) assign
+  roles at the organisation level.
+- Enforcement is the consumer's job: `client.RequireScope("write")` / `claims.HasScope`.
+
 ## Step-up verification (auth-service-17)
 
 Sessions record `verified_at`, the time of the last passkey assertion (login or step-up).

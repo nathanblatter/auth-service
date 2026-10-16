@@ -61,13 +61,15 @@ func NewDynamo(db DynamoAPI, table string) *Dynamo { return &Dynamo{db: db, tabl
 
 type serviceItem struct {
 	PK, SK, GSI1PK, GSI1SK string
-	Type                   string   `dynamodbav:"type"`
-	ID                     string   `dynamodbav:"id"`
-	Slug                   string   `dynamodbav:"slug"`
-	Name                   string   `dynamodbav:"name"`
-	Status                 string   `dynamodbav:"status"`
-	CreatedAt              string   `dynamodbav:"created_at"`
-	Resources              []string `dynamodbav:"resources,omitempty"`
+	Type                   string              `dynamodbav:"type"`
+	ID                     string              `dynamodbav:"id"`
+	Slug                   string              `dynamodbav:"slug"`
+	Name                   string              `dynamodbav:"name"`
+	Status                 string              `dynamodbav:"status"`
+	CreatedAt              string              `dynamodbav:"created_at"`
+	Resources              []string            `dynamodbav:"resources,omitempty"`
+	Scopes                 []string            `dynamodbav:"scopes,omitempty"`
+	Roles                  map[string][]string `dynamodbav:"roles,omitempty"`
 }
 
 type credItem struct {
@@ -261,7 +263,7 @@ func (it serviceItem) toService() (Service, error) {
 	if err != nil {
 		return Service{}, fmt.Errorf("store: bad created_at on %s: %w", it.PK, err)
 	}
-	return Service{ID: it.ID, Slug: it.Slug, Name: it.Name, Status: it.Status, CreatedAt: t, Resources: it.Resources}, nil
+	return Service{ID: it.ID, Slug: it.Slug, Name: it.Name, Status: it.Status, CreatedAt: t, Resources: it.Resources, Scopes: it.Scopes, Roles: it.Roles}, nil
 }
 
 func (it credItem) toCredential() (Credential, error) {
@@ -985,4 +987,34 @@ func fmtTime(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func (d *Dynamo) UpdateServicePermissions(ctx context.Context, serviceID string, scopes []string, roles map[string][]string) error {
+	scopesAV, err := attributevalue.MarshalList(scopes)
+	if err != nil {
+		return err
+	}
+	rolesAV, err := attributevalue.MarshalMap(roles)
+	if err != nil {
+		return err
+	}
+	if scopes == nil {
+		scopesAV = []types.AttributeValue{}
+	}
+	_, err = d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                &d.table,
+		Key:                      dynKey(pkService+serviceID, skMeta),
+		UpdateExpression:         aws.String("SET scopes = :s, #r = :r"),
+		ConditionExpression:      aws.String("attribute_exists(PK)"),
+		ExpressionAttributeNames: map[string]string{"#r": "roles"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":s": &types.AttributeValueMemberL{Value: scopesAV},
+			":r": &types.AttributeValueMemberM{Value: rolesAV},
+		},
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
 }
