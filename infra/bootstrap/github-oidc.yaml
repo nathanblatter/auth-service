@@ -121,9 +121,11 @@ Resources:
                 Resource:
                   - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${StackPrefix}*
                   - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${StackPrefix}*
-              - Sid: LogsDescribe
+              - Sid: LogsAccountLevel
                 Effect: Allow
-                Action: logs:DescribeLogGroups
+                # API Gateway access logging is wired through log deliveries,
+                # which have no resource ARN to scope to.
+                Action: [logs:DescribeLogGroups, logs:CreateLogDelivery, logs:GetLogDelivery, logs:UpdateLogDelivery, logs:DeleteLogDelivery, logs:ListLogDeliveries, logs:PutResourcePolicy, logs:DescribeResourcePolicies]
                 Resource: "*"
               - Sid: Alarms
                 Effect: Allow
