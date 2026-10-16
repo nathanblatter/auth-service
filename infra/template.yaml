@@ -34,7 +34,6 @@ Globals:
     Handler: bootstrap
     Timeout: 10
     MemorySize: 256
-    Tracing: Active
     LoggingConfig:
       LogFormat: JSON
       ApplicationLogLevel: INFO
@@ -145,7 +144,7 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/apigateway/${AWS::StackName}
-      RetentionInDays: 90
+      RetentionInDays: 30
 
   ApiFunction:
     Type: AWS::Serverless::Function
@@ -190,7 +189,7 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/lambda/${AWS::StackName}-api
-      RetentionInDays: 90
+      RetentionInDays: 30
 
   WorkerFunction:
     Type: AWS::Serverless::Function
@@ -215,7 +214,7 @@ Resources:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/lambda/${AWS::StackName}-worker
-      RetentionInDays: 90
+      RetentionInDays: 30
 
   # ── alarms ───────────────────────────────────────────────────────────────
   ApiErrorsAlarm:
