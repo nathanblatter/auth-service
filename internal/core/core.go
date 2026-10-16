@@ -46,6 +46,7 @@ var (
 	ErrResourceTaken     = errors.New("core: resource already registered to a service")
 	ErrInvalidScope      = errors.New("core: scopes are 1-40 chars of a-z, 0-9, ':', '.', '_', '-' starting with a letter; max 50")
 	ErrInvalidRole       = errors.New("core: role names are 1-40 chars of a-z, 0-9, '-', max 20 roles, and may only bundle catalog scopes")
+	ErrInvalidLogin      = errors.New("core: login_url must be an absolute https URL, rp_id a hostname, origins absolute https origins, default_roles defined roles")
 )
 
 var (
@@ -294,6 +295,76 @@ func (c *Core) SetPermissions(ctx context.Context, serviceID string, scopes []st
 	}
 	c.audit(ctx, "service.permissions.set", by, serviceID, fmt.Sprintf("scopes=%d roles=%d", len(clean), len(cleanRoles)))
 	return c.GetService(ctx, serviceID)
+}
+
+// SetLogin configures a service as a user pool (slice 3) or, with an empty
+// login URL, back to owner-only.
+func (c *Core) SetLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string, by Actor) (store.Service, error) {
+	svc, err := c.GetService(ctx, serviceID)
+	if err != nil {
+		return store.Service{}, err
+	}
+	loginURL = strings.TrimSpace(loginURL)
+	rpID = strings.ToLower(strings.TrimSpace(rpID))
+	cleanOrigins := make([]string, 0, len(origins))
+	for _, o := range origins {
+		o = strings.TrimRight(strings.TrimSpace(o), "/")
+		if o == "" {
+			continue
+		}
+		u, err := url.Parse(o)
+		if err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || !allowedScheme(u) {
+			return store.Service{}, ErrInvalidLogin
+		}
+		cleanOrigins = append(cleanOrigins, o)
+	}
+	if loginURL != "" {
+		u, err := url.Parse(loginURL)
+		if err != nil || u.Host == "" || u.Fragment != "" || !allowedScheme(u) {
+			return store.Service{}, ErrInvalidLogin
+		}
+		if rpID == "" || strings.ContainsAny(rpID, "/: ") || len(cleanOrigins) == 0 {
+			return store.Service{}, ErrInvalidLogin
+		}
+		for _, o := range cleanOrigins {
+			h := strings.ToLower(mustHost(o))
+			if h != rpID && !strings.HasSuffix(h, "."+rpID) {
+				return store.Service{}, ErrInvalidLogin // rp_id must be a registrable suffix of every origin
+			}
+		}
+	}
+	cleanRoles := make([]string, 0, len(defaultRoles))
+	for _, r := range defaultRoles {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		if _, ok := svc.Roles[r]; !ok {
+			return store.Service{}, ErrInvalidLogin
+		}
+		cleanRoles = append(cleanRoles, r)
+	}
+	if err := c.Store.UpdateServiceLogin(ctx, serviceID, loginURL, rpID, cleanOrigins, cleanRoles); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return store.Service{}, ErrServiceNotFound
+		}
+		return store.Service{}, err
+	}
+	c.audit(ctx, "service.login.set", by, serviceID, "login_url="+loginURL+" rp_id="+rpID)
+	return c.GetService(ctx, serviceID)
+}
+
+// allowedScheme accepts https anywhere and http only on localhost (dev).
+func allowedScheme(u *url.URL) bool {
+	return u.Scheme == "https" || (u.Scheme == "http" && u.Hostname() == "localhost")
+}
+
+func mustHost(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // GrantScope computes the scope a token may carry: the requested scopes

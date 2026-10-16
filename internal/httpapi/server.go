@@ -22,6 +22,7 @@ import (
 	"github.com/nathanblatter/auth-service/internal/owner"
 	"github.com/nathanblatter/auth-service/internal/ratelimit"
 	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/auth-service/internal/users"
 )
 
 //go:embed console.html
@@ -39,6 +40,10 @@ type Server struct {
 	Limit *ratelimit.Limiter
 	// OAuth is the connector authorization server. Required.
 	OAuth *oauth.Server
+	// Users handles end-user accounts and ceremonies (slice 3). Required.
+	Users *users.Users
+	// Google is the Sign in with Google provider; nil disables it.
+	Google *users.Google
 	// AdminTokenHash is the hex SHA-256 of the interim admin bearer token
 	// (break-glass until auth-service-4). Empty disables bearer admin auth.
 	AdminTokenHash string
@@ -94,6 +99,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /admin/services/{id}/credentials/{cred}", s.requireAdmin(s.revokeCredential))
 	mux.HandleFunc("POST /admin/services/{id}/resources", s.requireAdmin(s.addResource))
 	mux.HandleFunc("PUT /admin/services/{id}/permissions", s.requireAdmin(s.setPermissions))
+	s.userRoutes(mux)
 	return s.withCommon(mux)
 }
 
@@ -864,8 +870,17 @@ func serviceJSON(svc store.Service) map[string]any {
 	if roles == nil {
 		roles = map[string][]string{}
 	}
+	origins := svc.Origins
+	if origins == nil {
+		origins = []string{}
+	}
+	defRoles := svc.DefaultRoles
+	if defRoles == nil {
+		defRoles = []string{}
+	}
 	return map[string]any{"id": svc.ID, "slug": svc.Slug, "name": svc.Name, "status": svc.Status,
-		"created_at": svc.CreatedAt.UTC().Format(time.RFC3339), "resources": res, "scopes": scopes, "roles": roles}
+		"created_at": svc.CreatedAt.UTC().Format(time.RFC3339), "resources": res, "scopes": scopes, "roles": roles,
+		"login_url": svc.LoginURL, "rp_id": svc.RPID, "origins": origins, "default_roles": defRoles}
 }
 
 func credentialJSON(c store.Credential) map[string]any {

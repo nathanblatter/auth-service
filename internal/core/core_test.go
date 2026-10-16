@@ -172,3 +172,34 @@ func TestPermissions(t *testing.T) {
 		}
 	}
 }
+
+func TestSetLogin(t *testing.T) {
+	c, _ := newCore(t)
+	ctx := context.Background()
+	admin := Actor{ID: "admin"}
+	svc, _ := c.CreateService(ctx, "FinForge", "finforge", admin)
+	_, _ = c.SetPermissions(ctx, svc.ID, []string{"read"}, map[string][]string{"user": {"read"}}, admin)
+
+	got, err := c.SetLogin(ctx, svc.ID, "https://finforge.test/login", "finforge.test", []string{"https://finforge.test/", "https://app.finforge.test"}, []string{"user"}, admin)
+	if err != nil || got.LoginURL == "" || len(got.Origins) != 2 || got.Origins[0] != "https://finforge.test" || len(got.DefaultRoles) != 1 {
+		t.Fatalf("set login: %+v %v", got, err)
+	}
+	bad := [][]any{
+		{"http://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{}},        // http login url
+		{"https://finforge.test/login", "", []string{"https://finforge.test"}, []string{}},                    // no rp id
+		{"https://finforge.test/login", "finforge.test", []string{}, []string{}},                              // no origins
+		{"https://finforge.test/login", "finforge.test", []string{"https://evil.test"}, []string{}},           // origin not under rp id
+		{"https://finforge.test/login", "finforge.test", []string{"https://finforge.test/x"}, []string{}},     // origin with path
+		{"https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"nope"}}, // unknown role
+	}
+	for i, b := range bad {
+		if _, err := c.SetLogin(ctx, svc.ID, b[0].(string), b[1].(string), b[2].([]string), b[3].([]string), admin); !errors.Is(err, ErrInvalidLogin) {
+			t.Fatalf("bad case %d: %v", i, err)
+		}
+	}
+	// Back to owner-only.
+	got, err = c.SetLogin(ctx, svc.ID, "", "", nil, nil, admin)
+	if err != nil || got.LoginURL != "" {
+		t.Fatalf("clear login: %+v %v", got, err)
+	}
+}

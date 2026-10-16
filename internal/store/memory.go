@@ -24,6 +24,9 @@ type Memory struct {
 	codes     map[string]Code
 	refresh   map[string]RefreshToken
 	recovery  map[string]RecoveryCode
+	users     map[string]User        // svc#id
+	idents    map[string]string      // svc#identity -> user id
+	upks      map[string]UserPasskey // svc#cred
 	notBefore time.Time
 	Audit     []AuditEvent
 }
@@ -45,7 +48,7 @@ func NewMemory() *Memory {
 		passkeys: map[string]Passkey{}, chals: map[string]challenge{}, sessions: map[string]Session{},
 		fails: map[string]failCounter{}, resources: map[string]string{}, clients: map[string]OAuthClient{},
 		authz: map[string]AuthzRequest{}, codes: map[string]Code{}, refresh: map[string]RefreshToken{},
-		recovery: map[string]RecoveryCode{},
+		recovery: map[string]RecoveryCode{}, users: map[string]User{}, idents: map[string]string{}, upks: map[string]UserPasskey{},
 	}
 }
 
@@ -454,4 +457,142 @@ func (m *Memory) UpdateServicePermissions(_ context.Context, serviceID string, s
 	}
 	m.services[serviceID] = svc
 	return nil
+}
+
+func (m *Memory) UpdateServiceLogin(_ context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	svc, ok := m.services[serviceID]
+	if !ok {
+		return ErrNotFound
+	}
+	svc.LoginURL, svc.RPID = loginURL, rpID
+	svc.Origins = append([]string(nil), origins...)
+	svc.DefaultRoles = append([]string(nil), defaultRoles...)
+	m.services[serviceID] = svc
+	return nil
+}
+
+func ukey(svc, id string) string { return svc + "#" + id }
+
+func (m *Memory) CreateUser(_ context.Context, u User) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, taken := m.idents[ukey(u.ServiceID, u.Identity)]; taken {
+		return ErrConflict
+	}
+	if _, taken := m.users[ukey(u.ServiceID, u.ID)]; taken {
+		return ErrConflict
+	}
+	m.idents[ukey(u.ServiceID, u.Identity)] = u.ID
+	m.users[ukey(u.ServiceID, u.ID)] = u
+	return nil
+}
+
+func (m *Memory) GetUser(_ context.Context, serviceID, id string) (User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[ukey(serviceID, id)]
+	if !ok {
+		return User{}, ErrNotFound
+	}
+	return u, nil
+}
+
+func (m *Memory) GetUserByIdentity(_ context.Context, serviceID, identity string) (User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id, ok := m.idents[ukey(serviceID, identity)]
+	if !ok {
+		return User{}, ErrNotFound
+	}
+	return m.users[ukey(serviceID, id)], nil
+}
+
+func (m *Memory) ListUsers(_ context.Context, serviceID string, limit int, cursor string) ([]User, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var all []User
+	for _, u := range m.users {
+		if u.ServiceID == serviceID {
+			all = append(all, u)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CreatedAt.Equal(all[j].CreatedAt) {
+			return all[i].ID < all[j].ID
+		}
+		return all[i].CreatedAt.Before(all[j].CreatedAt)
+	})
+	start := 0
+	if cursor != "" {
+		if _, err := fmt.Sscanf(cursor, "%d", &start); err != nil {
+			return nil, "", fmt.Errorf("store: bad cursor %q", cursor)
+		}
+	}
+	if start >= len(all) {
+		return []User{}, "", nil
+	}
+	end := min(start+limit, len(all))
+	next := ""
+	if end < len(all) {
+		next = fmt.Sprint(end)
+	}
+	return all[start:end], next, nil
+}
+
+func (m *Memory) UpdateUser(_ context.Context, u User) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.users[ukey(u.ServiceID, u.ID)]
+	if !ok {
+		return ErrNotFound
+	}
+	cur.Email, cur.Name, cur.Status, cur.NotBefore = u.Email, u.Name, u.Status, u.NotBefore
+	cur.Roles = append([]string(nil), u.Roles...)
+	m.users[ukey(u.ServiceID, u.ID)] = cur
+	return nil
+}
+
+func (m *Memory) PutUserPasskey(_ context.Context, p UserPasskey) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, taken := m.upks[ukey(p.ServiceID, p.ID)]; taken {
+		return ErrConflict
+	}
+	m.upks[ukey(p.ServiceID, p.ID)] = p
+	return nil
+}
+
+func (m *Memory) UpdateUserPasskey(_ context.Context, p UserPasskey) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.upks[ukey(p.ServiceID, p.ID)]; !ok {
+		return ErrNotFound
+	}
+	m.upks[ukey(p.ServiceID, p.ID)] = p
+	return nil
+}
+
+func (m *Memory) ListUserPasskeys(_ context.Context, serviceID, userID string) ([]UserPasskey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []UserPasskey
+	for _, p := range m.upks {
+		if p.ServiceID == serviceID && p.UserID == userID {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *Memory) GetUserPasskeyByCred(_ context.Context, serviceID, credID string) (UserPasskey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.upks[ukey(serviceID, credID)]
+	if !ok {
+		return UserPasskey{}, ErrNotFound
+	}
+	return p, nil
 }

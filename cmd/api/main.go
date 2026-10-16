@@ -28,6 +28,7 @@ import (
 	"github.com/nathanblatter/auth-service/internal/ratelimit"
 	"github.com/nathanblatter/auth-service/internal/signer"
 	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/auth-service/internal/users"
 )
 
 // version is set by the Makefile via -ldflags.
@@ -94,18 +95,36 @@ func build(ctx context.Context, log *slog.Logger) (http.Handler, config.Config, 
 		return nil, cfg, err
 	}
 
+	ssmClient := ssm.NewFromConfig(awsCfg)
+	readParam := func(name string) (string, error) {
+		out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{Name: aws.String(name), WithDecryption: aws.Bool(true)})
+		if err != nil {
+			return "", fmt.Errorf("read ssm %s: %w", name, err)
+		}
+		return aws.ToString(out.Parameter.Value), nil
+	}
 	adminHash := ""
 	switch {
 	case cfg.AdminToken != "":
 		adminHash = core.HashSecret(cfg.AdminToken)
 	case cfg.AdminTokenHashParam != "":
-		out, err := ssm.NewFromConfig(awsCfg).GetParameter(ctx, &ssm.GetParameterInput{
-			Name: aws.String(cfg.AdminTokenHashParam), WithDecryption: aws.Bool(true),
-		})
-		if err != nil {
-			return nil, cfg, fmt.Errorf("read admin token hash from ssm: %w", err)
+		if adminHash, err = readParam(cfg.AdminTokenHashParam); err != nil {
+			return nil, cfg, err
 		}
-		adminHash = aws.ToString(out.Parameter.Value)
+	}
+	var google *users.Google
+	if cfg.GoogleClientID != "" {
+		secret := cfg.GoogleClientSecret
+		if cfg.GoogleClientSecretParam != "" {
+			if secret, err = readParam(cfg.GoogleClientSecretParam); err != nil {
+				// A missing secret must not take the whole API down; Google login stays off.
+				log.Error("google client secret unavailable; Sign in with Google disabled", "err", err)
+				secret = ""
+			}
+		}
+		if secret != "" {
+			google = users.NewGoogle(cfg.GoogleClientID, secret, cfg.Issuer+"/v1/login/google/callback")
+		}
 	}
 
 	c := core.New(st, ring, cfg.Issuer)
@@ -117,7 +136,9 @@ func build(ctx context.Context, log *slog.Logger) (http.Handler, config.Config, 
 	own.Log = log
 	lim := ratelimit.New(st)
 	lim.Log = log
-	srv := &httpapi.Server{Core: c, Owner: own, Limit: lim, OAuth: oauth.New(c), AdminTokenHash: adminHash, Log: log, Version: version}
+	us := users.New(st)
+	us.Log = log
+	srv := &httpapi.Server{Core: c, Owner: own, Limit: lim, OAuth: oauth.New(c), Users: us, Google: google, AdminTokenHash: adminHash, Log: log, Version: version}
 	return srv.Handler(), cfg, nil
 }
 

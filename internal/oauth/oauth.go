@@ -217,8 +217,10 @@ func (s *Server) BeginAuthorize(ctx context.Context, p AuthzParams, ip string) (
 	if svc.Status != "active" {
 		return bounce("invalid_target", "service is disabled"), nil
 	}
-	// The owner may be granted anything in the service's catalog; a request
-	// for a scope the service never declared is an error, not a silent trim.
+	// A request for a scope the service never declared is an error, not a
+	// silent trim. For owner-only services the grant is fixed now (the owner
+	// may have anything in the catalog); for user-pool services the requested
+	// scope is kept and narrowed to the user's roles at login.
 	granted, ok := core.GrantScope(p.Scope, svc.Scopes)
 	if !ok {
 		return bounce("invalid_scope", "requested scope is not in this service's catalog"), nil
@@ -231,7 +233,60 @@ func (s *Server) BeginAuthorize(ctx context.Context, p AuthzParams, ip string) (
 		return AuthzOutcome{}, err
 	}
 	s.audit(ctx, "oauth.authorize.request", "anonymous", svc.ID, "client="+c.ID+" authz="+a.ID, ip)
+	if svc.LoginURL != "" {
+		// User pool: the product's own login page runs the ceremony (slice 3).
+		loc, err := RedirectWith(svc.LoginURL, url.Values{"login_challenge": {a.ID}})
+		if err != nil {
+			return AuthzOutcome{}, err
+		}
+		return AuthzOutcome{ApproveURL: loc}, nil
+	}
 	return AuthzOutcome{ApproveURL: s.Issuer + "/admin?approve=" + url.QueryEscape(a.ID)}, nil
+}
+
+// CompleteForUser finishes a pending authorization for an end user who just
+// authenticated through the product's login page. Scope = the request's
+// (already catalog-checked) scope ∩ the user's allowed scopes; first-party
+// clients need no consent screen. Returns the redirect URL for the browser.
+func (s *Server) CompleteForUser(ctx context.Context, authzID string, user store.User, allowed []string, ip string) (string, error) {
+	a, err := s.Store.GetAuthzRequest(ctx, authzID, s.Now())
+	if err != nil {
+		return "", err
+	}
+	if a.ServiceID != user.ServiceID {
+		return "", oerr(400, "invalid_request", "login_challenge belongs to another service")
+	}
+	if err := s.Store.DeleteAuthzRequest(ctx, authzID); err != nil {
+		return "", err
+	}
+	granted, ok := core.GrantScope(a.Scope, allowed)
+	if !ok {
+		// The user lacks a role for some requested scope: grant the intersection.
+		granted, _ = core.GrantScope("", intersect(strings.Fields(a.Scope), allowed))
+	}
+	code := random("nbac_")
+	if err := s.Store.CreateCode(ctx, core.HashSecret(code), store.Code{
+		ClientID: a.ClientID, RedirectURI: a.RedirectURI, Challenge: a.Challenge, Scope: granted,
+		Subject: "usr:" + user.ID, ServiceID: a.ServiceID, ExpiresAt: s.Now().Add(CodeTTL),
+	}); err != nil {
+		return "", err
+	}
+	s.audit(ctx, "oauth.approve", "usr:"+user.ID, a.ServiceID, "client="+a.ClientID+" scope="+granted, ip)
+	return RedirectWith(a.RedirectURI, url.Values{"code": {code}, "state": {a.State}})
+}
+
+func intersect(a, b []string) []string {
+	set := map[string]bool{}
+	for _, x := range b {
+		set[x] = true
+	}
+	var out []string
+	for _, x := range a {
+		if set[x] {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // PendingApproval is what the console shows the owner.
@@ -400,23 +455,40 @@ func (s *Server) refresh(ctx context.Context, c store.OAuthClient, req TokenRequ
 	if row.ClientID != c.ID {
 		return TokenResponse{}, oerr(400, "invalid_grant", "refresh token belongs to another client")
 	}
-	if row.Subject == OwnerSubject {
-		nb, err := s.Store.GetOwnerNotBefore(ctx)
+	var nb time.Time
+	switch {
+	case row.Subject == OwnerSubject:
+		if nb, err = s.Store.GetOwnerNotBefore(ctx); err != nil {
+			return TokenResponse{}, err
+		}
+	case strings.HasPrefix(row.Subject, "usr:"):
+		user, err := s.Store.GetUser(ctx, row.ServiceID, strings.TrimPrefix(row.Subject, "usr:"))
+		if errors.Is(err, store.ErrNotFound) || (err == nil && user.Status != "active") {
+			s.audit(ctx, "oauth.refresh.denied", row.Subject, row.ServiceID, "client="+c.ID+" user missing or disabled", ip)
+			return TokenResponse{}, oerr(400, "invalid_grant", "account is not active")
+		}
 		if err != nil {
 			return TokenResponse{}, err
 		}
-		if !nb.IsZero() && row.IssuedAt.Before(nb) {
-			s.audit(ctx, "oauth.refresh.denied", OwnerSubject, row.ServiceID, "client="+c.ID+" issued before logout-everywhere", ip)
-			return TokenResponse{}, oerr(400, "invalid_grant", "session was signed out everywhere; reconnect")
-		}
+		nb = user.NotBefore
+	}
+	if !nb.IsZero() && row.IssuedAt.Before(nb) {
+		s.audit(ctx, "oauth.refresh.denied", row.Subject, row.ServiceID, "client="+c.ID+" issued before logout-everywhere", ip)
+		return TokenResponse{}, oerr(400, "invalid_grant", "session was signed out everywhere; sign in again")
 	}
 	return s.mint(ctx, c.ID, row.ServiceID, row.Subject, row.Scope, row.Family, "oauth.refresh", ip)
 }
 
 func (s *Server) mint(ctx context.Context, clientID, serviceID, subject, scope, family, kind, ip string) (TokenResponse, error) {
 	now := s.Now()
+	email := ""
+	if id, ok := strings.CutPrefix(subject, "usr:"); ok {
+		if user, err := s.Store.GetUser(ctx, serviceID, id); err == nil {
+			email = user.Email
+		}
+	}
 	access, err := jwt.Sign(ctx, s.Core.Ring.Active(), jwt.Claims{
-		Issuer: s.Issuer, Subject: subject, Audience: serviceID, Scope: scope, ClientID: clientID,
+		Issuer: s.Issuer, Subject: subject, Audience: serviceID, Scope: scope, ClientID: clientID, Email: email,
 		IssuedAt: now.Unix(), Expires: now.Add(AccessTTL).Unix(),
 	})
 	if err != nil {

@@ -409,6 +409,12 @@
         <div class="row" style="margin-top:6px"><textarea class="grow mono perm-roles" rows="3" placeholder="one role per line: admin = read write"></textarea></div>
         <div class="row" style="margin-top:6px"><button class="small perm-save">Save permissions</button><span class="muted" style="font-size:13px">Connector tokens may only carry catalog scopes; empty request = whole catalog.</span></div>
       </details>
+      <details><summary>Users: ${svc.login_url ? 'user pool · ' + svc.login_url : 'owner-only (no login URL)'}</summary>
+        <div class="row" style="margin-top:8px"><input class="grow login-url" placeholder="login URL the app hosts, e.g. https://finforge.nathanblatter.com/login"></div>
+        <div class="row" style="margin-top:6px"><input class="grow mono login-rp" placeholder="rp_id, e.g. finforge.nathanblatter.com"><input class="grow mono login-origins" placeholder="origins, space separated: https://finforge.nathanblatter.com"></div>
+        <div class="row" style="margin-top:6px"><input class="grow mono login-roles" placeholder="default roles for new users: user"><button class="small login-save">Save user pool</button></div>
+        <p class="muted" style="font-size:13px;margin:6px 0 0">Leave the login URL empty for an owner-only service (connectors approved by you). With a login URL, the app's own page signs users in with passkeys or Google.</p>
+      </details>
       <details><summary>${(svc.resources || []).length} connector resource${(svc.resources || []).length === 1 ? '' : 's'}</summary>
         <div class="resources"></div>
         <div class="row" style="margin-top:8px"><input class="grow res-url" placeholder="https://finforge.nathanblatter.com/mcp"><button class="small res-add">Add resource</button></div>
@@ -455,6 +461,20 @@
       }
       try { await api('PUT', `/admin/services/${svc.id}/permissions`, { Scopes: scopes, Roles: roles }); await loadServices(); }
       catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+    };
+
+    wrap.querySelector('.login-url').value = svc.login_url || '';
+    wrap.querySelector('.login-rp').value = svc.rp_id || '';
+    wrap.querySelector('.login-origins').value = (svc.origins || []).join(' ');
+    wrap.querySelector('.login-roles').value = (svc.default_roles || []).join(' ');
+    wrap.querySelector('.login-save').onclick = async () => {
+      try {
+        await api('PUT', `/admin/services/${svc.id}/login`, {
+          login_url: wrap.querySelector('.login-url').value.trim(), rp_id: wrap.querySelector('.login-rp').value.trim(),
+          origins: wrap.querySelector('.login-origins').value.split(/\s+/).filter(Boolean),
+          default_roles: wrap.querySelector('.login-roles').value.split(/\s+/).filter(Boolean) });
+        await loadServices();
+      } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
     };
 
     const resources = wrap.querySelector('.resources');

@@ -181,6 +181,85 @@ func conformance(t *testing.T, s Store) {
 		t.Fatalf("permissions on missing service: %v", err)
 	}
 
+	// User-pool login config.
+	if err := s.UpdateServiceLogin(ctx, "svc_a", "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"user"}); err != nil {
+		t.Fatal(err)
+	}
+	if ls, _ := s.GetService(ctx, "svc_a"); ls.LoginURL != "https://finforge.test/login" || ls.RPID != "finforge.test" || len(ls.Origins) != 1 || len(ls.DefaultRoles) != 1 {
+		t.Fatalf("login config: %+v", ls)
+	}
+	if err := s.UpdateServiceLogin(ctx, "svc_missing", "", "", nil, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("login config on missing: %v", err)
+	}
+
+	// End users: identity is unique per service; one method for life.
+	u1 := User{ID: "u1", ServiceID: "svc_a", Method: "google", Identity: "google:123", Email: "a@x.test", Name: "A", Roles: []string{"user"}, Status: "active", CreatedAt: now}
+	if err := s.CreateUser(ctx, u1); err != nil {
+		t.Fatal(err)
+	}
+	dupIdent := u1
+	dupIdent.ID = "u9"
+	if err := s.CreateUser(ctx, dupIdent); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup identity: %v", err)
+	}
+	u2 := User{ID: "u2", ServiceID: "svc_a", Method: "passkey", Identity: "email:b@x.test", Email: "b@x.test", Status: "active", CreatedAt: now.Add(time.Second)}
+	if err := s.CreateUser(ctx, u2); err != nil {
+		t.Fatal(err)
+	}
+	if gu, err := s.GetUser(ctx, "svc_a", "u1"); err != nil || gu.Email != "a@x.test" || len(gu.Roles) != 1 || !gu.NotBefore.IsZero() {
+		t.Fatalf("GetUser: %+v %v", gu, err)
+	}
+	if _, err := s.GetUser(ctx, "svc_b", "u1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("user from another service: %v", err)
+	}
+	if gu, err := s.GetUserByIdentity(ctx, "svc_a", "google:123"); err != nil || gu.ID != "u1" {
+		t.Fatalf("GetUserByIdentity: %+v %v", gu, err)
+	}
+	if _, err := s.GetUserByIdentity(ctx, "svc_a", "google:999"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown identity: %v", err)
+	}
+	page, next, err := s.ListUsers(ctx, "svc_a", 1, "")
+	if err != nil || len(page) != 1 || page[0].ID != "u1" || next == "" {
+		t.Fatalf("ListUsers page1: %+v %q %v", page, next, err)
+	}
+	page, next, err = s.ListUsers(ctx, "svc_a", 1, next)
+	if err != nil || len(page) != 1 || page[0].ID != "u2" || next != "" {
+		t.Fatalf("ListUsers page2: %+v %q %v", page, next, err)
+	}
+	u1.Roles = []string{"admin", "user"}
+	u1.Status = "disabled"
+	u1.NotBefore = now.Add(time.Hour)
+	u1.Name = "A2"
+	if err := s.UpdateUser(ctx, u1); err != nil {
+		t.Fatal(err)
+	}
+	if gu, _ := s.GetUser(ctx, "svc_a", "u1"); len(gu.Roles) != 2 || gu.Status != "disabled" || !gu.NotBefore.Equal(now.Add(time.Hour)) || gu.Name != "A2" || gu.Method != "google" {
+		t.Fatalf("UpdateUser: %+v", gu)
+	}
+	if err := s.UpdateUser(ctx, User{ID: "ghost", ServiceID: "svc_a"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update missing user: %v", err)
+	}
+	upk := UserPasskey{ServiceID: "svc_a", UserID: "u2", ID: "ucred1", Name: "Phone", CreatedAt: now, Data: []byte(`{"id":"x"}`)}
+	if err := s.PutUserPasskey(ctx, upk); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutUserPasskey(ctx, upk); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup user passkey: %v", err)
+	}
+	upk.Data = []byte(`{"id":"x","signCount":3}`)
+	if err := s.UpdateUserPasskey(ctx, upk); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.GetUserPasskeyByCred(ctx, "svc_a", "ucred1"); err != nil || got.UserID != "u2" || string(got.Data) != `{"id":"x","signCount":3}` {
+		t.Fatalf("GetUserPasskeyByCred: %+v %v", got, err)
+	}
+	if _, err := s.GetUserPasskeyByCred(ctx, "svc_b", "ucred1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("user passkey across service: %v", err)
+	}
+	if ks, err := s.ListUserPasskeys(ctx, "svc_a", "u2"); err != nil || len(ks) != 1 || ks[0].Name != "Phone" {
+		t.Fatalf("ListUserPasskeys: %+v %v", ks, err)
+	}
+
 	// Resources map to services, uniquely.
 	if err := s.AddServiceResource(ctx, "svc_a", "https://finforge.test/mcp"); err != nil {
 		t.Fatal(err)

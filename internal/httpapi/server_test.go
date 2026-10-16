@@ -19,6 +19,7 @@ import (
 	"github.com/nathanblatter/auth-service/internal/ratelimit"
 	"github.com/nathanblatter/auth-service/internal/signer"
 	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/auth-service/internal/users"
 )
 
 const adminToken = "test-admin-token"
@@ -44,11 +45,16 @@ func newServerWithStore(t *testing.T, issuer string) (*httptest.Server, *store.M
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{Core: c, Owner: own, Limit: ratelimit.New(mem), OAuth: oauth.New(c), AdminTokenHash: core.HashSecret(adminToken), Version: "test"}
+	srv := &Server{Core: c, Owner: own, Limit: ratelimit.New(mem), OAuth: oauth.New(c), Users: users.New(mem), AdminTokenHash: core.HashSecret(adminToken), Version: "test"}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
+	lastServer = srv
 	return ts, mem
 }
+
+// lastServer lets a test reach into the most recently built Server (to
+// install a fake Google provider).
+var lastServer *Server
 
 func do(t *testing.T, method, rawURL, auth, contentType string, body string) (int, map[string]any) {
 	t.Helper()
@@ -200,7 +206,7 @@ func TestAdminDisabledWhenNoHash(t *testing.T) {
 	mem := store.NewMemory()
 	own, _ := owner.New(mem, "https://auth.test")
 	c := core.New(mem, ring, "https://auth.test")
-	srv := &Server{Core: c, Owner: own, Limit: ratelimit.New(mem), OAuth: oauth.New(c)}
+	srv := &Server{Core: c, Owner: own, Limit: ratelimit.New(mem), OAuth: oauth.New(c), Users: users.New(mem)}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 	// Empty hash: even an empty-string token must not match.
@@ -663,5 +669,141 @@ func TestStepUp(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 401 || body["error"] != "passkey_required" {
 		t.Fatalf("mint with recovery session: %d %v", resp.StatusCode, body)
+	}
+}
+
+func TestUserPoolHTTP(t *testing.T) {
+	ts, _ := newServerWithStore(t, "https://auth.test")
+	srv := lastServer
+	admin := "Bearer " + adminToken
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	// Service: permissions, resource, login config, credential → service token.
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"FinForge","slug":"finforge"}`)
+	id := svc["id"].(string)
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/permissions", admin, "application/json", `{"scopes":["read","write"],"roles":{"user":["read"],"editor":["read","write"]}}`)
+	do(t, "POST", ts.URL+"/admin/services/"+id+"/resources", admin, "application/json", `{"resource":"https://finforge.test/api"}`)
+	if code, body := do(t, "PUT", ts.URL+"/admin/services/"+id+"/login", admin, "application/json", `{"login_url":"https://finforge.test/login","rp_id":"finforge.test","origins":["https://finforge.test"],"default_roles":["nope"]}`); code != 400 {
+		t.Fatalf("bad default role: %d %v", code, body)
+	}
+	code, body := do(t, "PUT", ts.URL+"/admin/services/"+id+"/login", admin, "application/json", `{"login_url":"https://finforge.test/login","rp_id":"finforge.test","origins":["https://finforge.test"],"default_roles":["user"]}`)
+	if code != 200 || body["login_url"] != "https://finforge.test/login" {
+		t.Fatalf("set login: %d %v", code, body)
+	}
+	_, cred := do(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", admin, "", "")
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {id}, "client_secret": {cred["credential"].(string)}}
+	_, tk := do(t, "POST", ts.URL+"/v1/token", "", "application/x-www-form-urlencoded", form.Encode())
+	svcTok := "Bearer " + tk["access_token"].(string)
+
+	// Users CRUD with the service token.
+	if code, _ := do(t, "POST", ts.URL+"/v1/users", "", "application/json", `{"email":"a@x.test"}`); code != 401 {
+		t.Fatalf("users without service token: %d", code)
+	}
+	code, u := do(t, "POST", ts.URL+"/v1/users", svcTok, "application/json", `{"email":"Alice@x.test","name":"Alice"}`)
+	if code != 201 || u["email"] != "alice@x.test" || u["method"] != "passkey" {
+		t.Fatalf("create user: %d %v", code, u)
+	}
+	uid := u["id"].(string)
+	if code, _ := do(t, "POST", ts.URL+"/v1/users", svcTok, "application/json", `{"email":"alice@x.test"}`); code != 409 {
+		t.Fatalf("dup user: %d", code)
+	}
+	if code, list := do(t, "GET", ts.URL+"/v1/users", svcTok, "", ""); code != 200 || len(list["users"].([]any)) != 1 {
+		t.Fatalf("list users: %d %v", code, list)
+	}
+	if code, got := do(t, "PATCH", ts.URL+"/v1/users/"+uid, svcTok, "application/json", `{"roles":["editor"]}`); code != 200 || len(got["roles"].([]any)) != 1 {
+		t.Fatalf("patch roles: %d %v", code, got)
+	}
+	if code, _ := do(t, "PATCH", ts.URL+"/v1/users/"+uid, svcTok, "application/json", `{"roles":["ghost"]}`); code != 400 {
+		t.Fatalf("unknown role: %d", code)
+	}
+	if code, opts := do(t, "POST", ts.URL+"/v1/users/"+uid+"/passkeys/begin", svcTok, "", ""); code != 200 || opts["challenge_id"] == nil {
+		t.Fatalf("passkey begin: %d %v", code, opts)
+	}
+	if code, _ := do(t, "GET", ts.URL+"/v1/users/"+uid+"/passkeys", svcTok, "", ""); code != 200 {
+		t.Fatalf("list passkeys: %d", code)
+	}
+
+	// First-party client + authorize → login_url with login_challenge.
+	_, reg := do(t, "POST", ts.URL+"/oauth/register", "", "application/json", `{"client_name":"FinForge web","redirect_uris":["https://finforge.test/cb"],"token_endpoint_auth_method":"none"}`)
+	clientID := reg["client_id"].(string)
+	verifier := strings.Repeat("v", 43)
+	sum := sha256.Sum256([]byte(verifier))
+	q := url.Values{"client_id": {clientID}, "redirect_uri": {"https://finforge.test/cb"}, "response_type": {"code"}, "state": {"s1"},
+		"resource": {"https://finforge.test/api"}, "scope": {"read write"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}}
+	resp, _ := noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+	resp.Body.Close()
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	if resp.StatusCode != 302 || loc.Host != "finforge.test" || loc.Path != "/login" || loc.Query().Get("login_challenge") == "" {
+		t.Fatalf("authorize for user pool: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	lc := loc.Query().Get("login_challenge")
+
+	// Passkey login begin needs a valid challenge for this service.
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/passkey/begin", svcTok, "application/json", `{"login_challenge":"nope"}`); code != 404 {
+		t.Fatalf("begin with bad challenge: %d", code)
+	}
+	code, lb := do(t, "POST", ts.URL+"/v1/login/passkey/begin", svcTok, "application/json", `{"login_challenge":"`+lc+`"}`)
+	if code != 200 || lb["options"] == nil {
+		t.Fatalf("login begin: %d %v", code, lb)
+	}
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/passkey/finish?challenge="+lb["challenge_id"].(string), svcTok, "application/json", `{"id":"junk"}`); code != 401 {
+		t.Fatalf("junk assertion: %d", code)
+	}
+
+	// Google: disabled until configured.
+	resp, _ = noRedirect.Get(ts.URL + "/v1/login/google/start?login_challenge=" + lc)
+	resp.Body.Close()
+	if resp.StatusCode != 404 {
+		t.Fatalf("google disabled: %d", resp.StatusCode)
+	}
+	// Fake Google.
+	gmux := http.NewServeMux()
+	gmux.HandleFunc("POST /token", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "at"})
+	})
+	gmux.HandleFunc("GET /userinfo", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"sub": "g42", "email": "g@x.test", "email_verified": true, "name": "G"})
+	})
+	fake := httptest.NewServer(gmux)
+	defer fake.Close()
+	srv.Google = users.NewGoogle("cid", "sec", "https://auth.test/v1/login/google/callback")
+	srv.Google.AuthURL, srv.Google.TokenURL, srv.Google.UserinfoURL = fake.URL+"/auth", fake.URL+"/token", fake.URL+"/userinfo"
+
+	resp, _ = noRedirect.Get(ts.URL + "/v1/login/google/start?login_challenge=" + lc)
+	resp.Body.Close()
+	gloc, _ := url.Parse(resp.Header.Get("Location"))
+	if resp.StatusCode != 302 || !strings.HasPrefix(resp.Header.Get("Location"), fake.URL+"/auth?") || gloc.Query().Get("state") == "" {
+		t.Fatalf("google start: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	state := gloc.Query().Get("state")
+	resp, _ = noRedirect.Get(ts.URL + "/v1/login/google/callback?state=bogus&code=x")
+	resp.Body.Close()
+	if resp.StatusCode != 400 {
+		t.Fatalf("bogus state: %d", resp.StatusCode)
+	}
+	resp, _ = noRedirect.Get(ts.URL + "/v1/login/google/callback?state=" + url.QueryEscape(state) + "&code=good")
+	resp.Body.Close()
+	cb, _ := url.Parse(resp.Header.Get("Location"))
+	if resp.StatusCode != 302 || cb.Host != "finforge.test" || cb.Path != "/cb" || cb.Query().Get("code") == "" || cb.Query().Get("state") != "s1" {
+		t.Fatalf("google callback: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	// Exchange: new Google user has the default role "user" → scope "read" only.
+	form = url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {cb.Query().Get("code")}, "code_verifier": {verifier}, "redirect_uri": {"https://finforge.test/cb"}}
+	code, ut := do(t, "POST", ts.URL+"/oauth/token", "", "application/x-www-form-urlencoded", form.Encode())
+	if code != 200 || ut["scope"] != "read" {
+		t.Fatalf("user token: %d %v", code, ut)
+	}
+	claims, err := srv.Core.VerifyToken(ut["access_token"].(string), id)
+	if err != nil || !strings.HasPrefix(claims.Subject, "usr:") || claims.Email != "g@x.test" {
+		t.Fatalf("claims: %+v %v", claims, err)
+	}
+	// Two users now; logout-everywhere on the google user works.
+	code, list := do(t, "GET", ts.URL+"/v1/users", svcTok, "", "")
+	if code != 200 || len(list["users"].([]any)) != 2 {
+		t.Fatalf("users after google: %d %v", code, list)
+	}
+	gid := strings.TrimPrefix(claims.Subject, "usr:")
+	if code, _ := do(t, "POST", ts.URL+"/v1/users/"+gid+"/logout-everywhere", svcTok, "", ""); code != 204 {
+		t.Fatalf("user logout everywhere: %d", code)
 	}
 }

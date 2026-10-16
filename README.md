@@ -35,6 +35,12 @@ curl -s -X POST $AUTH/v1/token -d grant_type=client_credentials \
 curl -s $AUTH/v1/me -H "Authorization: Bearer <access_token>"
 ```
 
+## End users
+
+A service with a login URL becomes a user pool: its own app signs people in with passkeys or
+Google through `/v1/users*` and `/v1/login/*` (service token), and gets ordinary OAuth tokens
+for them. See docs/API.md "End users" and docs/DESIGN.md "End users".
+
 ## Endpoints
 
 Full reference with request and response shapes: [docs/API.md](docs/API.md).

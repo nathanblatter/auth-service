@@ -161,8 +161,74 @@ Table rows: `CLIENT#<id>`, `AUTHZ#<id>` (ttl), `CODE#<sha256>` (ttl), `REFRESH#<
 (GSI1 `FAMILY#<id>`, ttl), `RESOURCE#<url>` lock → service id, and `resources` list on the
 service row.
 
-Slice 3 (not built): end users of a product (passkey / Google / Apple) and the Hydra-style
-redirect to a product's own login page for services that are not owner-only.
+## End users (auth-service-3, slice 3)
+
+**DECIDED (Nathan, 2026-10-15):** passkeys + Sign in with Google now, Apple later. No account
+linking: a user has exactly one login method for life. Customers of each product are separate
+pools. Each app renders its own screens (headless).
+
+### Shape
+
+A service is **owner-only** (no `login_url`; connectors are approved by Nathan in the console,
+slice 2) or a **user pool** (has a `login_url`). A user-pool service is itself a first-party
+OAuth client of this server: its web app runs the normal authorization-code + PKCE flow and gets
+tokens for the signed-in user. Users belong to exactly one service: `USER#<svc>#<id>`.
+
+### Login flow (Hydra-style: the app owns the screen, we own the ceremony)
+
+1. App → `GET /oauth/authorize` (its own `client_id`, PKCE, `resource` = its resource URL).
+2. The service has a `login_url`, so the request is parked and the browser is sent to
+   `login_url?login_challenge=<id>`. First-party clients skip consent.
+3. The app's login page offers the methods it wants:
+   - **Passkey:** app backend (service token) calls `POST /v1/login/passkey/begin`
+     `{login_challenge}` → WebAuthn assertion options; browser runs `navigator.credentials.get`;
+     backend calls `POST /v1/login/passkey/finish` `{login_challenge, credential}` →
+     `{redirect_to}`; the app sends the browser there (its own `redirect_uri` with `code`).
+   - **Google:** the page links to `GET /v1/login/google/start?login_challenge=<id>`; we redirect
+     to Google, Google calls back `/v1/login/google/callback`, we exchange the code, read
+     `userinfo` (sub, email, email_verified, name), find-or-create the user, complete the
+     authorization and redirect the browser to the app's `redirect_uri` with `code`.
+   - **Sign-up with a passkey:** `POST /v1/users` creates a user (method `passkey`,
+     `email`, `name`), then `POST /v1/users/{id}/passkeys/begin` + `/finish` registers the
+     credential (service token). Passkey users must register before they can log in.
+4. App exchanges the code at `/oauth/token`; refresh as usual.
+
+WebAuthn is bound to the **app's** origin, not ours: each user-pool service declares `rp_id`
+(e.g. `finforge.nathanblatter.com`) and `origins` (`https://finforge.nathanblatter.com`), and
+a `webauthn.WebAuthn` instance is built per service. Ceremony state lives in `CHALLENGE#` rows
+as for the owner.
+
+### Tokens for users
+
+`sub = usr:<id>`, `aud = <service id>`, `scope` = requested ∩ allowed, `client_id`, plus
+`email` when known. **Allowed** for a user = the union of the scopes of the user's roles; new
+users get the service's `default_roles`. Refresh tokens carry `sub` and honour a per-user
+`sessions_not_before` (log out everywhere, auth-service-11, applied per user).
+
+### Rows
+
+| Entity | PK | SK | GSI1PK | GSI1SK |
+|---|---|---|---|---|
+| User | `USER#<svc>#<id>` | `META` | `USERS#<svc>` | `<created_at>` |
+| Identity lock (one method, one identity) | `IDENT#<svc>#google:<sub>` or `IDENT#<svc>#email:<email>` | `META` → user id | | |
+| User passkey | `USER#<svc>#<id>` | `PASSKEY#<cred id>` | `UPK#<svc>#<cred id>` | user id |
+
+Service row gains `login_url`, `rp_id`, `origins`, `default_roles`.
+
+### Google
+
+Config: `AUTH_GOOGLE_CLIENT_ID` (template parameter) and the client secret in SSM
+`/auth-service/prod/google-client-secret`, read at cold start like the admin token hash.
+Nathan creates the OAuth client in Google Cloud Console with redirect URI
+`https://auth.nathanblatter.com/v1/login/google/callback`. We request `openid email profile`,
+verify `email_verified`, and key the identity on Google's stable `sub`. The state parameter is
+the `login_challenge` plus a random nonce stored in the challenge row. Apple follows the same
+provider interface when Nathan buys the developer account.
+
+### User management (service token)
+
+`GET /v1/users`, `GET /v1/users/{id}`, `PATCH /v1/users/{id}` (`roles`, `status`),
+`POST /v1/users/{id}/logout-everywhere`. Deletion and export are auth-service-13.
 
 ## Tokens
 

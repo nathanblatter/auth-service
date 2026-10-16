@@ -21,6 +21,14 @@ Parameters:
     Type: String
     Default: /auth-service/prod/admin-token-hash
     Description: SSM parameter holding the hex SHA-256 of the interim admin token.
+  GoogleClientID:
+    Type: String
+    Default: ""
+    Description: Google OAuth client id for Sign in with Google (empty = disabled).
+  GoogleClientSecretParam:
+    Type: String
+    Default: /auth-service/prod/google-client-secret
+    Description: SSM SecureString holding the Google OAuth client secret.
 
 Conditions:
   HasDomain: !And
@@ -160,6 +168,8 @@ Resources:
           AUTH_TABLE: !Ref Table
           AUTH_SIGNING_KEY_IDS: !Ref SigningKeyA
           AUTH_ADMIN_TOKEN_HASH_PARAM: !Ref AdminTokenHashParam
+          AUTH_GOOGLE_CLIENT_ID: !Ref GoogleClientID
+          AUTH_GOOGLE_CLIENT_SECRET_PARAM: !Ref GoogleClientSecretParam
       Events:
         Root:
           Type: HttpApi
@@ -184,7 +194,9 @@ Resources:
               Resource: !GetAtt SigningKeyA.Arn
             - Effect: Allow
               Action: ssm:GetParameter
-              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AdminTokenHashParam}
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${AdminTokenHashParam}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleClientSecretParam}
   ApiFunctionLogs:
     Type: AWS::Logs::LogGroup
     Properties:

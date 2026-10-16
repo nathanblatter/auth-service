@@ -15,8 +15,9 @@ don't invent new ones, log proposals in flightdeck (project slug `auth-service`)
 - Layout: `cmd/api` (Lambda + local listener) · `cmd/worker` (SQS consumer) ·
   `internal/core` (business rules) · `internal/httpapi` (HTTP) · `internal/store`
   (Store interface: DynamoDB + in-memory) · `internal/signer` (Signer: KMS + local ECDSA) ·
-  `internal/jwt` (ES256 compact JWS, JWKS) · `internal/owner` (passkeys + console sessions,
-  go-webauthn) · `internal/config` (AUTH_* env).
+  `internal/jwt` (ES256 compact JWS, JWKS) · `internal/owner` (owner passkeys + console sessions,
+  go-webauthn) · `internal/oauth` (connector + first-party OAuth 2.1) · `internal/users` (end
+  users: per-service WebAuthn, Google provider) · `internal/ratelimit` · `internal/config`.
 - `client/` is a separate, stdlib-only Go module (the SDK consumers import). Keep it
   dependency-free; `make check` and CI run its tests too.
 - Infra: `infra/template.yaml` (the whole stack) · `infra/bootstrap/github-oidc.yaml`
@@ -37,6 +38,10 @@ Never hand-deploy the stack. `make deploy` exists for the first bootstrap only.
 Custom domain: repo vars `AUTH_DOMAIN_NAME` + `AUTH_CERTIFICATE_ARN`; empty = execute-api URL.
 
 ## Gotchas
+- Sign in with Google is off until `vars.AUTH_GOOGLE_CLIENT_ID` is set in the repo AND the
+  client secret sits in SSM `/auth-service/prod/google-client-secret` (SecureString). The
+  Lambda logs and keeps running without it. Redirect URI to register at Google:
+  `https://auth.nathanblatter.com/v1/login/google/callback`.
 - `/admin/*` accepts a passkey session cookie (1h, `internal/owner`) or the interim bearer
   token (break-glass until auth-service-4; also bootstraps the first passkey). Passkeys bind
   to the issuer host, so they only work on auth.nathanblatter.com or localhost, never on the

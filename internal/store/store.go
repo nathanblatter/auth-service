@@ -28,6 +28,35 @@ type Service struct {
 	// scopes from it. Roles are named bundles of those scopes.
 	Scopes []string
 	Roles  map[string][]string
+	// User-pool configuration (slice 3). LoginURL empty = owner-only service.
+	LoginURL     string
+	RPID         string
+	Origins      []string
+	DefaultRoles []string
+}
+
+// User is an end user of one service. Method is fixed for life (no linking).
+type User struct {
+	ID        string
+	ServiceID string
+	Method    string // passkey | google
+	Identity  string // "google:<sub>" or "email:<email>"; unique per service
+	Email     string
+	Name      string
+	Roles     []string
+	Status    string // active | disabled
+	CreatedAt time.Time
+	NotBefore time.Time // sessions/refresh tokens issued before this are dead
+}
+
+// UserPasskey is a WebAuthn credential of an end user (Data = webauthn.Credential JSON).
+type UserPasskey struct {
+	ServiceID string
+	UserID    string
+	ID        string // base64url credential id
+	Name      string
+	CreatedAt time.Time
+	Data      []byte
 }
 
 // Credential is a hashed service credential.
@@ -138,6 +167,18 @@ type Store interface {
 
 	AddServiceResource(ctx context.Context, serviceID, resource string) error                                         // ErrConflict when taken
 	UpdateServicePermissions(ctx context.Context, serviceID string, scopes []string, roles map[string][]string) error // ErrNotFound
+	UpdateServiceLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string) error   // ErrNotFound
+
+	// End users (slice 3).
+	CreateUser(ctx context.Context, u User) error // ErrConflict when the identity is taken
+	GetUser(ctx context.Context, serviceID, id string) (User, error)
+	GetUserByIdentity(ctx context.Context, serviceID, identity string) (User, error)
+	ListUsers(ctx context.Context, serviceID string, limit int, cursor string) (users []User, next string, err error)
+	UpdateUser(ctx context.Context, u User) error // ErrNotFound; replaces Email, Name, Roles, Status, NotBefore
+	PutUserPasskey(ctx context.Context, p UserPasskey) error
+	UpdateUserPasskey(ctx context.Context, p UserPasskey) error
+	ListUserPasskeys(ctx context.Context, serviceID, userID string) ([]UserPasskey, error)
+	GetUserPasskeyByCred(ctx context.Context, serviceID, credID string) (UserPasskey, error)
 	GetServiceByResource(ctx context.Context, resource string) (Service, error)
 
 	PutCredential(ctx context.Context, c Credential) error

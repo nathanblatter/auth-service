@@ -232,3 +232,53 @@ func TestLogoutEverywhereKillsRefresh(t *testing.T) {
 	_, err = s.Token(ctx, TokenRequest{GrantType: "refresh_token", ClientID: c.ID, ClientSecret: secret, RefreshToken: tok.RefreshToken}, "ip")
 	oauthErr(t, err, "invalid_grant")
 }
+
+func TestUserPoolFlow(t *testing.T) {
+	s, mem, svc := newServer(t)
+	ctx := context.Background()
+	_ = mem.UpdateServiceLogin(ctx, svc.ID, "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"viewer"})
+	c, secret, _ := s.Register(ctx, RegisterRequest{RedirectURIs: []string{"https://finforge.test/cb"}, ClientName: "FinForge web"}, "ip")
+	verifier, challenge := pkce()
+	p := AuthzParams{ClientID: c.ID, RedirectURI: "https://finforge.test/cb", ResponseType: "code", State: "s", Scope: "read write",
+		Challenge: challenge, Method: "S256", Resource: "https://finforge.test/mcp"}
+
+	// User-pool service: the browser goes to the product's login page.
+	out, err := s.BeginAuthorize(ctx, p, "ip")
+	if err != nil || !strings.HasPrefix(out.ApproveURL, "https://finforge.test/login?login_challenge=") {
+		t.Fatalf("begin: %+v %v", out, err)
+	}
+	authzID := strings.TrimPrefix(out.ApproveURL, "https://finforge.test/login?login_challenge=")
+
+	user := store.User{ID: "usr_1", ServiceID: svc.ID, Method: "passkey", Identity: "email:a@x.test", Email: "a@x.test", Roles: []string{"viewer"}, Status: "active", CreatedAt: s.Now()}
+	_ = mem.CreateUser(ctx, user)
+	// Another service's user cannot complete this request.
+	if _, err := s.CompleteForUser(ctx, authzID, store.User{ID: "x", ServiceID: "svc_other"}, nil, "ip"); err == nil {
+		t.Fatal("cross-service completion accepted")
+	}
+	// Viewer only has read: requested "read write" narrows to "read".
+	loc, err := s.CompleteForUser(ctx, authzID, user, []string{"read"}, "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(loc)
+	tok, err := s.Token(ctx, TokenRequest{GrantType: "authorization_code", ClientID: c.ID, ClientSecret: secret, Code: u.Query().Get("code"), CodeVerifier: verifier}, "ip")
+	if err != nil || tok.Scope != "read" {
+		t.Fatalf("user token: %+v %v", tok, err)
+	}
+	claims, err := s.Core.VerifyToken(tok.AccessToken, svc.ID)
+	if err != nil || claims.Subject != "usr:usr_1" || claims.Email != "a@x.test" {
+		t.Fatalf("user claims: %+v %v", claims, err)
+	}
+
+	// Refresh works, then the user is signed out everywhere → refresh refused.
+	tok2, err := s.Token(ctx, TokenRequest{GrantType: "refresh_token", ClientID: c.ID, ClientSecret: secret, RefreshToken: tok.RefreshToken}, "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := s.Now()
+	user.NotBefore = base.Add(time.Second)
+	_ = mem.UpdateUser(ctx, user)
+	s.Now = func() time.Time { return base.Add(2 * time.Second) }
+	_, err = s.Token(ctx, TokenRequest{GrantType: "refresh_token", ClientID: c.ID, ClientSecret: secret, RefreshToken: tok2.RefreshToken}, "ip")
+	oauthErr(t, err, "invalid_grant")
+}

@@ -144,6 +144,38 @@ The Go client does all of this: `client.NewVerifier(issuer, serviceID)` + `clien
 
 ---
 
+## End users (slice 3)
+
+A **user-pool** service (one with a `login_url`) has its own users. All `/v1/users*` and
+`/v1/login/passkey/*` calls need the service's **service token**; users are always scoped to
+the calling service. A user has one method for life: `passkey` (created via `POST /v1/users`)
+or `google` (created on first Google sign-in).
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/users` | `{"email","name"?}` → `201 user` (method `passkey`, roles = service `default_roles`). `409 identity_taken` |
+| GET | `/v1/users?limit=50&cursor=` | `{"users":[user],"next"}` |
+| GET | `/v1/users/{id}` | `user` |
+| PATCH | `/v1/users/{id}` | any of `{"roles":[…],"status":"active|disabled","name"}`; roles must exist on the service |
+| POST | `/v1/users/{id}/logout-everywhere` | `204`; refresh tokens issued earlier are refused |
+| GET | `/v1/users/{id}/passkeys` | `{"passkeys":[{"id","name","created_at"}]}` |
+| POST | `/v1/users/{id}/passkeys/begin` | `{"challenge_id","options"}` WebAuthn creation options bound to the service's `rp_id`/`origins` |
+| POST | `/v1/users/{id}/passkeys/finish?challenge=&name=` | body: the browser's credential JSON → `201` |
+| POST | `/v1/login/passkey/begin` | `{"login_challenge"}` → `{"challenge_id","options"}` (usernameless) |
+| POST | `/v1/login/passkey/finish?challenge=` | body: credential JSON → `{"redirect_to","user"}`; send the browser to `redirect_to` |
+| GET | `/v1/login/google/start?login_challenge=` | browser endpoint, no auth; `302` to Google (404 `google_disabled` when not configured) |
+| GET | `/v1/login/google/callback` | Google returns here; `302` to the app's `redirect_uri` with `code`, or back to `login_url?login_challenge=&error=` |
+
+`user` = `{"id":"usr_…","service_id","method","email","name","roles":[…],"status","created_at"}`.
+
+**Login flow:** the app sends the browser to `/oauth/authorize` (its own client, PKCE,
+`resource`); because the service has a `login_url` the browser lands on
+`login_url?login_challenge=<id>`. The page offers passkey (backend drives
+`/v1/login/passkey/*`) or Google (link to `/v1/login/google/start`). Either path ends with a
+redirect to the app's `redirect_uri` carrying `code`, exchanged at `/oauth/token`. User tokens:
+`sub=usr:<id>`, `aud=<service id>`, `email`, `scope` = requested ∩ union of the user's roles'
+scopes. First-party apps get no consent screen.
+
 ## Admin API
 
 All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step-up required.
@@ -176,12 +208,13 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | GET | `/admin/services` | `{"services":[service]}` |
 | GET | `/admin/services/{id}` | `service` |
 | POST | `/admin/services/{id}/resources` | `{"resource":"https://finforge.nathanblatter.com/mcp"}` → `200 service`. Absolute https URL, unique across services |
+| PUT | `/admin/services/{id}/login` | `{"login_url","rp_id","origins":[…],"default_roles":[…]}` → `200 service`. Empty `login_url` = owner-only. `rp_id` must be a registrable suffix of every origin; default roles must exist |
 | PUT | `/admin/services/{id}/permissions` | `{"scopes":["read","write"],"roles":{"admin":["read","write"],"viewer":["read"]}}` → `200 service`. Scopes `^[a-z][a-z0-9:._-]{0,39}$` (≤50); role names `^[a-z][a-z0-9-]{0,39}$` (≤20) bundling catalog scopes only. Replaces the whole catalog |
 | POST | `/admin/services/{id}/credentials` | **fresh**. `201 {"credential":"nbk_…", "id","service_id","last4","created_at","revoked":false}` |
 | GET | `/admin/services/{id}/credentials` | `{"credentials":[{"id","service_id","last4","created_at","revoked","revoked_at"?}]}` (never the secret or its hash) |
 | DELETE | `/admin/services/{id}/credentials/{cred}` | `204`; idempotent. Already-issued 15-minute service tokens finish their lifetime |
 
-`service` = `{"id","slug","name","status":"active|disabled","created_at","resources":[…],"scopes":[…],"roles":{name:[…]}}`.
+`service` = `{"id","slug","name","status":"active|disabled","created_at","resources":[…],"scopes":[…],"roles":{name:[…]},"login_url","rp_id","origins":[…],"default_roles":[…]}`.
 
 ### Connector approvals
 | Method | Path | Notes |
@@ -195,7 +228,9 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 |---|---|---|
 | GET | `/admin/audit?month=YYYY-MM&limit=50&cursor=` | `{"month","events":[{"at","kind","actor","service_id","detail","ip"}],"next"}` newest first; pass `next` back as `cursor` |
 
-Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `credential.mint`, `credential.revoke`,
+Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `service.login.set`,
+`user.create`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
+`user.passkey.register`, `credential.mint`, `credential.revoke`,
 `token.issue`, `token.denied`, `passkey.register`, `owner.login`, `owner.login_denied`,
 `owner.stepup`, `owner.stepup_denied`, `owner.logout_everywhere`, `recovery.generate`,
 `recovery.login`, `recovery.denied`, `oauth.client.register`, `oauth.authorize.request`,

@@ -38,6 +38,10 @@ const (
 	pkRefresh   = "REFRESH#"
 	gsiFamily   = "FAMILY#"
 	skRecovery  = "RECOVERY#"
+	pkUser      = "USER#"
+	pkIdent     = "IDENT#"
+	gsiUsers    = "USERS#"
+	gsiUPK      = "UPK#"
 )
 
 // DynamoAPI is the slice of the DynamoDB client the store uses.
@@ -70,6 +74,10 @@ type serviceItem struct {
 	Resources              []string            `dynamodbav:"resources,omitempty"`
 	Scopes                 []string            `dynamodbav:"scopes,omitempty"`
 	Roles                  map[string][]string `dynamodbav:"roles,omitempty"`
+	LoginURL               string              `dynamodbav:"login_url,omitempty"`
+	RPID                   string              `dynamodbav:"rp_id,omitempty"`
+	Origins                []string            `dynamodbav:"origins,omitempty"`
+	DefaultRoles           []string            `dynamodbav:"default_roles,omitempty"`
 }
 
 type credItem struct {
@@ -263,7 +271,8 @@ func (it serviceItem) toService() (Service, error) {
 	if err != nil {
 		return Service{}, fmt.Errorf("store: bad created_at on %s: %w", it.PK, err)
 	}
-	return Service{ID: it.ID, Slug: it.Slug, Name: it.Name, Status: it.Status, CreatedAt: t, Resources: it.Resources, Scopes: it.Scopes, Roles: it.Roles}, nil
+	return Service{ID: it.ID, Slug: it.Slug, Name: it.Name, Status: it.Status, CreatedAt: t, Resources: it.Resources, Scopes: it.Scopes, Roles: it.Roles,
+		LoginURL: it.LoginURL, RPID: it.RPID, Origins: it.Origins, DefaultRoles: it.DefaultRoles}, nil
 }
 
 func (it credItem) toCredential() (Credential, error) {
@@ -911,7 +920,9 @@ func (d *Dynamo) ListAudit(ctx context.Context, month string, limit int, cursor 
 		KeyConditionExpression:    aws.String("PK = :p"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: pkAudit + month}},
 		ScanIndexForward:          aws.Bool(false),
-		Limit:                     aws.Int32(int32(limit)), //nolint:gosec // limit is clamped by the caller
+		// One extra row tells us whether a next page exists; DynamoDB's own
+		// LastEvaluatedKey is set even when the page exactly drained the data.
+		Limit: aws.Int32(int32(limit + 1)), //nolint:gosec // limit is clamped by the caller
 	}
 	if cursor != "" {
 		in.ExclusiveStartKey = dynKey(pkAudit+month, cursor)
@@ -924,14 +935,15 @@ func (d *Dynamo) ListAudit(ctx context.Context, month string, limit int, cursor 
 	if err := attributevalue.UnmarshalListOfMaps(out.Items, &items); err != nil {
 		return nil, "", err
 	}
+	next := ""
+	if len(items) > limit {
+		items = items[:limit]
+		next = items[limit-1].SK
+	}
 	events := make([]AuditEvent, 0, len(items))
 	for _, it := range items {
 		at, _ := time.Parse(time.RFC3339Nano, it.At)
 		events = append(events, AuditEvent{At: at, Kind: it.Kind, Actor: it.Actor, ServiceID: it.ServiceID, Detail: it.Detail, IP: it.IP})
-	}
-	next := ""
-	if sk, ok := out.LastEvaluatedKey["SK"].(*types.AttributeValueMemberS); ok {
-		next = sk.Value
 	}
 	return events, next, nil
 }
@@ -1017,4 +1029,288 @@ func (d *Dynamo) UpdateServicePermissions(ctx context.Context, serviceID string,
 		return ErrNotFound
 	}
 	return err
+}
+
+func (d *Dynamo) UpdateServiceLogin(ctx context.Context, serviceID, loginURL, rpID string, origins, defaultRoles []string) error {
+	strList := func(xs []string) types.AttributeValue {
+		out := make([]types.AttributeValue, 0, len(xs))
+		for _, x := range xs {
+			out = append(out, &types.AttributeValueMemberS{Value: x})
+		}
+		return &types.AttributeValueMemberL{Value: out}
+	}
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:           &d.table,
+		Key:                 dynKey(pkService+serviceID, skMeta),
+		UpdateExpression:    aws.String("SET login_url = :l, rp_id = :r, origins = :o, default_roles = :d"),
+		ConditionExpression: aws.String("attribute_exists(PK)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":l": &types.AttributeValueMemberS{Value: loginURL},
+			":r": &types.AttributeValueMemberS{Value: rpID},
+			":o": strList(origins),
+			":d": strList(defaultRoles),
+		},
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
+}
+
+// ── end users ──────────────────────────────────────────────────────────────
+
+type userItem struct {
+	PK, SK, GSI1PK, GSI1SK string
+	Type                   string   `dynamodbav:"type"`
+	ID                     string   `dynamodbav:"id"`
+	ServiceID              string   `dynamodbav:"service_id"`
+	Method                 string   `dynamodbav:"method"`
+	Identity               string   `dynamodbav:"identity"`
+	Email                  string   `dynamodbav:"email,omitempty"`
+	Name                   string   `dynamodbav:"name,omitempty"`
+	Roles                  []string `dynamodbav:"roles,omitempty"`
+	Status                 string   `dynamodbav:"status"`
+	CreatedAt              string   `dynamodbav:"created_at"`
+	NotBefore              string   `dynamodbav:"sessions_not_before,omitempty"`
+}
+
+func (it userItem) toUser() (User, error) {
+	t, err := time.Parse(time.RFC3339Nano, it.CreatedAt)
+	if err != nil {
+		return User{}, fmt.Errorf("store: bad created_at on %s: %w", it.PK, err)
+	}
+	nb, _ := time.Parse(time.RFC3339Nano, it.NotBefore)
+	return User{ID: it.ID, ServiceID: it.ServiceID, Method: it.Method, Identity: it.Identity, Email: it.Email, Name: it.Name,
+		Roles: it.Roles, Status: it.Status, CreatedAt: t, NotBefore: nb}, nil
+}
+
+func (d *Dynamo) CreateUser(ctx context.Context, u User) error {
+	item, err := attributevalue.MarshalMap(userItem{
+		PK: pkUser + u.ServiceID + "#" + u.ID, SK: skMeta, GSI1PK: gsiUsers + u.ServiceID, GSI1SK: u.CreatedAt.UTC().Format(time.RFC3339Nano) + "#" + u.ID,
+		Type: "user", ID: u.ID, ServiceID: u.ServiceID, Method: u.Method, Identity: u.Identity, Email: u.Email, Name: u.Name,
+		Roles: u.Roles, Status: u.Status, CreatedAt: u.CreatedAt.UTC().Format(time.RFC3339Nano), NotBefore: fmtTime(u.NotBefore),
+	})
+	if err != nil {
+		return err
+	}
+	lock, err := attributevalue.MarshalMap(map[string]string{"PK": pkIdent + u.ServiceID + "#" + u.Identity, "SK": skMeta, "type": "identity", "user_id": u.ID})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{Put: &types.Put{TableName: &d.table, Item: lock, ConditionExpression: aws.String("attribute_not_exists(PK)")}},
+			{Put: &types.Put{TableName: &d.table, Item: item, ConditionExpression: aws.String("attribute_not_exists(PK)")}},
+		},
+	})
+	var canceled *types.TransactionCanceledException
+	if errors.As(err, &canceled) {
+		return ErrConflict
+	}
+	return err
+}
+
+func (d *Dynamo) GetUser(ctx context.Context, serviceID, id string) (User, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkUser+serviceID+"#"+id, skMeta)})
+	if err != nil {
+		return User{}, err
+	}
+	if out.Item == nil {
+		return User{}, ErrNotFound
+	}
+	var it userItem
+	if err := attributevalue.UnmarshalMap(out.Item, &it); err != nil {
+		return User{}, err
+	}
+	return it.toUser()
+}
+
+func (d *Dynamo) GetUserByIdentity(ctx context.Context, serviceID, identity string) (User, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkIdent+serviceID+"#"+identity, skMeta)})
+	if err != nil {
+		return User{}, err
+	}
+	if out.Item == nil {
+		return User{}, ErrNotFound
+	}
+	var lock struct {
+		UserID string `dynamodbav:"user_id"`
+	}
+	if err := attributevalue.UnmarshalMap(out.Item, &lock); err != nil {
+		return User{}, err
+	}
+	return d.GetUser(ctx, serviceID, lock.UserID)
+}
+
+func (d *Dynamo) ListUsers(ctx context.Context, serviceID string, limit int, cursor string) ([]User, string, error) {
+	in := &dynamodb.QueryInput{
+		TableName:                 &d.table,
+		IndexName:                 aws.String(gsi1),
+		KeyConditionExpression:    aws.String("GSI1PK = :p"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: gsiUsers + serviceID}},
+		Limit:                     aws.Int32(int32(limit + 1)), //nolint:gosec // limit is clamped by the caller
+	}
+	if cursor != "" {
+		// cursor = "<GSI1SK>|<PK>" (the index key plus the table key).
+		gsk, pk, ok := strings.Cut(cursor, "|")
+		if !ok {
+			return nil, "", fmt.Errorf("store: bad cursor %q", cursor)
+		}
+		in.ExclusiveStartKey = map[string]types.AttributeValue{
+			"GSI1PK": &types.AttributeValueMemberS{Value: gsiUsers + serviceID}, "GSI1SK": &types.AttributeValueMemberS{Value: gsk},
+			"PK": &types.AttributeValueMemberS{Value: pk}, "SK": &types.AttributeValueMemberS{Value: skMeta},
+		}
+	}
+	out, err := d.db.Query(ctx, in)
+	if err != nil {
+		return nil, "", err
+	}
+	var items []userItem
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &items); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(items) > limit {
+		items = items[:limit]
+		next = items[limit-1].GSI1SK + "|" + items[limit-1].PK
+	}
+	users := make([]User, 0, len(items))
+	for _, it := range items {
+		u, err := it.toUser()
+		if err != nil {
+			return nil, "", err
+		}
+		users = append(users, u)
+	}
+	return users, next, nil
+}
+
+func (d *Dynamo) UpdateUser(ctx context.Context, u User) error {
+	roles := make([]types.AttributeValue, 0, len(u.Roles))
+	for _, r := range u.Roles {
+		roles = append(roles, &types.AttributeValueMemberS{Value: r})
+	}
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                &d.table,
+		Key:                      dynKey(pkUser+u.ServiceID+"#"+u.ID, skMeta),
+		UpdateExpression:         aws.String("SET email = :e, #n = :n, #r = :r, #s = :s, sessions_not_before = :nb"),
+		ConditionExpression:      aws.String("attribute_exists(PK)"),
+		ExpressionAttributeNames: map[string]string{"#n": "name", "#r": "roles", "#s": "status"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":e":  &types.AttributeValueMemberS{Value: u.Email},
+			":n":  &types.AttributeValueMemberS{Value: u.Name},
+			":r":  &types.AttributeValueMemberL{Value: roles},
+			":s":  &types.AttributeValueMemberS{Value: u.Status},
+			":nb": &types.AttributeValueMemberS{Value: fmtTime(u.NotBefore)},
+		},
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
+}
+
+type userPasskeyItem struct {
+	PK, SK, GSI1PK, GSI1SK string
+	Type                   string `dynamodbav:"type"`
+	ID                     string `dynamodbav:"id"`
+	ServiceID              string `dynamodbav:"service_id"`
+	UserID                 string `dynamodbav:"user_id"`
+	Name                   string `dynamodbav:"name"`
+	CreatedAt              string `dynamodbav:"created_at"`
+	Data                   []byte `dynamodbav:"data"`
+}
+
+func (it userPasskeyItem) toPasskey() (UserPasskey, error) {
+	t, err := time.Parse(time.RFC3339Nano, it.CreatedAt)
+	if err != nil {
+		return UserPasskey{}, fmt.Errorf("store: bad created_at on %s/%s: %w", it.PK, it.SK, err)
+	}
+	return UserPasskey{ServiceID: it.ServiceID, UserID: it.UserID, ID: it.ID, Name: it.Name, CreatedAt: t, Data: it.Data}, nil
+}
+
+func (d *Dynamo) PutUserPasskey(ctx context.Context, p UserPasskey) error {
+	item, err := attributevalue.MarshalMap(userPasskeyItem{
+		PK: pkUser + p.ServiceID + "#" + p.UserID, SK: skPasskey + p.ID, GSI1PK: gsiUPK + p.ServiceID + "#" + p.ID, GSI1SK: p.UserID,
+		Type: "user_passkey", ID: p.ID, ServiceID: p.ServiceID, UserID: p.UserID, Name: p.Name,
+		CreatedAt: p.CreatedAt.UTC().Format(time.RFC3339Nano), Data: p.Data,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item, ConditionExpression: aws.String("attribute_not_exists(PK)")})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrConflict
+	}
+	return err
+}
+
+func (d *Dynamo) UpdateUserPasskey(ctx context.Context, p UserPasskey) error {
+	if len(p.Data) == 0 {
+		return errors.New("store: passkey data required")
+	}
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 &d.table,
+		Key:                       dynKey(pkUser+p.ServiceID+"#"+p.UserID, skPasskey+p.ID),
+		UpdateExpression:          aws.String("SET #d = :d"),
+		ConditionExpression:       aws.String("attribute_exists(PK)"),
+		ExpressionAttributeNames:  map[string]string{"#d": "data"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":d": &types.AttributeValueMemberB{Value: p.Data}},
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
+}
+
+func (d *Dynamo) ListUserPasskeys(ctx context.Context, serviceID, userID string) ([]UserPasskey, error) {
+	out, err := d.db.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &d.table,
+		KeyConditionExpression: aws.String("PK = :p AND begins_with(SK, :s)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":p": &types.AttributeValueMemberS{Value: pkUser + serviceID + "#" + userID},
+			":s": &types.AttributeValueMemberS{Value: skPasskey},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var items []userPasskeyItem
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &items); err != nil {
+		return nil, err
+	}
+	keys := make([]UserPasskey, 0, len(items))
+	for _, it := range items {
+		k, err := it.toPasskey()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
+func (d *Dynamo) GetUserPasskeyByCred(ctx context.Context, serviceID, credID string) (UserPasskey, error) {
+	out, err := d.db.Query(ctx, &dynamodb.QueryInput{
+		TableName:                 &d.table,
+		IndexName:                 aws.String(gsi1),
+		KeyConditionExpression:    aws.String("GSI1PK = :p"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: gsiUPK + serviceID + "#" + credID}},
+		Limit:                     aws.Int32(1),
+	})
+	if err != nil {
+		return UserPasskey{}, err
+	}
+	if len(out.Items) == 0 {
+		return UserPasskey{}, ErrNotFound
+	}
+	var it userPasskeyItem
+	if err := attributevalue.UnmarshalMap(out.Items[0], &it); err != nil {
+		return UserPasskey{}, err
+	}
+	return it.toPasskey()
 }

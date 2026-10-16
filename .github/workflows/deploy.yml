@@ -61,12 +61,18 @@ jobs:
         env:
           DOMAIN: ${{ vars.AUTH_DOMAIN_NAME }}
           CERT: ${{ vars.AUTH_CERTIFICATE_ARN }}
+          GOOGLE_CLIENT_ID: ${{ vars.AUTH_GOOGLE_CLIENT_ID }}
         run: |
           # Custom domain only when both repo variables are set; SAM rejects empty overrides.
-          OVERRIDES=()
+          PARAMS=()
           if [ -n "$DOMAIN" ] && [ -n "$CERT" ]; then
-            OVERRIDES=(--parameter-overrides "DomainName=$DOMAIN" "CertificateArn=$CERT")
+            PARAMS+=("DomainName=$DOMAIN" "CertificateArn=$CERT")
           fi
+          if [ -n "$GOOGLE_CLIENT_ID" ]; then
+            PARAMS+=("GoogleClientID=$GOOGLE_CLIENT_ID")
+          fi
+          OVERRIDES=()
+          if [ ${#PARAMS[@]} -gt 0 ]; then OVERRIDES=(--parameter-overrides "${PARAMS[@]}"); fi
           sam deploy --no-confirm-changeset --no-fail-on-empty-changeset "${OVERRIDES[@]}"
       - name: smoke test
         run: |
