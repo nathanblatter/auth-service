@@ -193,6 +193,8 @@ refusals are audited as `user.signup_denied`.
 | POST | `/v1/users/{id}/passkeys/finish?challenge=&name=` | body: the browser's credential JSON → `201 {"id","name","user_id","created_at","redirect_to"?}` (`redirect_to` only after a passkey activation) |
 | POST | `/v1/login/passkey/begin` | `{"login_challenge"}` → `{"challenge_id","options"}` (usernameless) |
 | POST | `/v1/login/passkey/finish?challenge=` | body: credential JSON → `{"redirect_to","user"}`; send the browser to `redirect_to`. `403 email_unverified` until the account verified its email |
+| POST | `/v1/login/owner/begin` | `{"login_challenge"}` → `{"challenge_id","options"}`: assertion options for the **owner's** passkeys (RP ID = the issuer's parent domain, accepted from the service's `origins`). `409 setup_required` when the owner has no passkey, `409 service_not_configured` without `origins` |
+| POST | `/v1/login/owner/finish?challenge=` | body: credential JSON → `{"redirect_to","subject":"owner"}`. `401 passkey_rejected`. The token minted from the code has `sub=owner` and the request's full scope |
 | POST | `/v1/login/passkey/activate/begin` | `{"login_challenge","email"}` → `{"challenge_id","expires_in"}`; mails a code to the **passkey** account created with that address (owner-provisioned, or an app sign-up on a new device). `404 not_found` on an open pool when no such account, `403 signup_closed` on an invite-only one |
 | POST | `/v1/login/passkey/activate/finish?challenge=` | `{"code"}` → `{"challenge_id","options","user"}`: WebAuthn **creation** options (the code also marks the email verified). Run `navigator.credentials.create`, then `POST /v1/users/{user.id}/passkeys/finish?challenge=&name=`, whose `201` carries `redirect_to` because the challenge completes the parked sign-in |
 | POST | `/v1/login/email/begin` | `{"login_challenge","email"}` → `{"challenge_id","expires_in":600}`; a code is mailed. `403 signup_closed` for an unknown address on an invite-only pool, `403 account_disabled`, `429` |
@@ -207,10 +209,12 @@ refusals are audited as `user.signup_denied`.
 **Login flow:** the app sends the browser to `/oauth/authorize` (its own client, PKCE,
 `resource`); because the service has a `login_url` the browser lands on
 `login_url?login_challenge=<id>`. The page offers passkey (backend drives
-`/v1/login/passkey/*`) or Google (link to `/v1/login/google/start`). Either path ends with a
-redirect to the app's `redirect_uri` carrying `code`, exchanged at `/oauth/token`. User tokens:
-`sub=usr:<id>`, `aud=<service id>`, `email`, `scope` = requested ∩ union of the user's roles'
-scopes. First-party apps get no consent screen.
+`/v1/login/passkey/*`), an emailed code, Google (link to `/v1/login/google/start`) or
+"Sign in as owner" (`/v1/login/owner/*`). Every path ends with a redirect to the app's
+`redirect_uri` carrying `code`, exchanged at `/oauth/token`. User tokens: `sub=usr:<id>`,
+`aud=<service id>`, `email`, `scope` = requested ∩ union of the user's roles' scopes. Owner
+tokens: `sub=owner`, no `email`, the requested scope. Consumers that gate on `sub` must accept
+both forms. First-party apps get no consent screen.
 
 ## Admin API
 

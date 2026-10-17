@@ -52,9 +52,10 @@ Custom domain: repo vars `AUTH_DOMAIN_NAME` + `AUTH_CERTIFICATE_ARN`; empty = ex
   access key and calls email-api's keyed `/send`. If codes stop arriving, check the bridge
   container and the `auth-service-prod-mail-dlq` alarm before suspecting this repo.
 - `/admin/*` accepts a passkey session cookie (1h, `internal/owner`) or the interim bearer
-  token (break-glass until auth-service-4; also bootstraps the first passkey). Passkeys bind
-  to the issuer host, so they only work on squawk.nathanblatter.com or localhost, never on the
-  execute-api URL. Locally `AUTH_ADMIN_TOKEN` is used as-is.
+  token (break-glass until auth-service-4; also bootstraps the first passkey). Owner passkeys
+  bind to the issuer's parent domain (`owner.RPIDFor`: nathanblatter.com in prod, localhost in
+  dev) so they also work on product login pages ("Sign in as owner", `/v1/login/owner/*`);
+  they never work on the execute-api URL. Locally `AUTH_ADMIN_TOKEN` is used as-is.
 - The console is `internal/httpapi/console.html`, embedded, vanilla JS, strict CSP. No build
   step; keep it that way.
 - Revoking a credential stops new token exchanges; already-issued 15-minute service tokens

@@ -162,8 +162,10 @@ A service with a login URL becomes a user pool: its own app signs people in with
 Google or an emailed 6-digit code through `/v1/users*` and `/v1/login/*` (service token), and
 gets ordinary OAuth tokens for them. `open_signup` decides whether anyone may create an
 account (the games) or only the owner may (the personal site). App-created passkey accounts
-verify their email with a code before they can sign in. See docs/API.md "End users" and
-docs/DESIGN.md "End users".
+verify their email with a code before they can sign in. The owner needs no account in any
+pool: owner passkeys bind to the parent domain, so every login page can offer "Sign in as
+owner" and get a token with `sub=owner`. See docs/API.md "End users" and docs/DESIGN.md
+"End users".
 
 ## Endpoints
 

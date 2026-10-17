@@ -673,7 +673,7 @@ func TestStepUp(t *testing.T) {
 }
 
 func TestUserPoolHTTP(t *testing.T) {
-	ts, _ := newServerWithStore(t, "https://auth.test")
+	ts, mem := newServerWithStore(t, "https://auth.test")
 	srv := lastServer
 	admin := "Bearer " + adminToken
 	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -752,6 +752,29 @@ func TestUserPoolHTTP(t *testing.T) {
 	}
 	if code, _ := do(t, "POST", ts.URL+"/v1/login/passkey/finish?challenge="+lb["challenge_id"].(string), svcTok, "application/json", `{"id":"junk"}`); code != 401 {
 		t.Fatalf("junk assertion: %d", code)
+	}
+
+	// Owner sign-in on the product's page: needs an owner passkey first.
+	if code, body := do(t, "POST", ts.URL+"/v1/login/owner/begin", svcTok, "application/json", `{"login_challenge":"`+lc+`"}`); code != 409 || body["error"] != "setup_required" {
+		t.Fatalf("owner begin without passkeys: %d %v", code, body)
+	}
+	_ = mem.PutPasskey(context.Background(), store.Passkey{ID: "abc", Name: "Seed", CreatedAt: time.Now(),
+		Data: []byte(`{"id":"YWJj","publicKey":"AAAA","attestationType":"none","flags":{},"authenticator":{}}`)})
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/owner/begin", svcTok, "application/json", `{"login_challenge":"nope"}`); code != 404 {
+		t.Fatalf("owner begin with bad challenge: %d", code)
+	}
+	code, ob := do(t, "POST", ts.URL+"/v1/login/owner/begin", svcTok, "application/json", `{"login_challenge":"`+lc+`"}`)
+	if code != 200 || ob["options"] == nil {
+		t.Fatalf("owner begin: %d %v", code, ob)
+	}
+	if pk := ob["options"].(map[string]any)["publicKey"].(map[string]any); pk["rpId"] != "auth.test" {
+		t.Fatalf("owner options rpId: %v", pk["rpId"])
+	}
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/owner/finish?challenge="+ob["challenge_id"].(string), svcTok, "application/json", `{"id":"junk"}`); code != 401 {
+		t.Fatalf("junk owner assertion: %d", code)
+	}
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/owner/finish?challenge=", svcTok, "application/json", `{"id":"junk"}`); code != 401 {
+		t.Fatalf("owner finish without challenge: %d", code)
 	}
 
 	// Google: disabled until configured.

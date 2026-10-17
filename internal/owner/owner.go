@@ -15,9 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -42,6 +44,7 @@ var (
 	ErrSessionInvalid  = errors.New("owner: session invalid")
 	ErrPasskeyNotFound = errors.New("owner: passkey not found")
 	ErrRecoveryInvalid = errors.New("owner: recovery code invalid or used")
+	ErrNoOrigins       = errors.New("owner: service has no origins configured")
 )
 
 // RecoveryCodeCount is how many codes a set contains.
@@ -50,22 +53,57 @@ const RecoveryCodeCount = 10
 // Owner wires WebAuthn to the store.
 type Owner struct {
 	Store store.Store
-	WA    *webauthn.WebAuthn
-	Now   func() time.Time
-	Log   *slog.Logger
+	// WA is the console's relying party: RPID plus the issuer origin.
+	WA  *webauthn.WebAuthn
+	Now func() time.Time
+	Log *slog.Logger
+
+	rpID string
+	mu   sync.Mutex
+	// was caches relying parties for owner sign-in on product login pages,
+	// keyed by their origin list. Same RP ID, different allowed origins.
+	was map[string]*webauthn.WebAuthn
 }
 
-// New configures WebAuthn for the issuer URL: the RP ID is its host and the
-// only allowed origin is the issuer itself.
+// New configures WebAuthn for the issuer URL. The RP ID is the issuer's
+// parent domain (see RPIDFor) so the owner's passkeys are usable from every
+// product on a sibling host; the console itself only accepts the issuer origin.
 func New(st store.Store, issuer string) (*Owner, error) {
 	u, err := url.Parse(issuer)
 	if err != nil || u.Host == "" {
 		return nil, fmt.Errorf("owner: issuer %q is not a URL", issuer)
 	}
+	rpID := RPIDFor(u.Hostname())
+	wa, err := newRP(rpID, []string{u.Scheme + "://" + u.Host})
+	if err != nil {
+		return nil, err
+	}
+	return &Owner{Store: st, WA: wa, Now: time.Now, Log: slog.Default(), rpID: rpID, was: map[string]*webauthn.WebAuthn{}}, nil
+}
+
+// RPIDFor picks the WebAuthn RP ID for an issuer host. A subdomain issuer
+// (squawk.nathanblatter.com) yields its parent (nathanblatter.com) so a passkey
+// registered in the console also asserts on the products' login pages, which
+// all live under the same parent. Two-label hosts, IPs and localhost are
+// used as they are. Nathan, 2026-10-16: one owner passkey for every service.
+func RPIDFor(host string) string {
+	if net.ParseIP(host) != nil {
+		return host
+	}
+	if parts := strings.Split(host, "."); len(parts) >= 3 {
+		return strings.Join(parts[1:], ".")
+	}
+	return host
+}
+
+// RPID is the relying party id the owner's passkeys are bound to.
+func (o *Owner) RPID() string { return o.rpID }
+
+func newRP(rpID string, origins []string) (*webauthn.WebAuthn, error) {
 	wa, err := webauthn.New(&webauthn.Config{
-		RPID:          u.Hostname(),
-		RPDisplayName: u.Hostname() + " admin",
-		RPOrigins:     []string{u.Scheme + "://" + u.Host},
+		RPID:          rpID,
+		RPDisplayName: rpID + " owner",
+		RPOrigins:     origins,
 		Timeouts: webauthn.TimeoutsConfig{
 			Login:        webauthn.TimeoutConfig{Enforce: true, Timeout: ChallengeTTL, TimeoutUVD: ChallengeTTL},
 			Registration: webauthn.TimeoutConfig{Enforce: true, Timeout: ChallengeTTL, TimeoutUVD: ChallengeTTL},
@@ -74,7 +112,30 @@ func New(st store.Store, issuer string) (*Owner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("owner: webauthn config: %w", err)
 	}
-	return &Owner{Store: st, WA: wa, Now: time.Now, Log: slog.Default()}, nil
+	return wa, nil
+}
+
+// rpFor returns the relying party that accepts assertions from a product's
+// login page: the owner's RP ID with that service's origins.
+func (o *Owner) rpFor(svc store.Service) (*webauthn.WebAuthn, error) {
+	if len(svc.Origins) == 0 {
+		return nil, ErrNoOrigins
+	}
+	key := strings.Join(svc.Origins, ",")
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if wa, ok := o.was[key]; ok {
+		return wa, nil
+	}
+	wa, err := newRP(o.rpID, svc.Origins)
+	if err != nil {
+		return nil, err
+	}
+	if o.was == nil {
+		o.was = map[string]*webauthn.WebAuthn{}
+	}
+	o.was[key] = wa
+	return wa, nil
 }
 
 // user adapts the owner to webauthn.User. The handle is a fixed opaque value:
@@ -204,9 +265,26 @@ func (o *Owner) FinishLogin(ctx context.Context, challengeID string, r *http.Req
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	u, keys, err := o.loadUser(ctx)
+	pk, err := o.verifyAssertion(ctx, o.WA, sess, r, "owner.login_denied")
 	if err != nil {
 		return "", time.Time{}, err
+	}
+	token, expires, err = o.openSession(ctx, "passkey", ip)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	o.audit(ctx, "owner.login", "pk="+pk, ip)
+	return token, expires, nil
+}
+
+// verifyAssertion checks a discoverable-login assertion against the owner's
+// passkeys with the given relying party, persists the sign counter and
+// returns the passkey id. Failures are audited under deniedKind.
+func (o *Owner) verifyAssertion(ctx context.Context, wa *webauthn.WebAuthn, sess webauthn.SessionData, r *http.Request, deniedKind string) (string, error) {
+	ip := clientIP(r)
+	u, keys, err := o.loadUser(ctx)
+	if err != nil {
+		return "", err
 	}
 	handler := func(rawID, userHandle []byte) (webauthn.User, error) {
 		if string(userHandle) != string(ownerHandle) {
@@ -219,34 +297,79 @@ func (o *Owner) FinishLogin(ctx context.Context, challengeID string, r *http.Req
 		}
 		return nil, errors.New("unknown credential")
 	}
-	cred, err := o.WA.FinishDiscoverableLogin(handler, sess, r)
+	cred, err := wa.FinishDiscoverableLogin(handler, sess, r)
 	if err != nil {
-		o.audit(ctx, "owner.login_denied", "webauthn: "+err.Error(), ip)
-		return "", time.Time{}, ErrCeremony
+		o.audit(ctx, deniedKind, "webauthn: "+err.Error(), ip)
+		return "", ErrCeremony
 	}
 	if cred.Authenticator.CloneWarning {
-		o.audit(ctx, "owner.login_denied", "clone warning on pk="+b64(cred.ID), ip)
-		return "", time.Time{}, ErrCeremony
+		o.audit(ctx, deniedKind, "clone warning on pk="+b64(cred.ID), ip)
+		return "", ErrCeremony
 	}
-	// Persist the updated sign counter.
 	for _, k := range keys {
 		if k.ID == b64(cred.ID) {
 			data, err := json.Marshal(cred)
 			if err != nil {
-				return "", time.Time{}, err
+				return "", err
 			}
 			k.Data = data
 			if err := o.Store.UpdatePasskey(ctx, k); err != nil {
-				return "", time.Time{}, err
+				return "", err
 			}
 		}
 	}
-	token, expires, err = o.openSession(ctx, "passkey", ip)
-	if err != nil {
-		return "", time.Time{}, err
+	return b64(cred.ID), nil
+}
+
+// ── owner sign-in on a product's login page ────────────────────────────────
+
+// BeginLoginFor starts an owner passkey assertion that a product's login page
+// will run for the parked authorization authzID. The options carry the
+// owner's RP ID; the service's origins are what the assertion must come from.
+func (o *Owner) BeginLoginFor(ctx context.Context, svc store.Service, authzID string) (*protocol.CredentialAssertion, string, error) {
+	if authzID == "" {
+		return nil, "", ErrCeremony
 	}
-	o.audit(ctx, "owner.login", "pk="+b64(cred.ID), ip)
-	return token, expires, nil
+	wa, err := o.rpFor(svc)
+	if err != nil {
+		return nil, "", err
+	}
+	has, err := o.HasPasskeys(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	if !has {
+		return nil, "", ErrNoPasskeys
+	}
+	opts, sess, err := wa.BeginDiscoverableLogin(webauthn.WithUserVerification(protocol.VerificationRequired))
+	if err != nil {
+		return nil, "", err
+	}
+	id, err := o.saveChallengeFor(ctx, challenge{Session: sess, ServiceID: svc.ID, AuthzID: authzID})
+	return opts, id, err
+}
+
+// FinishLoginFor verifies the assertion from the product's page and returns
+// the authorization id the ceremony was started for. It opens no console
+// session: the caller completes the OAuth request as the owner instead.
+func (o *Owner) FinishLoginFor(ctx context.Context, svc store.Service, challengeID string, r *http.Request) (string, error) {
+	ch, err := o.loadChallengeFor(ctx, challengeID)
+	if err != nil {
+		return "", err
+	}
+	if ch.ServiceID != svc.ID || ch.AuthzID == "" || ch.Session == nil {
+		return "", ErrCeremony
+	}
+	wa, err := o.rpFor(svc)
+	if err != nil {
+		return "", err
+	}
+	pk, err := o.verifyAssertion(ctx, wa, *ch.Session, r, "owner.login_denied")
+	if err != nil {
+		return "", err
+	}
+	o.audit(ctx, "owner.login", "pk="+pk+" service="+svc.ID, clientIP(r))
+	return ch.AuthzID, nil
 }
 
 func (o *Owner) openSession(ctx context.Context, method, ip string) (string, time.Time, error) {
@@ -281,37 +404,9 @@ func (o *Owner) FinishStepUp(ctx context.Context, challengeID, sessionToken stri
 	if err != nil {
 		return err
 	}
-	u, keys, err := o.loadUser(ctx)
+	pk, err := o.verifyAssertion(ctx, o.WA, sess, r, "owner.stepup_denied")
 	if err != nil {
 		return err
-	}
-	handler := func(rawID, userHandle []byte) (webauthn.User, error) {
-		if string(userHandle) != string(ownerHandle) {
-			return nil, errors.New("unknown user handle")
-		}
-		for _, c := range u.creds {
-			if string(c.ID) == string(rawID) {
-				return u, nil
-			}
-		}
-		return nil, errors.New("unknown credential")
-	}
-	cred, err := o.WA.FinishDiscoverableLogin(handler, sess, r)
-	if err != nil || cred.Authenticator.CloneWarning {
-		o.audit(ctx, "owner.stepup_denied", "webauthn", ip)
-		return ErrCeremony
-	}
-	for _, k := range keys {
-		if k.ID == b64(cred.ID) {
-			data, err := json.Marshal(cred)
-			if err != nil {
-				return err
-			}
-			k.Data = data
-			if err := o.Store.UpdatePasskey(ctx, k); err != nil {
-				return err
-			}
-		}
 	}
 	if err := o.Store.TouchSessionVerified(ctx, hash(sessionToken), o.Now()); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -319,7 +414,7 @@ func (o *Owner) FinishStepUp(ctx context.Context, challengeID, sessionToken stri
 		}
 		return err
 	}
-	o.audit(ctx, "owner.stepup", "pk="+b64(cred.ID), ip)
+	o.audit(ctx, "owner.stepup", "pk="+pk, ip)
 	return nil
 }
 
@@ -456,8 +551,22 @@ func (o *Owner) Logout(ctx context.Context, token string) error {
 	return o.Store.DeleteSession(ctx, hash(token))
 }
 
+// challenge is what a CHALLENGE# row holds for the owner: the WebAuthn session
+// and, for a sign-in started from a product's login page, which service and
+// parked authorization it belongs to. Console ceremonies leave those empty,
+// so a challenge minted for a product can never open a console session.
+type challenge struct {
+	Session   *webauthn.SessionData `json:"session"`
+	ServiceID string                `json:"service_id,omitempty"`
+	AuthzID   string                `json:"authz_id,omitempty"`
+}
+
 func (o *Owner) saveChallenge(ctx context.Context, sess *webauthn.SessionData) (string, error) {
-	data, err := json.Marshal(sess)
+	return o.saveChallengeFor(ctx, challenge{Session: sess})
+}
+
+func (o *Owner) saveChallengeFor(ctx context.Context, ch challenge) (string, error) {
+	data, err := json.Marshal(ch)
 	if err != nil {
 		return "", err
 	}
@@ -465,22 +574,34 @@ func (o *Owner) saveChallenge(ctx context.Context, sess *webauthn.SessionData) (
 	return id, o.Store.PutChallenge(ctx, id, data, o.Now().Add(ChallengeTTL))
 }
 
+// loadChallenge consumes a console ceremony's challenge.
 func (o *Owner) loadChallenge(ctx context.Context, id string) (webauthn.SessionData, error) {
-	if id == "" {
-		return webauthn.SessionData{}, ErrCeremony
-	}
-	data, err := o.Store.ConsumeChallenge(ctx, id, o.Now())
-	if errors.Is(err, store.ErrNotFound) {
-		return webauthn.SessionData{}, ErrCeremony
-	}
+	ch, err := o.loadChallengeFor(ctx, id)
 	if err != nil {
 		return webauthn.SessionData{}, err
 	}
-	var sess webauthn.SessionData
-	if err := json.Unmarshal(data, &sess); err != nil {
+	if ch.ServiceID != "" || ch.Session == nil {
 		return webauthn.SessionData{}, ErrCeremony
 	}
-	return sess, nil
+	return *ch.Session, nil
+}
+
+func (o *Owner) loadChallengeFor(ctx context.Context, id string) (challenge, error) {
+	if id == "" {
+		return challenge{}, ErrCeremony
+	}
+	data, err := o.Store.ConsumeChallenge(ctx, id, o.Now())
+	if errors.Is(err, store.ErrNotFound) {
+		return challenge{}, ErrCeremony
+	}
+	if err != nil {
+		return challenge{}, err
+	}
+	var ch challenge
+	if err := json.Unmarshal(data, &ch); err != nil {
+		return challenge{}, ErrCeremony
+	}
+	return ch, nil
 }
 
 func (o *Owner) audit(ctx context.Context, kind, detail, ip string) {

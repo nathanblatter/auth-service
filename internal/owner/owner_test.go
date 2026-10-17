@@ -39,6 +39,82 @@ func TestConfigFromIssuer(t *testing.T) {
 	}
 }
 
+func TestRPIDFor(t *testing.T) {
+	cases := map[string]string{
+		"squawk.nathanblatter.com": "nathanblatter.com",
+		"auth.test":                "auth.test",
+		"localhost":                "localhost",
+		"127.0.0.1":                "127.0.0.1",
+		"a.b.c.example.com":        "b.c.example.com",
+	}
+	for host, want := range cases {
+		if got := RPIDFor(host); got != want {
+			t.Errorf("RPIDFor(%q) = %q, want %q", host, got, want)
+		}
+	}
+	o, err := New(store.NewMemory(), "https://squawk.nathanblatter.com")
+	if err != nil || o.RPID() != "nathanblatter.com" || o.WA.Config.RPID != "nathanblatter.com" ||
+		o.WA.Config.RPOrigins[0] != "https://squawk.nathanblatter.com" {
+		t.Fatalf("subdomain issuer: %v %+v", err, o.WA.Config)
+	}
+}
+
+func TestLoginForService(t *testing.T) {
+	o, mem := newOwner(t)
+	ctx := context.Background()
+	svc := store.Service{ID: "svc_1", Origins: []string{"https://site.test"}}
+	if _, _, err := o.BeginLoginFor(ctx, store.Service{ID: "svc_0"}, "authz1"); !errors.Is(err, ErrNoOrigins) {
+		t.Fatalf("service without origins: %v", err)
+	}
+	if _, _, err := o.BeginLoginFor(ctx, svc, "authz1"); !errors.Is(err, ErrNoPasskeys) {
+		t.Fatalf("no passkeys: %v", err)
+	}
+	_ = mem.PutPasskey(ctx, store.Passkey{ID: "abc", Name: "Seed", CreatedAt: o.Now(),
+		Data: []byte(`{"id":"YWJj","publicKey":"AAAA","attestationType":"none","flags":{},"authenticator":{}}`)})
+	if _, _, err := o.BeginLoginFor(ctx, svc, ""); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("empty authz: %v", err)
+	}
+	opts, chID, err := o.BeginLoginFor(ctx, svc, "authz1")
+	if err != nil || chID == "" {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(opts)
+	if !strings.Contains(string(raw), `"rpId":"auth.test"`) || !strings.Contains(string(raw), `"userVerification":"required"`) {
+		t.Fatalf("assertion options: %s", raw)
+	}
+	// A product challenge can never open a console session.
+	req := httptest.NewRequest("POST", "/", strings.NewReader(`{"id":"x"}`))
+	if _, _, err := o.FinishLogin(ctx, chID, req); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("console finish with product challenge: %v", err)
+	}
+	// ...and it was consumed by that attempt.
+	req = httptest.NewRequest("POST", "/", strings.NewReader(`{"id":"x"}`))
+	if _, err := o.FinishLoginFor(ctx, svc, chID, req); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("replayed: %v", err)
+	}
+	// Wrong service for the challenge.
+	_, chID, _ = o.BeginLoginFor(ctx, svc, "authz2")
+	req = httptest.NewRequest("POST", "/", strings.NewReader(`{"id":"x"}`))
+	if _, err := o.FinishLoginFor(ctx, store.Service{ID: "svc_2", Origins: svc.Origins}, chID, req); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("other service: %v", err)
+	}
+	// Garbage assertion is denied and audited.
+	_, chID, _ = o.BeginLoginFor(ctx, svc, "authz3")
+	req = httptest.NewRequest("POST", "/", strings.NewReader(`{"id":"x"}`))
+	if _, err := o.FinishLoginFor(ctx, svc, chID, req); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("garbage assertion: %v", err)
+	}
+	if n := len(mem.Audit); n == 0 || mem.Audit[n-1].Kind != "owner.login_denied" {
+		t.Fatalf("denied login not audited: %+v", mem.Audit)
+	}
+	// Relying parties are cached per origin set.
+	a, _ := o.rpFor(svc)
+	b, _ := o.rpFor(svc)
+	if a != b {
+		t.Fatal("rpFor not cached")
+	}
+}
+
 func TestRegistrationOptions(t *testing.T) {
 	o, _ := newOwner(t)
 	ctx := context.Background()

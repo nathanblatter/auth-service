@@ -321,9 +321,20 @@ func (s *Server) Pending(ctx context.Context, id string) (PendingApproval, error
 	return PendingApproval{ID: a.ID, ClientName: name, ClientID: c.ID, Service: svc, Scope: a.Scope, Resource: a.Resource, ExpiresAt: a.ExpiresAt}, nil
 }
 
-// Approve issues a code for a pending request as the owner and returns the
-// redirect URL for the browser.
+// Approve issues a code for a pending request as the owner (console approval)
+// and returns the redirect URL for the browser.
 func (s *Server) Approve(ctx context.Context, id string, ip string) (string, error) {
+	return s.completeForOwner(ctx, id, "console", ip)
+}
+
+// CompleteForOwner finishes a pending authorization for the owner, who just
+// proved an owner passkey on the product's own login page. The owner gets the
+// request's full (catalog-checked) scope: there is no role to narrow to.
+func (s *Server) CompleteForOwner(ctx context.Context, authzID string, ip string) (string, error) {
+	return s.completeForOwner(ctx, authzID, "login", ip)
+}
+
+func (s *Server) completeForOwner(ctx context.Context, id, via, ip string) (string, error) {
 	a, err := s.Store.GetAuthzRequest(ctx, id, s.Now())
 	if err != nil {
 		return "", err
@@ -338,7 +349,7 @@ func (s *Server) Approve(ctx context.Context, id string, ip string) (string, err
 	}); err != nil {
 		return "", err
 	}
-	s.audit(ctx, "oauth.approve", "owner", a.ServiceID, "client="+a.ClientID+" scope="+a.Scope, ip)
+	s.audit(ctx, "oauth.approve", "owner", a.ServiceID, "client="+a.ClientID+" scope="+a.Scope+" via="+via, ip)
 	return RedirectWith(a.RedirectURI, url.Values{"code": {code}, "state": {a.State}})
 }
 

@@ -24,6 +24,14 @@ No account linking: an account created with Google signs in only with Google.
 **DECIDED:** customers of each product are separate pools. Nathan himself has one owner
 identity that spans every tenant.
 
+**DECIDED (Nathan, 2026-10-16): the owner signs in to every product with the owner passkey.**
+Owner passkeys bind to the issuer's parent domain (`nathanblatter.com`), so they assert on any
+product login page under it. Each product page offers "Sign in as owner", which drives
+`/v1/login/owner/*`; the resulting tokens carry `sub=owner`, the same subject connector
+approvals already use, and the request's full scope. Rejected alternatives: a Squawk-hosted
+login page (reverses "the app owns the screen"), and provisioning the owner as an ordinary
+user in each pool (two identities for one person, and no passkey transfer).
+
 **Rejected (Nathan, 2026-10-15):** billing/entitlements inside auth; a separate AWS
 staging environment.
 
@@ -61,8 +69,10 @@ remains as break-glass until auth-service-4; see "Owner and the admin console".
 
 The owner (Nathan) is the one cross-tenant identity. He authenticates to the console with a
 **passkey** (WebAuthn, resident key, user verification required), implemented with
-`go-webauthn`. The RP ID is the issuer's host, so passkeys only work on
-`squawk.nathanblatter.com` (or `localhost` in dev); the execute-api URL cannot register them.
+`go-webauthn`. The RP ID is the issuer's **parent domain** (`squawk.nathanblatter.com` →
+`nathanblatter.com`, `owner.RPIDFor`), so the same passkey asserts in the console and on every
+product login page under that domain; two-label hosts and `localhost` are used as they are.
+The console accepts only the issuer origin; the execute-api URL cannot register passkeys.
 
 - `GET /admin` serves the console: one embedded HTML file, no build step, strict CSP.
 - Ceremony state (`webauthn.SessionData`) lives in the table under `CHALLENGE#<id>` for
@@ -240,6 +250,12 @@ same email is a stranger.
    - **Email code:** app backend calls `POST /v1/login/email/begin` `{login_challenge, email}`
      (a code is mailed), then `POST /v1/login/email/finish?challenge=` `{code}` →
      `{redirect_to}`, exactly like the passkey finish.
+   - **Owner:** `POST /v1/login/owner/begin` `{login_challenge}` → assertion options for the
+     *owner's* RP ID (the parent domain) accepted from the service's `origins`; the browser runs
+     `navigator.credentials.get`; `POST /v1/login/owner/finish?challenge=` → `{redirect_to}`.
+     The authorization completes with `sub=owner` and the request's full scope. The challenge
+     row records the service and parked authorization, so it can never open a console session,
+     and a console challenge can never finish a product sign-in.
 4. App exchanges the code at `/oauth/token`; refresh as usual.
 
 WebAuthn is bound to the **app's** origin, not ours: each user-pool service declares `rp_id`
@@ -249,8 +265,8 @@ as for the owner.
 
 ### Tokens for users
 
-`sub = usr:<id>`, `aud = <service id>`, `scope` = requested ∩ allowed, `client_id`, plus
-`email` when known. **Allowed** for a user = the union of the scopes of the user's roles; new
+`sub = usr:<id>` (or `owner` when the owner signed in), `aud = <service id>`, `scope` =
+requested ∩ allowed, `client_id`, plus `email` when known. **Allowed** for a user = the union of the scopes of the user's roles; new
 users get the service's `default_roles`. Refresh tokens carry `sub` and honour a per-user
 `sessions_not_before` (log out everywhere, auth-service-11, applied per user).
 
@@ -291,7 +307,7 @@ responsible for confirming the user's intent (and its own step-up) before callin
 | Claim | Value |
 |---|---|
 | `iss` | `https://squawk.nathanblatter.com` (from `AUTH_ISSUER`) |
-| `sub` | `svc:<service_id>` for service tokens; `usr:<user_id>` later |
+| `sub` | `svc:<service_id>` for service tokens; `usr:<user_id>` for end users; `owner` for the owner (connector approvals and owner sign-in) |
 | `aud` | the service id the token is for; for service tokens, `auth` (the auth API itself) |
 | `scope` | space-separated scopes |
 | `iat`, `exp`, `jti` | standard |

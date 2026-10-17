@@ -10,6 +10,7 @@ import (
 
 	"github.com/nathanblatter/squawk/internal/core"
 	"github.com/nathanblatter/squawk/internal/oauth"
+	"github.com/nathanblatter/squawk/internal/owner"
 	"github.com/nathanblatter/squawk/internal/ratelimit"
 	"github.com/nathanblatter/squawk/internal/store"
 	"github.com/nathanblatter/squawk/internal/users"
@@ -32,6 +33,8 @@ func (s *Server) userRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/users/{id}/passkeys/finish", s.requireService(s.userPasskeyFinish))
 	mux.HandleFunc("POST /v1/login/passkey/begin", s.requireService(s.loginPasskeyBegin))
 	mux.HandleFunc("POST /v1/login/passkey/finish", s.requireService(s.loginPasskeyFinish))
+	mux.HandleFunc("POST /v1/login/owner/begin", s.requireService(s.loginOwnerBegin))
+	mux.HandleFunc("POST /v1/login/owner/finish", s.requireService(s.loginOwnerFinish))
 	mux.HandleFunc("POST /v1/login/passkey/activate/begin", s.requireService(s.loginPasskeyActivateBegin))
 	mux.HandleFunc("POST /v1/login/passkey/activate/finish", s.requireService(s.loginPasskeyActivateFinish))
 	mux.HandleFunc("POST /v1/login/email/begin", s.requireService(s.loginEmailBegin))
@@ -339,6 +342,71 @@ func (s *Server) loginPasskeyFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"redirect_to": loc, "user": userJSON(user)})
+}
+
+// loginOwnerBegin starts an owner passkey sign-in on a product's login page:
+// the owner's RP ID with the service's origins, bound to the parked authz.
+func (s *Server) loginOwnerBegin(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		LoginChallenge string `json:"login_challenge"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if !s.pendingFor(w, r, svc, in.LoginChallenge) {
+		return
+	}
+	opts, chID, err := s.Owner.BeginLoginFor(r.Context(), svc, in.LoginChallenge)
+	switch {
+	case errors.Is(err, owner.ErrNoPasskeys):
+		writeJSON(w, 409, map[string]string{"error": "setup_required", "detail": "the owner has no passkey registered"})
+		return
+	case errors.Is(err, owner.ErrNoOrigins):
+		writeJSON(w, 409, map[string]string{"error": "service_not_configured", "detail": err.Error()})
+		return
+	case err != nil:
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"challenge_id": chID, "options": opts})
+}
+
+// loginOwnerFinish verifies the owner's assertion and completes the parked
+// authorization with sub=owner.
+func (s *Server) loginOwnerFinish(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	ipKey := "login:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, ipKey) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
+	authzID, err := s.Owner.FinishLoginFor(r.Context(), svc, r.URL.Query().Get("challenge"), r)
+	if errors.Is(err, owner.ErrCeremony) {
+		s.Limit.Fail(r.Context(), ratelimit.LoginIP, ipKey)
+		writeJSON(w, 401, map[string]string{"error": "passkey_rejected"})
+		return
+	}
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	loc, err := s.OAuth.CompleteForOwner(r.Context(), authzID, clientIP(r))
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "login_challenge expired; start over"})
+		return
+	}
+	if s.oauthFail(w, err) {
+		return
+	}
+	writeJSON(w, 200, map[string]any{"redirect_to": loc, "subject": oauth.OwnerSubject})
 }
 
 // googleStart is hit by the browser from the product's login page.
