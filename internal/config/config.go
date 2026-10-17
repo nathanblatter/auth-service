@@ -11,7 +11,7 @@ import (
 
 // Config is the fully resolved runtime configuration.
 type Config struct {
-	// Issuer is the public base URL, e.g. https://auth.nathanblatter.com.
+	// Issuer is the public base URL, e.g. https://squawk.nathanblatter.com.
 	Issuer string
 	// Table is the DynamoDB table name.
 	Table string

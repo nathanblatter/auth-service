@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/core"
-	"github.com/nathanblatter/auth-service/internal/oauth"
-	"github.com/nathanblatter/auth-service/internal/ratelimit"
-	"github.com/nathanblatter/auth-service/internal/store"
-	"github.com/nathanblatter/auth-service/internal/users"
+	"github.com/nathanblatter/squawk/internal/core"
+	"github.com/nathanblatter/squawk/internal/oauth"
+	"github.com/nathanblatter/squawk/internal/ratelimit"
+	"github.com/nathanblatter/squawk/internal/store"
+	"github.com/nathanblatter/squawk/internal/users"
 )
 
 // Slice 3: end-user accounts and login, driven by a product's backend with

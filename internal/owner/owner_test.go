@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/squawk/internal/store"
 )
 
 func newOwner(t *testing.T) (*Owner, *store.Memory) {

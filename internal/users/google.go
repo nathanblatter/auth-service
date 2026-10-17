@@ -18,7 +18,7 @@ import (
 type Google struct {
 	ClientID     string
 	ClientSecret string
-	RedirectURL  string // https://auth.nathanblatter.com/v1/login/google/callback
+	RedirectURL  string // https://squawk.nathanblatter.com/v1/login/google/callback
 	// Endpoints are overridable for tests.
 	AuthURL     string
 	TokenURL    string

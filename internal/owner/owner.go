@@ -1,5 +1,5 @@
 // Package owner is Nathan's cross-tenant identity: the single account that
-// administers the auth service. It authenticates with passkeys (WebAuthn) and
+// administers Squawk. It authenticates with passkeys (WebAuthn) and
 // holds short console sessions. Everything here is single-owner by design;
 // per-product users live elsewhere.
 package owner
@@ -23,7 +23,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 
-	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/squawk/internal/store"
 )
 
 const (

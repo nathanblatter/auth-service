@@ -1,4 +1,4 @@
-// Command api is the auth-service HTTP API. Inside Lambda it serves API
+// Command api is the Squawk HTTP API. Inside Lambda it serves API
 // Gateway v2 events; anywhere else it listens on $PORT.
 package main
 
@@ -21,16 +21,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/awslabs/aws-lambda-go-api-proxy/httpadapter"
 
-	"github.com/nathanblatter/auth-service/internal/config"
-	"github.com/nathanblatter/auth-service/internal/core"
-	"github.com/nathanblatter/auth-service/internal/httpapi"
-	"github.com/nathanblatter/auth-service/internal/mailqueue"
-	"github.com/nathanblatter/auth-service/internal/oauth"
-	"github.com/nathanblatter/auth-service/internal/owner"
-	"github.com/nathanblatter/auth-service/internal/ratelimit"
-	"github.com/nathanblatter/auth-service/internal/signer"
-	"github.com/nathanblatter/auth-service/internal/store"
-	"github.com/nathanblatter/auth-service/internal/users"
+	"github.com/nathanblatter/squawk/internal/config"
+	"github.com/nathanblatter/squawk/internal/core"
+	"github.com/nathanblatter/squawk/internal/httpapi"
+	"github.com/nathanblatter/squawk/internal/mailqueue"
+	"github.com/nathanblatter/squawk/internal/oauth"
+	"github.com/nathanblatter/squawk/internal/owner"
+	"github.com/nathanblatter/squawk/internal/ratelimit"
+	"github.com/nathanblatter/squawk/internal/signer"
+	"github.com/nathanblatter/squawk/internal/store"
+	"github.com/nathanblatter/squawk/internal/users"
 )
 
 // version is set by the Makefile via -ldflags.
@@ -44,7 +44,7 @@ func main() {
 		log.Error("startup failed", "err", err)
 		os.Exit(1)
 	}
-	log.Info("auth-service starting", "version", version, "config", cfg.String(), "lambda", config.InLambda())
+	log.Info("squawk starting", "version", version, "config", cfg.String(), "lambda", config.InLambda())
 
 	if config.InLambda() {
 		lambda.Start(httpadapter.NewV2(handler).ProxyWithContext)

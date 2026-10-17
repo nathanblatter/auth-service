@@ -1,4 +1,4 @@
-// Package client is the Go SDK for auth.nathanblatter.com. It has no
+// Package client is the Go SDK for squawk.nathanblatter.com. It has no
 // dependencies beyond the standard library so any service can pull it in
 // without inheriting the server's AWS modules.
 //
@@ -11,10 +11,10 @@
 //
 // Typical wiring:
 //
-//	v := client.NewVerifier("https://auth.nathanblatter.com", "auth")
+//	v := client.NewVerifier("https://squawk.nathanblatter.com", "auth")
 //	mux.Handle("/api/", client.RequireToken(v)(apiHandler))
 //
-//	c := client.NewClient("https://auth.nathanblatter.com", serviceID, credential)
+//	c := client.NewClient("https://squawk.nathanblatter.com", serviceID, credential)
 //	tok, err := c.Token(ctx)
 package client
 
@@ -273,7 +273,7 @@ func RequireToken(v *Verifier) func(http.Handler) http.Handler {
 }
 
 // WithResource declares the RFC 8707 resource identifier this service is
-// known by at the auth service (for example "https://finforge.nathanblatter.com/mcp").
+// known by at Squawk (for example "https://finforge.nathanblatter.com/mcp").
 // It enables ProtectedResourceMetadata and the resource_metadata hint on 401s.
 func WithResource(resource string) VerifierOption {
 	return func(v *Verifier) { v.resource = strings.TrimRight(resource, "/") }

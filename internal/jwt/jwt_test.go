@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/signer"
+	"github.com/nathanblatter/squawk/internal/signer"
 )
 
 func newRing(t *testing.T, kids ...string) *signer.Ring {

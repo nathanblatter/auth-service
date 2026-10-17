@@ -1,4 +1,4 @@
-// Package mailqueue is the outbox: auth-service never talks SMTP or to a
+// Package mailqueue is the outbox: Squawk never talks SMTP or to a
 // provider. It drops {to, subject, text} on an SQS queue that the email-api
 // bridge on Nathan's Mac mini drains and turns into keyed /send calls, so
 // every message still leaves through email-api with an actor on it.

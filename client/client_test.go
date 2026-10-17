@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// fakeIssuer is a stand-in auth service: it signs tokens with its own keys,
+// fakeIssuer is a stand-in Squawk: it signs tokens with its own keys,
 // serves JWKS, and answers /v1/token.
 type fakeIssuer struct {
 	keys       map[string]*ecdsa.PrivateKey

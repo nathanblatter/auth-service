@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/core"
-	"github.com/nathanblatter/auth-service/internal/signer"
-	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/squawk/internal/core"
+	"github.com/nathanblatter/squawk/internal/signer"
+	"github.com/nathanblatter/squawk/internal/store"
 )
 
 func newServer(t *testing.T) (*Server, *store.Memory, store.Service) {

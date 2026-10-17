@@ -1,11 +1,11 @@
-# auth-service Go client
+# Squawk Go client
 
-Standard library only. `go get github.com/nathanblatter/auth-service/client`
+Standard library only. `go get github.com/nathanblatter/squawk/client`
 
 ## Protect your endpoints
 
 ```go
-v := client.NewVerifier("https://auth.nathanblatter.com", "<your service id>")
+v := client.NewVerifier("https://squawk.nathanblatter.com", "<your service id>")
 
 mux.Handle("GET /api/things", client.RequireToken(v)(handler))
 mux.Handle("POST /api/things", client.RequireToken(v)(client.RequireScope("write")(handler)))
@@ -23,7 +23,7 @@ keeps serving cached keys.
 ## Expose an MCP connector (what Claude's phone app needs)
 
 ```go
-v := client.NewVerifier("https://auth.nathanblatter.com", serviceID,
+v := client.NewVerifier("https://squawk.nathanblatter.com", serviceID,
     client.WithResource("https://finforge.nathanblatter.com/mcp"))
 
 mux.Handle("GET /.well-known/oauth-protected-resource/mcp", client.ProtectedResourceMetadata(v, "FinForge", []string{"read"}))
@@ -31,14 +31,14 @@ mux.Handle("/mcp", client.RequireToken(v)(mcpHandler))
 ```
 
 Register the same resource URL on the service in the admin console. Claude reads the metadata,
-registers itself at the auth service, you approve once with your passkey, and tokens flow.
+registers itself at Squawk, you approve once with your passkey, and tokens flow.
 
 ## Call the auth API (or another service) as your service
 
 ```go
-c := client.NewClient("https://auth.nathanblatter.com", serviceID, os.Getenv("AUTH_CREDENTIAL"))
+c := client.NewClient("https://squawk.nathanblatter.com", serviceID, os.Getenv("AUTH_CREDENTIAL"))
 
-req, _ := http.NewRequestWithContext(ctx, "GET", "https://auth.nathanblatter.com/v1/me", nil)
+req, _ := http.NewRequestWithContext(ctx, "GET", "https://squawk.nathanblatter.com/v1/me", nil)
 if err := c.Authorize(ctx, req); err != nil { ... }
 ```
 

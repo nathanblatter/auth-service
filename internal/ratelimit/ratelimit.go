@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/squawk/internal/store"
 )
 
 // Policy is a limit over a window.

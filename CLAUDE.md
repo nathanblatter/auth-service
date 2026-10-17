@@ -1,4 +1,7 @@
-# auth-service
+# Squawk
+
+Squawk (renamed from auth-service 2026-10-16; AWS stack/resource names and the flightdeck slug
+`auth-service` deliberately keep the old name, see README "A note on names").
 
 VISION (Nathan, 2026-10-15): auth as a service for all of Nathan's products, "my own Okta":
 spin up a service, mint a token for it, and have auth out of the box. Rock solid and ready
@@ -42,7 +45,7 @@ Custom domain: repo vars `AUTH_DOMAIN_NAME` + `AUTH_CERTIFICATE_ARN`; empty = ex
 - Sign in with Google is off until `vars.AUTH_GOOGLE_CLIENT_ID` is set in the repo AND the
   client secret sits in SSM `/auth-service/prod/google-client-secret` (SecureString). The
   Lambda logs and keeps running without it. Redirect URI to register at Google:
-  `https://auth.nathanblatter.com/v1/login/google/callback`.
+  `https://squawk.nathanblatter.com/v1/login/google/callback`.
 - Email codes and verification are off until `AUTH_MAIL_QUEUE_URL` is set (the template sets
   it to `MailQueue`). The Lambda only enqueues; email-api's `sqs-bridge` on the Mac mini
   (repo `~/dev/email-api`, compose service `bridge`) drains the queue with the `MailBridgeUser`
@@ -50,7 +53,7 @@ Custom domain: repo vars `AUTH_DOMAIN_NAME` + `AUTH_CERTIFICATE_ARN`; empty = ex
   container and the `auth-service-prod-mail-dlq` alarm before suspecting this repo.
 - `/admin/*` accepts a passkey session cookie (1h, `internal/owner`) or the interim bearer
   token (break-glass until auth-service-4; also bootstraps the first passkey). Passkeys bind
-  to the issuer host, so they only work on auth.nathanblatter.com or localhost, never on the
+  to the issuer host, so they only work on squawk.nathanblatter.com or localhost, never on the
   execute-api URL. Locally `AUTH_ADMIN_TOKEN` is used as-is.
 - The console is `internal/httpapi/console.html`, embedded, vanilla JS, strict CSP. No build
   step; keep it that way.

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/signer"
-	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/squawk/internal/signer"
+	"github.com/nathanblatter/squawk/internal/store"
 )
 
 func newCore(t *testing.T) (*Core, *store.Memory) {

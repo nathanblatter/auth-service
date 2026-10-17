@@ -1,4 +1,4 @@
-# auth-service design
+# Squawk design
 
 Status: living document. Decisions marked **DECIDED** came from Nathan (see flightdeck
 project `auth-service`). Everything marked *proposed* is the implementer's call and can be
@@ -10,7 +10,7 @@ Auth as a service for every one of Nathan's products: FinForge, Flightdeck, emai
 AI Therapist, Journal, future apps. A product registers as a **service**, gets a credential,
 and has production-grade auth without writing any of it. "My own Okta."
 
-**DECIDED:** headless API at `https://auth.nathanblatter.com`. Products render their own
+**DECIDED:** headless API at `https://squawk.nathanblatter.com`. Products render their own
 screens and call the API. The only UI this project ships is a passkey-protected admin
 console for minting and managing service credentials.
 
@@ -62,7 +62,7 @@ remains as break-glass until auth-service-4; see "Owner and the admin console".
 The owner (Nathan) is the one cross-tenant identity. He authenticates to the console with a
 **passkey** (WebAuthn, resident key, user verification required), implemented with
 `go-webauthn`. The RP ID is the issuer's host, so passkeys only work on
-`auth.nathanblatter.com` (or `localhost` in dev); the execute-api URL cannot register them.
+`squawk.nathanblatter.com` (or `localhost` in dev); the execute-api URL cannot register them.
 
 - `GET /admin` serves the console: one embedded HTML file, no build step, strict CSP.
 - Ceremony state (`webauthn.SessionData`) lives in the table under `CHALLENGE#<id>` for
@@ -254,7 +254,7 @@ Service row gains `login_url`, `rp_id`, `origins`, `default_roles`.
 Config: `AUTH_GOOGLE_CLIENT_ID` (template parameter) and the client secret in SSM
 `/auth-service/prod/google-client-secret`, read at cold start like the admin token hash.
 Nathan creates the OAuth client in Google Cloud Console with redirect URI
-`https://auth.nathanblatter.com/v1/login/google/callback`. We request `openid email profile`,
+`https://squawk.nathanblatter.com/v1/login/google/callback`. We request `openid email profile`,
 verify `email_verified`, and key the identity on Google's stable `sub`. The state parameter is
 the `login_challenge` plus a random nonce stored in the challenge row. Apple follows the same
 provider interface when Nathan buys the developer account.
@@ -274,7 +274,7 @@ responsible for confirming the user's intent (and its own step-up) before callin
 
 | Claim | Value |
 |---|---|
-| `iss` | `https://auth.nathanblatter.com` (from `AUTH_ISSUER`) |
+| `iss` | `https://squawk.nathanblatter.com` (from `AUTH_ISSUER`) |
 | `sub` | `svc:<service_id>` for service tokens; `usr:<user_id>` later |
 | `aud` | the service id the token is for; for service tokens, `auth` (the auth API itself) |
 | `scope` | space-separated scopes |
@@ -361,7 +361,7 @@ locally with `make dev`. No framework; `net/http` with Go 1.22+ pattern routing.
 
 `nathanblatter.com` is on Cloudflare, so Route 53 from the reference diagram is not used
 (*proposed*: nothing to gain from a second DNS host). An ACM certificate for
-`auth.nathanblatter.com` is DNS-validated with a CNAME in Cloudflare, and a second CNAME
+`squawk.nathanblatter.com` is DNS-validated with a CNAME in Cloudflare, and a second CNAME
 points the hostname at the API Gateway custom domain. Cloudflare proxy stays off (grey
 cloud) so TLS terminates at API Gateway with the ACM cert.
 

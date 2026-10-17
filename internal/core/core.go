@@ -19,9 +19,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/jwt"
-	"github.com/nathanblatter/auth-service/internal/signer"
-	"github.com/nathanblatter/auth-service/internal/store"
+	"github.com/nathanblatter/squawk/internal/jwt"
+	"github.com/nathanblatter/squawk/internal/signer"
+	"github.com/nathanblatter/squawk/internal/store"
 )
 
 const (

@@ -1,3 +1,3 @@
-module github.com/nathanblatter/auth-service/client
+module github.com/nathanblatter/squawk/client
 
 go 1.26

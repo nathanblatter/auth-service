@@ -7,12 +7,12 @@ Description: >
 Parameters:
   Issuer:
     Type: String
-    Default: https://auth.nathanblatter.com
+    Default: https://squawk.nathanblatter.com
     Description: Public base URL, also the JWT iss claim.
   DomainName:
     Type: String
     Default: ""
-    Description: Custom domain (auth.nathanblatter.com). Empty = execute-api URL only.
+    Description: Custom domain (squawk.nathanblatter.com). Empty = execute-api URL only.
   CertificateArn:
     Type: String
     Default: ""

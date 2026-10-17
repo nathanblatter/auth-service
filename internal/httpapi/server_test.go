@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/core"
-	"github.com/nathanblatter/auth-service/internal/oauth"
-	"github.com/nathanblatter/auth-service/internal/owner"
-	"github.com/nathanblatter/auth-service/internal/ratelimit"
-	"github.com/nathanblatter/auth-service/internal/signer"
-	"github.com/nathanblatter/auth-service/internal/store"
-	"github.com/nathanblatter/auth-service/internal/users"
+	"github.com/nathanblatter/squawk/internal/core"
+	"github.com/nathanblatter/squawk/internal/oauth"
+	"github.com/nathanblatter/squawk/internal/owner"
+	"github.com/nathanblatter/squawk/internal/ratelimit"
+	"github.com/nathanblatter/squawk/internal/signer"
+	"github.com/nathanblatter/squawk/internal/store"
+	"github.com/nathanblatter/squawk/internal/users"
 )
 
 const adminToken = "test-admin-token"

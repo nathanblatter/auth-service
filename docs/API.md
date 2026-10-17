@@ -1,6 +1,6 @@
-# auth-service API reference
+# Squawk API reference
 
-Base URL: `https://auth.nathanblatter.com`. All responses are JSON. Times are RFC 3339 UTC.
+Base URL: `https://squawk.nathanblatter.com`. All responses are JSON. Times are RFC 3339 UTC.
 Every secret is shown exactly once at creation and stored only as a SHA-256 hash.
 
 ## Concepts
@@ -19,7 +19,7 @@ Every secret is shown exactly once at creation and stored only as a SHA-256 hash
 |---|---|---|
 | Service token | `Authorization: Bearer <jwt>` | service backends calling `/v1/*` |
 | Connector token | `Authorization: Bearer <jwt>` | Claude (or any OAuth client) calling **your** API, verified by you via JWKS |
-| Admin session | cookie `auth_admin_session` (HttpOnly, Secure, SameSite=Strict, `Path=/admin`) | the console. Writes also require `Origin: https://auth.nathanblatter.com` |
+| Admin session | cookie `auth_admin_session` (HttpOnly, Secure, SameSite=Strict, `Path=/admin`) | the console. Writes also require `Origin: https://squawk.nathanblatter.com` |
 | Admin bearer | `Authorization: Bearer <admin token>` | break-glass / bootstrap only |
 
 Admin endpoints marked **fresh** additionally require that the passkey was used in the last
@@ -105,7 +105,7 @@ Header `{"alg":"ES256","typ":"at+jwt","kid":"<key id>"}`. Claims:
 
 | Claim | Service token | Connector token |
 |---|---|---|
-| `iss` | `https://auth.nathanblatter.com` | same |
+| `iss` | `https://squawk.nathanblatter.com` | same |
 | `sub` | `svc:<service id>` | `owner` |
 | `aud` | `auth` | `<service id>` |
 | `scope` | `service` | requested scopes, space-separated |
@@ -272,7 +272,7 @@ Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`
 ## Quick start for a new product
 
 ```sh
-AUTH=https://auth.nathanblatter.com
+AUTH=https://squawk.nathanblatter.com
 # 1. In the console: create the service, add its resource URL, mint a credential.
 # 2. Backend: exchange the credential when you need to call the auth API.
 curl -s -X POST $AUTH/v1/token -d grant_type=client_credentials -d client_id=svc_… -d client_secret=nbk_…

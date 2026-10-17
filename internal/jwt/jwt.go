@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nathanblatter/auth-service/internal/signer"
+	"github.com/nathanblatter/squawk/internal/signer"
 )
 
 // Claims is the registered + private claim set this service emits.

@@ -1,7 +1,9 @@
-# auth-service
+# Squawk
 
-Auth as a service for Nathan's products, "my own Okta". Headless API at
-`https://auth.nathanblatter.com`: products register as **services**, get a credential, and
+**Squawk** is auth as a service for Nathan's products, "my own Okta". The name is the
+transponder code air traffic control assigns so radar knows exactly who you are; Flightdeck
+flies the plane, Squawk says who everyone is. Headless API at
+`https://squawk.nathanblatter.com`: products register as **services**, get a credential, and
 exchange it for short-lived signed tokens. Each service can own a **user pool** (passkeys,
 Sign in with Google, emailed sign-in codes), open to the public or invite-only, and Claude
 connectors get standard OAuth 2.1 with the owner approving each one by passkey. See
@@ -19,7 +21,7 @@ flowchart LR
     end
 
     subgraph edge [Edge]
-        CF["Cloudflare DNS<br/>auth.nathanblatter.com<br/>CNAME, proxy off"]
+        CF["Cloudflare DNS<br/>squawk.nathanblatter.com<br/>CNAME, proxy off"]
         APIGW["API Gateway HTTP API<br/>TLS, throttling, access logs"]
     end
 
@@ -109,6 +111,12 @@ decided on day one. The reasons, in order:
    $15 budget alarm as the ceiling. The homelab would not have been meaningfully cheaper for
    this workload, only riskier.
 
+A note on names: the project was born as `auth-service` and renamed Squawk on 2026-10-16. The
+repo, module, hostname and docs carry the new name; the AWS plumbing (stack `auth-service-prod`,
+its table, queues, alarms, the SSM paths, the deploy role) keeps the old one, because renaming
+a CloudFormation stack means recreating every resource including the user table, for no
+benefit anyone can see. The flightdeck project slug also stays `auth-service`.
+
 What was *not* chosen, and why: Route 53 for DNS (Cloudflare already holds the zone, a CNAME
 with proxy off is enough and keeps one DNS story); a separate staging environment (rejected:
 local DynamoDB plus the CI gates cover it at this scale); containers on ECS or a VM (a
@@ -195,7 +203,7 @@ Full reference with request and response shapes: [docs/API.md](docs/API.md).
 
 ## Verifying a token in your service
 
-Go: `go get github.com/nathanblatter/auth-service/client` and see [client/README.md](client/README.md).
+Go: `go get github.com/nathanblatter/squawk/client` and see [client/README.md](client/README.md).
 Standard library only; verifies tokens against a cached JWKS and wraps the credential exchange.
 
 Anything else: fetch `/.well-known/jwks.json`, pick the key by the token's `kid`, verify
