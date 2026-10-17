@@ -52,10 +52,30 @@ type Claims struct {
 	Subject  string `json:"sub"`
 	Audience string `json:"aud"`
 	Scope    string `json:"scope"`
+	Email    string `json:"email,omitempty"`
+	// EmailVerified is true once the user's address was proven.
+	EmailVerified bool `json:"email_verified,omitempty"`
+	// Org and OrgRole are present when the token was issued in an org
+	// context: the org id and the subject's role in it (admin | member).
+	Org      string `json:"org,omitempty"`
+	OrgRole  string `json:"org_role,omitempty"`
 	IssuedAt int64  `json:"iat"`
 	Expires  int64  `json:"exp"`
 	ID       string `json:"jti"`
 }
+
+// UserID returns the user id when the token belongs to an end user
+// (subject "usr:<id>").
+func (c Claims) UserID() (string, bool) { return strings.CutPrefix(c.Subject, "usr:") }
+
+// IsOwner reports whether the token was issued to the owner.
+func (c Claims) IsOwner() bool { return c.Subject == "owner" }
+
+// InOrg reports whether the token carries the given org context.
+func (c Claims) InOrg(orgID string) bool { return orgID != "" && c.Org == orgID }
+
+// IsOrgAdmin reports whether the token's org role is admin.
+func (c Claims) IsOrgAdmin() bool { return c.Org != "" && c.OrgRole == "admin" }
 
 // Scopes splits the space-separated scope claim.
 func (c Claims) Scopes() []string { return strings.Fields(c.Scope) }

@@ -31,7 +31,7 @@ flowchart LR
     end
 
     subgraph state [State]
-        DDB[("DynamoDB single table<br/>services · credentials · users<br/>passkeys · OAuth clients/codes/refresh<br/>challenges · sessions · audit · rate limits<br/>PITR, TTL")]
+        DDB[("DynamoDB single table<br/>services · credentials · users · orgs<br/>passkeys · OAuth clients/codes/refresh<br/>challenges · sessions · audit · rate limits<br/>PITR, TTL")]
         KMS["KMS ECC P-256 keys<br/>ES256 signing, rotation ring<br/>private key never leaves KMS"]
         SSM["SSM Parameter Store<br/>admin-token hash<br/>Google client secret"]
     end
@@ -166,6 +166,12 @@ verify their email with a code before they can sign in. The owner needs no accou
 pool: owner passkeys bind to the parent domain, so every login page can offer "Sign in as
 owner" and get a token with `sub=owner`. See docs/API.md "End users" and docs/DESIGN.md
 "End users".
+
+**Teams.** Users of a pool can found organisations (a practice, a company) and add members
+with an org role, `admin` or `member`, through `/v1/orgs*`. An app asks for an org context
+with `org=` on the authorize request, or switches with `org=` on a refresh, and the tokens
+carry `org` + `org_role`; non-members cannot complete the sign-in. See docs/API.md "Teams and
+organisations".
 
 ## Endpoints
 

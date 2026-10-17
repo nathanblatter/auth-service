@@ -37,7 +37,17 @@ const (
 
 	// OwnerSubject is the sub claim for tokens the owner approved.
 	OwnerSubject = "owner"
+
+	// OrgRoleAdmin / OrgRoleMember mirror users.OrgRole*; the owner is
+	// always admin of any org in any of the owner's services.
+	OrgRoleAdmin  = "admin"
+	OrgRoleMember = "member"
 )
+
+// ErrNotMember: the signed-in user is not a member of the org the app asked
+// for (or the org is disabled). The parked authorization is left intact so
+// another account can still complete it.
+var ErrNotMember = errors.New("oauth: not a member of the requested org")
 
 // Error is an OAuth-shaped failure: an RFC 6749 error code, a description
 // and the HTTP status to answer with.
@@ -163,12 +173,16 @@ func validRedirectURI(raw string) bool {
 // AuthzParams are the query parameters of GET /oauth/authorize.
 type AuthzParams struct {
 	ClientID, RedirectURI, ResponseType, State, Scope, Challenge, Method, Resource string
+	// Org asks for an org context (auth-service-15): the tokens carry the org
+	// and the user's role in it; a non-member cannot complete the sign-in.
+	Org string
 }
 
 // ParseAuthz reads the parameters from a query.
 func ParseAuthz(v url.Values) AuthzParams {
 	return AuthzParams{ClientID: v.Get("client_id"), RedirectURI: v.Get("redirect_uri"), ResponseType: v.Get("response_type"),
-		State: v.Get("state"), Scope: v.Get("scope"), Challenge: v.Get("code_challenge"), Method: v.Get("code_challenge_method"), Resource: v.Get("resource")}
+		State: v.Get("state"), Scope: v.Get("scope"), Challenge: v.Get("code_challenge"), Method: v.Get("code_challenge_method"), Resource: v.Get("resource"),
+		Org: v.Get("org")}
 }
 
 // AuthzOutcome tells the HTTP layer what to do: either redirect to the
@@ -225,9 +239,21 @@ func (s *Server) BeginAuthorize(ctx context.Context, p AuthzParams, ip string) (
 	if !ok {
 		return bounce("invalid_scope", "requested scope is not in this service's catalog"), nil
 	}
+	if p.Org != "" {
+		org, err := s.Store.GetOrg(ctx, svc.ID, p.Org)
+		if errors.Is(err, store.ErrNotFound) {
+			return bounce("invalid_request", "unknown org for this service"), nil
+		}
+		if err != nil {
+			return AuthzOutcome{}, err
+		}
+		if org.Status != "active" {
+			return bounce("access_denied", "org is disabled"), nil
+		}
+	}
 	a := store.AuthzRequest{
 		ID: random(""), ClientID: c.ID, RedirectURI: p.RedirectURI, State: p.State, Scope: granted,
-		Challenge: p.Challenge, Resource: p.Resource, ServiceID: svc.ID, ExpiresAt: s.Now().Add(AuthzTTL),
+		Challenge: p.Challenge, Resource: p.Resource, ServiceID: svc.ID, Org: p.Org, ExpiresAt: s.Now().Add(AuthzTTL),
 	}
 	if err := s.Store.PutAuthzRequest(ctx, a); err != nil {
 		return AuthzOutcome{}, err
@@ -256,6 +282,18 @@ func (s *Server) CompleteForUser(ctx context.Context, authzID string, user store
 	if a.ServiceID != user.ServiceID {
 		return "", oerr(400, "invalid_request", "login_challenge belongs to another service")
 	}
+	// Membership is checked before the request is consumed: a non-member
+	// gets a clear refusal and the page can let someone else sign in.
+	orgRole := ""
+	if a.Org != "" {
+		var ok bool
+		if orgRole, ok, err = s.orgRole(ctx, a.ServiceID, a.Org, "usr:"+user.ID); err != nil {
+			return "", err
+		} else if !ok {
+			s.audit(ctx, "oauth.org.denied", "usr:"+user.ID, a.ServiceID, "client="+a.ClientID+" org="+a.Org+" not a member", ip)
+			return "", ErrNotMember
+		}
+	}
 	if err := s.Store.DeleteAuthzRequest(ctx, authzID); err != nil {
 		return "", err
 	}
@@ -267,12 +305,46 @@ func (s *Server) CompleteForUser(ctx context.Context, authzID string, user store
 	code := random("nbac_")
 	if err := s.Store.CreateCode(ctx, core.HashSecret(code), store.Code{
 		ClientID: a.ClientID, RedirectURI: a.RedirectURI, Challenge: a.Challenge, Scope: granted,
-		Subject: "usr:" + user.ID, ServiceID: a.ServiceID, ExpiresAt: s.Now().Add(CodeTTL),
+		Subject: "usr:" + user.ID, ServiceID: a.ServiceID, Org: a.Org, OrgRole: orgRole, ExpiresAt: s.Now().Add(CodeTTL),
 	}); err != nil {
 		return "", err
 	}
-	s.audit(ctx, "oauth.approve", "usr:"+user.ID, a.ServiceID, "client="+a.ClientID+" scope="+granted, ip)
+	s.audit(ctx, "oauth.approve", "usr:"+user.ID, a.ServiceID, "client="+a.ClientID+" scope="+granted+orgDetail(a.Org, orgRole), ip)
 	return RedirectWith(a.RedirectURI, url.Values{"code": {code}, "state": {a.State}})
+}
+
+// orgRole resolves a subject's role in an org: the membership's role for a
+// user, admin for the owner. ok is false for non-members and disabled orgs.
+func (s *Server) orgRole(ctx context.Context, serviceID, orgID, subject string) (role string, ok bool, err error) {
+	org, err := s.Store.GetOrg(ctx, serviceID, orgID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil || org.Status != "active" {
+		return "", false, err
+	}
+	if subject == OwnerSubject {
+		return OrgRoleAdmin, true, nil
+	}
+	userID, isUser := strings.CutPrefix(subject, "usr:")
+	if !isUser {
+		return "", false, nil
+	}
+	m, err := s.Store.GetOrgMember(ctx, serviceID, orgID, userID)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return m.Role, true, nil
+}
+
+func orgDetail(org, role string) string {
+	if org == "" {
+		return ""
+	}
+	return " org=" + org + " org_role=" + role
 }
 
 func intersect(a, b []string) []string {
@@ -342,14 +414,19 @@ func (s *Server) completeForOwner(ctx context.Context, id, via, ip string) (stri
 	if err := s.Store.DeleteAuthzRequest(ctx, id); err != nil {
 		return "", err
 	}
+	// The owner is admin of every org in the owner's services.
+	orgRole := ""
+	if a.Org != "" {
+		orgRole = OrgRoleAdmin
+	}
 	code := random("nbac_")
 	if err := s.Store.CreateCode(ctx, core.HashSecret(code), store.Code{
 		ClientID: a.ClientID, RedirectURI: a.RedirectURI, Challenge: a.Challenge, Scope: a.Scope,
-		Subject: OwnerSubject, ServiceID: a.ServiceID, ExpiresAt: s.Now().Add(CodeTTL),
+		Subject: OwnerSubject, ServiceID: a.ServiceID, Org: a.Org, OrgRole: orgRole, ExpiresAt: s.Now().Add(CodeTTL),
 	}); err != nil {
 		return "", err
 	}
-	s.audit(ctx, "oauth.approve", "owner", a.ServiceID, "client="+a.ClientID+" scope="+a.Scope+" via="+via, ip)
+	s.audit(ctx, "oauth.approve", "owner", a.ServiceID, "client="+a.ClientID+" scope="+a.Scope+" via="+via+orgDetail(a.Org, orgRole), ip)
 	return RedirectWith(a.RedirectURI, url.Values{"code": {code}, "state": {a.State}})
 }
 
@@ -377,6 +454,10 @@ type TokenRequest struct {
 	CodeVerifier string
 	RedirectURI  string
 	RefreshToken string
+	// Org, on a refresh_token grant, switches the org context: the new
+	// tokens carry this org (the subject must be a member). Empty keeps the
+	// token's current org.
+	Org string
 }
 
 // TokenResponse is the RFC 6749 §5.1 success body.
@@ -440,7 +521,7 @@ func (s *Server) exchangeCode(ctx context.Context, c store.OAuthClient, req Toke
 		s.audit(ctx, "oauth.token.denied", "anonymous", row.ServiceID, "client="+c.ID+" code mismatch", ip)
 		return TokenResponse{}, oerr(400, "invalid_grant", "code does not match this client, redirect_uri, or code_verifier")
 	}
-	return s.mint(ctx, c.ID, row.ServiceID, row.Subject, row.Scope, random(""), "oauth.token", ip)
+	return s.mint(ctx, c.ID, row.ServiceID, row.Subject, row.Scope, row.Org, row.OrgRole, random(""), "oauth.token", ip)
 }
 
 func (s *Server) refresh(ctx context.Context, c store.OAuthClient, req TokenRequest, ip string) (TokenResponse, error) {
@@ -487,10 +568,33 @@ func (s *Server) refresh(ctx context.Context, c store.OAuthClient, req TokenRequ
 		s.audit(ctx, "oauth.refresh.denied", row.Subject, row.ServiceID, "client="+c.ID+" issued before logout-everywhere", ip)
 		return TokenResponse{}, oerr(400, "invalid_grant", "session was signed out everywhere; sign in again")
 	}
-	return s.mint(ctx, c.ID, row.ServiceID, row.Subject, row.Scope, row.Family, "oauth.refresh", ip)
+	// Org context: an explicit switch must resolve to a membership; a carried
+	// context is re-resolved and silently dropped when the membership is gone
+	// (the app sees no org claim and offers the picker again).
+	org, orgRole := row.Org, ""
+	if req.Org != "" {
+		org = req.Org
+	}
+	if org != "" {
+		role, ok, err := s.orgRole(ctx, row.ServiceID, org, row.Subject)
+		if err != nil {
+			return TokenResponse{}, err
+		}
+		switch {
+		case ok:
+			orgRole = role
+		case req.Org != "":
+			s.audit(ctx, "oauth.org.denied", row.Subject, row.ServiceID, "client="+c.ID+" org="+org+" not a member", ip)
+			return TokenResponse{}, oerr(400, "invalid_grant", "not a member of the requested org")
+		default:
+			s.audit(ctx, "oauth.org.dropped", row.Subject, row.ServiceID, "client="+c.ID+" org="+org, ip)
+			org = ""
+		}
+	}
+	return s.mint(ctx, c.ID, row.ServiceID, row.Subject, row.Scope, org, orgRole, row.Family, "oauth.refresh", ip)
 }
 
-func (s *Server) mint(ctx context.Context, clientID, serviceID, subject, scope, family, kind, ip string) (TokenResponse, error) {
+func (s *Server) mint(ctx context.Context, clientID, serviceID, subject, scope, org, orgRole, family, kind, ip string) (TokenResponse, error) {
 	now := s.Now()
 	email, verified := "", false
 	if id, ok := strings.CutPrefix(subject, "usr:"); ok {
@@ -500,7 +604,7 @@ func (s *Server) mint(ctx context.Context, clientID, serviceID, subject, scope, 
 	}
 	access, err := jwt.Sign(ctx, s.Core.Ring.Active(), jwt.Claims{
 		Issuer: s.Issuer, Subject: subject, Audience: serviceID, Scope: scope, ClientID: clientID, Email: email, EmailVerified: verified,
-		IssuedAt: now.Unix(), Expires: now.Add(AccessTTL).Unix(),
+		Org: org, OrgRole: orgRole, IssuedAt: now.Unix(), Expires: now.Add(AccessTTL).Unix(),
 	})
 	if err != nil {
 		return TokenResponse{}, fmt.Errorf("oauth: sign: %w", err)
@@ -508,11 +612,11 @@ func (s *Server) mint(ctx context.Context, clientID, serviceID, subject, scope, 
 	refresh := random("nbrt_")
 	if err := s.Store.CreateRefresh(ctx, store.RefreshToken{
 		Hash: core.HashSecret(refresh), Family: family, ClientID: clientID, ServiceID: serviceID, Subject: subject, Scope: scope,
-		IssuedAt: now, ExpiresAt: now.Add(RefreshTTL),
+		Org: org, OrgRole: orgRole, IssuedAt: now, ExpiresAt: now.Add(RefreshTTL),
 	}); err != nil {
 		return TokenResponse{}, err
 	}
-	s.audit(ctx, kind, subject, serviceID, "client="+clientID+" family="+family, ip)
+	s.audit(ctx, kind, subject, serviceID, "client="+clientID+" family="+family+orgDetail(org, orgRole), ip)
 	return TokenResponse{AccessToken: access, TokenType: "Bearer", ExpiresIn: int(AccessTTL.Seconds()), RefreshToken: refresh, Scope: scope}, nil
 }
 

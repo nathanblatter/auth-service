@@ -1180,3 +1180,185 @@ func TestPasskeyActivationHTTP(t *testing.T) {
 		t.Fatalf("junk attestation: %d %v", code, body)
 	}
 }
+
+// TestOrgHTTP covers auth-service-15: org CRUD and membership under the
+// service token, the org context on authorize / login / token / refresh,
+// the owner as admin of every org, and the non-member refusal.
+func TestOrgHTTP(t *testing.T) {
+	ts, _ := newServerWithStore(t, "https://auth.test")
+	srv := lastServer
+	admin := "Bearer " + adminToken
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	mail := &captureMail{}
+	srv.Users.Mail = mail
+
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"Therapist","slug":"therapist"}`)
+	id := svc["id"].(string)
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/permissions", admin, "application/json", `{"scopes":["read","write"],"roles":{"user":["read","write"]}}`)
+	do(t, "POST", ts.URL+"/admin/services/"+id+"/resources", admin, "application/json", `{"resource":"https://therapist.test/api"}`)
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/login", admin, "application/json", `{"login_url":"https://therapist.test/login","rp_id":"therapist.test","origins":["https://therapist.test"],"default_roles":["user"],"open_signup":true}`)
+	_, cred := do(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", admin, "", "")
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {id}, "client_secret": {cred["credential"].(string)}}
+	_, tk := do(t, "POST", ts.URL+"/v1/token", "", "application/x-www-form-urlencoded", form.Encode())
+	svcTok := "Bearer " + tk["access_token"].(string)
+
+	// Two accounts; alice founds an org.
+	_, alice := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", admin, "application/json", `{"email":"alice@x.test","method":"email"}`)
+	_, bob := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", admin, "application/json", `{"email":"bob@x.test","method":"email"}`)
+	aliceID, bobID := alice["id"].(string), bob["id"].(string)
+
+	if code, _ := do(t, "POST", ts.URL+"/v1/orgs", "", "application/json", `{}`); code != 401 {
+		t.Fatalf("orgs without service token: %d", code)
+	}
+	if code, body := do(t, "POST", ts.URL+"/v1/orgs", svcTok, "application/json", `{"name":"","admin_user_id":"`+aliceID+`"}`); code != 400 || body["error"] != "invalid_request" {
+		t.Fatalf("blank org name: %d %v", code, body)
+	}
+	code, org := do(t, "POST", ts.URL+"/v1/orgs", svcTok, "application/json", `{"name":"Sunny Practice","admin_user_id":"`+aliceID+`"}`)
+	if code != 201 || org["status"] != "active" || !strings.HasPrefix(org["id"].(string), "org_") {
+		t.Fatalf("create org: %d %v", code, org)
+	}
+	orgID := org["id"].(string)
+	if code, body := do(t, "GET", ts.URL+"/v1/orgs/"+orgID+"/members", svcTok, "", ""); code != 200 || len(body["members"].([]any)) != 1 || body["members"].([]any)[0].(map[string]any)["role"] != "admin" {
+		t.Fatalf("members: %d %v", code, body)
+	}
+	if code, body := do(t, "PUT", ts.URL+"/v1/orgs/"+orgID+"/members/"+aliceID, svcTok, "application/json", `{"role":"member"}`); code != 409 || body["error"] != "last_admin" {
+		t.Fatalf("demote last admin: %d %v", code, body)
+	}
+	if code, body := do(t, "PUT", ts.URL+"/v1/orgs/"+orgID+"/members/"+bobID, svcTok, "application/json", `{"role":"owner"}`); code != 400 || body["error"] != "invalid_request" {
+		t.Fatalf("bad role: %d %v", code, body)
+	}
+	if code, body := do(t, "GET", ts.URL+"/v1/users/"+bobID+"/orgs", svcTok, "", ""); code != 200 || len(body["orgs"].([]any)) != 0 {
+		t.Fatalf("bob orgs before: %d %v", code, body)
+	}
+	if code, body := do(t, "GET", ts.URL+"/v1/orgs", svcTok, "", ""); code != 200 || len(body["orgs"].([]any)) != 1 {
+		t.Fatalf("list orgs: %d %v", code, body)
+	}
+	if code, body := do(t, "GET", ts.URL+"/admin/services/"+id+"/orgs", admin, "", ""); code != 200 || len(body["orgs"].([]any)) != 1 {
+		t.Fatalf("admin list orgs: %d %v", code, body)
+	}
+	if code, body := do(t, "GET", ts.URL+"/admin/services/"+id+"/orgs/"+orgID+"/members", admin, "", ""); code != 200 || len(body["members"].([]any)) != 1 {
+		t.Fatalf("admin list members: %d %v", code, body)
+	}
+
+	// First-party client; authorize with and without an org context.
+	_, reg := do(t, "POST", ts.URL+"/oauth/register", "", "application/json", `{"client_name":"Therapist web","redirect_uris":["https://therapist.test/cb"],"token_endpoint_auth_method":"none"}`)
+	clientID := reg["client_id"].(string)
+	verifier := strings.Repeat("v", 43)
+	sum := sha256.Sum256([]byte(verifier))
+	authorize := func(org string) *url.URL {
+		q := url.Values{"client_id": {clientID}, "redirect_uri": {"https://therapist.test/cb"}, "response_type": {"code"}, "state": {"s1"},
+			"resource": {"https://therapist.test/api"}, "scope": {"read"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}}
+		if org != "" {
+			q.Set("org", org)
+		}
+		resp, _ := noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+		resp.Body.Close()
+		loc, _ := url.Parse(resp.Header.Get("Location"))
+		return loc
+	}
+	if loc := authorize("org_nope"); loc.Host != "therapist.test" || loc.Path != "/cb" || loc.Query().Get("error") != "invalid_request" {
+		t.Fatalf("unknown org must bounce to the client: %v", loc)
+	}
+	signIn := func(lc, email string) (int, map[string]any) {
+		_, begin := do(t, "POST", ts.URL+"/v1/login/email/begin", svcTok, "application/json", `{"login_challenge":"`+lc+`","email":"`+email+`"}`)
+		return do(t, "POST", ts.URL+"/v1/login/email/finish?challenge="+begin["challenge_id"].(string), svcTok, "application/json", `{"code":"`+mail.code(t)+`"}`)
+	}
+	exchange := func(redirectTo string) map[string]any {
+		cb, _ := url.Parse(redirectTo)
+		form := url.Values{"grant_type": {"authorization_code"}, "client_id": {clientID}, "code": {cb.Query().Get("code")}, "code_verifier": {verifier}, "redirect_uri": {"https://therapist.test/cb"}}
+		code, tok := do(t, "POST", ts.URL+"/oauth/token", "", "application/x-www-form-urlencoded", form.Encode())
+		if code != 200 {
+			t.Fatalf("token: %d %v", code, tok)
+		}
+		return tok
+	}
+
+	// Bob is not a member: refused, and the challenge survives for alice.
+	lc := authorize(orgID).Query().Get("login_challenge")
+	if code, body := signIn(lc, "bob@x.test"); code != 403 || body["error"] != "not_a_member" {
+		t.Fatalf("non-member: %d %v", code, body)
+	}
+	code, fin := signIn(lc, "alice@x.test")
+	if code != 200 {
+		t.Fatalf("alice sign-in: %d %v", code, fin)
+	}
+	tok := exchange(fin["redirect_to"].(string))
+	claims, err := srv.Core.VerifyToken(tok["access_token"].(string), id)
+	if err != nil || claims.Subject != "usr:"+aliceID || claims.Org != orgID || claims.OrgRole != "admin" {
+		t.Fatalf("org claims: %+v %v", claims, err)
+	}
+
+	// Refresh keeps the org; after a demotion the role follows; an explicit
+	// switch to an org she is not in is refused; a plain sign-in has no org.
+	refresh := func(rt, org string) (int, map[string]any) {
+		form := url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "refresh_token": {rt}}
+		if org != "" {
+			form.Set("org", org)
+		}
+		return do(t, "POST", ts.URL+"/oauth/token", "", "application/x-www-form-urlencoded", form.Encode())
+	}
+	do(t, "PUT", ts.URL+"/v1/orgs/"+orgID+"/members/"+bobID, svcTok, "application/json", `{"role":"admin"}`)
+	do(t, "PUT", ts.URL+"/v1/orgs/"+orgID+"/members/"+aliceID, svcTok, "application/json", `{"role":"member"}`)
+	code, r1 := refresh(tok["refresh_token"].(string), "")
+	if code != 200 {
+		t.Fatalf("refresh: %d %v", code, r1)
+	}
+	if c, _ := srv.Core.VerifyToken(r1["access_token"].(string), id); c.Org != orgID || c.OrgRole != "member" {
+		t.Fatalf("refresh must re-resolve the role: %+v", c)
+	}
+	code, org2 := do(t, "POST", ts.URL+"/v1/orgs", svcTok, "application/json", `{"name":"Other Clinic","admin_user_id":"`+bobID+`"}`)
+	if code != 201 {
+		t.Fatalf("second org: %d %v", code, org2)
+	}
+	if code, body := refresh(r1["refresh_token"].(string), org2["id"].(string)); code != 400 || body["error"] != "invalid_grant" {
+		t.Fatalf("switch to a foreign org: %d %v", code, body)
+	}
+	// A refused switch still consumed that refresh token (rotation), so
+	// alice signs in again; without an org in the request there is no context.
+	lc = authorize("").Query().Get("login_challenge")
+	_, fin = signIn(lc, "alice@x.test")
+	tok = exchange(fin["redirect_to"].(string))
+	if c, _ := srv.Core.VerifyToken(tok["access_token"].(string), id); c.Org != "" || c.OrgRole != "" {
+		t.Fatalf("no org requested, none granted: %+v", c)
+	}
+	// Switch into her org on refresh, then lose the membership: the next
+	// refresh drops the context instead of failing.
+	code, r2 := refresh(tok["refresh_token"].(string), orgID)
+	if code != 200 {
+		t.Fatalf("switch: %d %v", code, r2)
+	}
+	if c, _ := srv.Core.VerifyToken(r2["access_token"].(string), id); c.Org != orgID || c.OrgRole != "member" {
+		t.Fatalf("switched claims: %+v", c)
+	}
+	if code, _ := do(t, "DELETE", ts.URL+"/v1/orgs/"+orgID+"/members/"+aliceID, svcTok, "", ""); code != 204 {
+		t.Fatalf("remove alice: %d", code)
+	}
+	code, r3 := refresh(r2["refresh_token"].(string), "")
+	if code != 200 {
+		t.Fatalf("refresh after removal: %d %v", code, r3)
+	}
+	if c, _ := srv.Core.VerifyToken(r3["access_token"].(string), id); c.Org != "" {
+		t.Fatalf("org must be dropped: %+v", c)
+	}
+
+	// Deleting the org and a user cleans memberships; export lists orgs.
+	if code, body := do(t, "GET", ts.URL+"/v1/users/"+bobID+"/export", svcTok, "", ""); code != 200 || len(body["orgs"].([]any)) != 2 {
+		t.Fatalf("export orgs: %d %v", code, body["orgs"])
+	}
+	if code, _ := do(t, "DELETE", ts.URL+"/v1/orgs/"+org2["id"].(string), svcTok, "", ""); code != 204 {
+		t.Fatalf("delete org: %d", code)
+	}
+	if code, body := do(t, "GET", ts.URL+"/v1/orgs/"+org2["id"].(string), svcTok, "", ""); code != 404 || body["error"] != "not_found" {
+		t.Fatalf("deleted org: %d %v", code, body)
+	}
+	if code, body := do(t, "GET", ts.URL+"/v1/users/"+bobID+"/orgs", svcTok, "", ""); code != 200 || len(body["orgs"].([]any)) != 1 {
+		t.Fatalf("bob orgs after: %d %v", code, body)
+	}
+	name := `{"name":"Sunny","status":"disabled"}`
+	if code, body := do(t, "PATCH", ts.URL+"/v1/orgs/"+orgID, svcTok, "application/json", name); code != 200 || body["name"] != "Sunny" || body["status"] != "disabled" {
+		t.Fatalf("patch org: %d %v", code, body)
+	}
+	if loc := authorize(orgID); loc.Query().Get("error") != "access_denied" {
+		t.Fatalf("disabled org must bounce: %v", loc)
+	}
+}

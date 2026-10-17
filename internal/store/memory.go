@@ -29,6 +29,8 @@ type Memory struct {
 	idents    map[string]string      // svc#identity -> user id
 	upks      map[string]UserPasskey // svc#cred
 	seen      map[string]time.Time   // svc#user#ip → expires
+	orgs      map[string]Org         // svc#id
+	members   map[string]OrgMember   // svc#org#user
 	notBefore time.Time
 	Audit     []AuditEvent
 }
@@ -51,6 +53,7 @@ func NewMemory() *Memory {
 		fails: map[string]failCounter{}, resources: map[string]string{}, clients: map[string]OAuthClient{},
 		authz: map[string]AuthzRequest{}, codes: map[string]Code{}, refresh: map[string]RefreshToken{},
 		recovery: map[string]RecoveryCode{}, users: map[string]User{}, idents: map[string]string{}, upks: map[string]UserPasskey{}, seen: map[string]time.Time{},
+		orgs: map[string]Org{}, members: map[string]OrgMember{},
 	}
 }
 
@@ -645,5 +648,160 @@ func (m *Memory) DeleteUser(_ context.Context, serviceID, id string) error {
 			delete(m.seen, k)
 		}
 	}
+	for k, mb := range m.members {
+		if mb.ServiceID == serviceID && mb.UserID == id {
+			delete(m.members, k)
+		}
+	}
+	return nil
+}
+
+// ── orgs ───────────────────────────────────────────────────────────────────
+
+func mkey(serviceID, orgID, userID string) string { return serviceID + "#" + orgID + "#" + userID }
+
+func (m *Memory) CreateOrg(_ context.Context, o Org) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, taken := m.orgs[ukey(o.ServiceID, o.ID)]; taken {
+		return ErrConflict
+	}
+	m.orgs[ukey(o.ServiceID, o.ID)] = o
+	return nil
+}
+
+func (m *Memory) GetOrg(_ context.Context, serviceID, id string) (Org, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o, ok := m.orgs[ukey(serviceID, id)]
+	if !ok {
+		return Org{}, ErrNotFound
+	}
+	return o, nil
+}
+
+func (m *Memory) ListOrgs(_ context.Context, serviceID string, limit int, cursor string) ([]Org, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var all []Org
+	for _, o := range m.orgs {
+		if o.ServiceID == serviceID {
+			all = append(all, o)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CreatedAt.Equal(all[j].CreatedAt) {
+			return all[i].ID < all[j].ID
+		}
+		return all[i].CreatedAt.Before(all[j].CreatedAt)
+	})
+	start := 0
+	if cursor != "" {
+		if _, err := fmt.Sscanf(cursor, "%d", &start); err != nil {
+			return nil, "", fmt.Errorf("store: bad cursor %q", cursor)
+		}
+	}
+	if start >= len(all) {
+		return []Org{}, "", nil
+	}
+	end := min(start+limit, len(all))
+	next := ""
+	if end < len(all) {
+		next = fmt.Sprint(end)
+	}
+	return all[start:end], next, nil
+}
+
+func (m *Memory) UpdateOrg(_ context.Context, o Org) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.orgs[ukey(o.ServiceID, o.ID)]
+	if !ok {
+		return ErrNotFound
+	}
+	cur.Name, cur.Status = o.Name, o.Status
+	m.orgs[ukey(o.ServiceID, o.ID)] = cur
+	return nil
+}
+
+func (m *Memory) DeleteOrg(_ context.Context, serviceID, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.orgs[ukey(serviceID, id)]; !ok {
+		return ErrNotFound
+	}
+	delete(m.orgs, ukey(serviceID, id))
+	for k, mb := range m.members {
+		if mb.ServiceID == serviceID && mb.OrgID == id {
+			delete(m.members, k)
+		}
+	}
+	return nil
+}
+
+func (m *Memory) PutOrgMember(_ context.Context, mb OrgMember) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := mkey(mb.ServiceID, mb.OrgID, mb.UserID)
+	if cur, ok := m.members[k]; ok {
+		mb.CreatedAt = cur.CreatedAt
+	}
+	m.members[k] = mb
+	return nil
+}
+
+func (m *Memory) GetOrgMember(_ context.Context, serviceID, orgID, userID string) (OrgMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mb, ok := m.members[mkey(serviceID, orgID, userID)]
+	if !ok {
+		return OrgMember{}, ErrNotFound
+	}
+	return mb, nil
+}
+
+func (m *Memory) ListOrgMembers(_ context.Context, serviceID, orgID string) ([]OrgMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []OrgMember{}
+	for _, mb := range m.members {
+		if mb.ServiceID == serviceID && mb.OrgID == orgID {
+			out = append(out, mb)
+		}
+	}
+	sortMembers(out)
+	return out, nil
+}
+
+func (m *Memory) ListUserOrgs(_ context.Context, serviceID, userID string) ([]OrgMember, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []OrgMember{}
+	for _, mb := range m.members {
+		if mb.ServiceID == serviceID && mb.UserID == userID {
+			out = append(out, mb)
+		}
+	}
+	sortMembers(out)
+	return out, nil
+}
+
+func sortMembers(out []OrgMember) {
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].OrgID+out[i].UserID < out[j].OrgID+out[j].UserID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+}
+
+func (m *Memory) DeleteOrgMember(_ context.Context, serviceID, orgID, userID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := mkey(serviceID, orgID, userID)
+	if _, ok := m.members[k]; !ok {
+		return ErrNotFound
+	}
+	delete(m.members, k)
 	return nil
 }

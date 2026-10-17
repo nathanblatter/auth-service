@@ -110,6 +110,8 @@ Header `{"alg":"ES256","typ":"at+jwt","kid":"<key id>"}`. Claims:
 | `aud` | `auth` | `<service id>` |
 | `scope` | `service` | requested scopes, space-separated |
 | `client_id` | — | `nbc_…` |
+| `email`, `email_verified` | — | user tokens only |
+| `org`, `org_role` | — | only when an org context was requested: org id and `admin\|member` |
 | `iat`, `exp`, `jti` | yes | yes |
 
 ### Verifying a token (what your service does)
@@ -206,6 +208,40 @@ refusals are audited as `user.signup_denied`.
 
 `user` = `{"id":"usr_…","service_id","method","email","email_verified","name","roles":[…],"status","created_at","last_login_at"?}`.
 
+### Teams and organisations
+
+An **org** is a customer account inside one service with several members (a therapy
+practice, a company). Orgs never span services. Any user may found one through the app and
+becomes its first **admin**; members are added by user id with an org role, `admin` or
+`member`, layered on their service roles. An org always keeps at least one admin
+(`409 last_admin`); delete the org instead. These calls run under the service token, so the
+app decides who may make them (normally: callers whose token says `org_role: admin`).
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/orgs` | `{"name","admin_user_id"}` → `201 org`; the user becomes the first admin. Name 1–80 chars |
+| GET | `/v1/orgs?limit=50&cursor=` | `{"orgs":[org],"next"}` |
+| GET | `/v1/orgs/{id}` | `org` |
+| PATCH | `/v1/orgs/{id}` | any of `{"name","status":"active\|disabled"}` → `200 org`. A disabled org cannot be used as a login context |
+| DELETE | `/v1/orgs/{id}` | `204`; removes every membership. Tokens already carrying the org run out within the hour; refreshes drop it |
+| GET | `/v1/orgs/{id}/members` | `{"members":[{"user_id","role","joined_at","email","name","status"}]}` oldest first |
+| PUT | `/v1/orgs/{id}/members/{user_id}` | `{"role":"admin\|member"}` adds or re-roles → `200 {"org_id","user_id","role","joined_at"}`. `409 last_admin` |
+| DELETE | `/v1/orgs/{id}/members/{user_id}` | `204`. `404 not_a_member`, `409 last_admin` |
+| GET | `/v1/users/{id}/orgs` | `{"orgs":[org + "role"]}`: what to show in an org picker |
+
+`org` = `{"id":"org_…","service_id","name","status","created_at"}`.
+
+**Org context in tokens.** Add `org=<org id>` to `/oauth/authorize` and the sign-in completes
+only for a member (or the owner): the login finish calls answer `403 not_a_member` and leave
+the `login_challenge` valid for another account; the Google callback returns to
+`login_url?error=not_a_member`. An unknown org bounces to the client with `invalid_request`, a
+disabled one with `access_denied`. The tokens then carry `org` and `org_role` (`admin` for the
+owner). To pick or switch an org after signing in, refresh with `org=<org id>`
+(`POST /oauth/token`, `grant_type=refresh_token`): the new tokens carry it, or the exchange
+fails with `invalid_grant` for a non-member. A plain refresh re-resolves the current org: the
+role follows the membership, and a membership that no longer exists (or a disabled or deleted
+org) drops the context instead of failing, so the app shows its picker again.
+
 **Login flow:** the app sends the browser to `/oauth/authorize` (its own client, PKCE,
 `resource`); because the service has a `login_url` the browser lands on
 `login_url?login_challenge=<id>`. The page offers passkey (backend drives
@@ -214,7 +250,8 @@ refusals are audited as `user.signup_denied`.
 `redirect_uri` carrying `code`, exchanged at `/oauth/token`. User tokens: `sub=usr:<id>`,
 `aud=<service id>`, `email`, `scope` = requested ∩ union of the user's roles' scopes. Owner
 tokens: `sub=owner`, no `email`, the requested scope. Consumers that gate on `sub` must accept
-both forms. First-party apps get no consent screen.
+both forms. First-party apps get no consent screen. With `org=` on the authorize request the
+tokens also carry `org` and `org_role` (see "Teams and organisations").
 
 ## Admin API
 
@@ -251,6 +288,8 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | PUT | `/admin/services/{id}/login` | `{"login_url","rp_id","origins":[…],"default_roles":[…],"open_signup":false}` → `200 service`. Empty `login_url` = owner-only (and `open_signup` is forced off). `rp_id` must be a registrable suffix of every origin; default roles must exist |
 | POST | `/admin/services/{id}/users` | `{"email","name"?,"method":"passkey|google|email"}` (default `passkey`) → `201 user` (born `email_verified`), whatever `open_signup` says. `409 identity_taken`, `409 service_not_configured` on an owner-only service |
 | GET | `/admin/services/{id}/users?limit=50&cursor=` | `{"users":[user],"next"}` |
+| GET | `/admin/services/{id}/orgs?limit=50&cursor=` | `{"orgs":[org],"next"}` (read-only view of the service's teams) |
+| GET | `/admin/services/{id}/orgs/{org}/members` | `{"members":[…]}` as the service-token call |
 | PUT | `/admin/services/{id}/permissions` | `{"scopes":["read","write"],"roles":{"admin":["read","write"],"viewer":["read"]}}` → `200 service`. Scopes `^[a-z][a-z0-9:._-]{0,39}$` (≤50); role names `^[a-z][a-z0-9-]{0,39}$` (≤20) bundling catalog scopes only. Replaces the whole catalog |
 | POST | `/admin/services/{id}/credentials` | **fresh**. `201 {"credential":"nbk_…", "id","service_id","last4","created_at","revoked":false}` |
 | GET | `/admin/services/{id}/credentials` | `{"credentials":[{"id","service_id","last4","created_at","revoked","revoked_at"?}]}` (never the secret or its hash) |
@@ -272,12 +311,13 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 
 Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `service.login.set`,
 `user.create`, `user.provision`, `user.signup_denied`, `user.google.bind`, `user.email_code.sent`, `user.email.verified`, `user.passkey.register`, `user.login.alerted`, `user.login.alert_suppressed`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
-`user.passkey.register`, `user.export`, `user.delete`, `credential.mint`, `credential.revoke`,
+`user.passkey.register`, `user.export`, `user.delete`, `org.create`, `org.update`, `org.delete`,
+`org.member.set`, `org.member.remove`, `credential.mint`, `credential.revoke`,
 `token.issue`, `token.denied`, `passkey.register`, `owner.login`, `owner.login_denied`,
 `owner.stepup`, `owner.stepup_denied`, `owner.logout_everywhere`, `recovery.generate`,
 `recovery.login`, `recovery.denied`, `oauth.client.register`, `oauth.authorize.request`,
 `oauth.approve`, `oauth.deny`, `oauth.token`, `oauth.token.denied`, `oauth.refresh`,
-`oauth.refresh.reuse`, `oauth.refresh.denied`.
+`oauth.refresh.reuse`, `oauth.refresh.denied`, `oauth.org.denied`, `oauth.org.dropped`.
 
 ---
 

@@ -342,6 +342,96 @@ func conformance(t *testing.T, s Store) {
 		t.Fatalf("delete missing: %v", err)
 	}
 
+	// Orgs: per service, members keyed by (org, user), role upsert keeps created_at.
+	o1 := Org{ID: "org1", ServiceID: "svc_a", Name: "Practice", Status: "active", CreatedAt: now}
+	if err := s.CreateOrg(ctx, o1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateOrg(ctx, o1); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dup org: %v", err)
+	}
+	if _, err := s.GetOrg(ctx, "svc_b", "org1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("org across service: %v", err)
+	}
+	o2 := Org{ID: "org2", ServiceID: "svc_a", Name: "Clinic", Status: "active", CreatedAt: now.Add(time.Second)}
+	if err := s.CreateOrg(ctx, o2); err != nil {
+		t.Fatal(err)
+	}
+	if page, next, err := s.ListOrgs(ctx, "svc_a", 1, ""); err != nil || len(page) != 1 || page[0].ID != "org1" || next == "" {
+		t.Fatalf("ListOrgs page1: %+v %q %v", page, next, err)
+	} else if page, next, err = s.ListOrgs(ctx, "svc_a", 1, next); err != nil || len(page) != 1 || page[0].ID != "org2" || next != "" {
+		t.Fatalf("ListOrgs page2: %+v %q %v", page, next, err)
+	}
+	o1.Name, o1.Status = "Practice 2", "disabled"
+	if err := s.UpdateOrg(ctx, o1); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetOrg(ctx, "svc_a", "org1"); got.Name != "Practice 2" || got.Status != "disabled" || !got.CreatedAt.Equal(now) {
+		t.Fatalf("UpdateOrg: %+v", got)
+	}
+	if err := s.UpdateOrg(ctx, Org{ID: "ghost", ServiceID: "svc_a"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update missing org: %v", err)
+	}
+	if err := s.PutOrgMember(ctx, OrgMember{ServiceID: "svc_a", OrgID: "org1", UserID: "u1", Role: "admin", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOrgMember(ctx, OrgMember{ServiceID: "svc_a", OrgID: "org1", UserID: "u2", Role: "member", CreatedAt: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOrgMember(ctx, OrgMember{ServiceID: "svc_a", OrgID: "org2", UserID: "u2", Role: "admin", CreatedAt: now.Add(2 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	// Role change keeps the join date.
+	if err := s.PutOrgMember(ctx, OrgMember{ServiceID: "svc_a", OrgID: "org1", UserID: "u2", Role: "admin", CreatedAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if mb, err := s.GetOrgMember(ctx, "svc_a", "org1", "u2"); err != nil || mb.Role != "admin" || !mb.CreatedAt.Equal(now.Add(time.Second)) {
+		t.Fatalf("member after role change: %+v %v", mb, err)
+	}
+	if _, err := s.GetOrgMember(ctx, "svc_a", "org2", "u1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("non-member: %v", err)
+	}
+	if ms, err := s.ListOrgMembers(ctx, "svc_a", "org1"); err != nil || len(ms) != 2 || ms[0].UserID != "u1" || ms[1].UserID != "u2" {
+		t.Fatalf("ListOrgMembers: %+v %v", ms, err)
+	}
+	if ms, err := s.ListUserOrgs(ctx, "svc_a", "u2"); err != nil || len(ms) != 2 || ms[0].OrgID != "org1" || ms[1].OrgID != "org2" {
+		t.Fatalf("ListUserOrgs: %+v %v", ms, err)
+	}
+	if ms, err := s.ListUserOrgs(ctx, "svc_b", "u2"); err != nil || len(ms) != 0 {
+		t.Fatalf("ListUserOrgs across service: %+v %v", ms, err)
+	}
+	if err := s.DeleteOrgMember(ctx, "svc_a", "org1", "u1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteOrgMember(ctx, "svc_a", "org1", "u1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing member: %v", err)
+	}
+	// Deleting a user drops its memberships; deleting an org drops its members.
+	if err := s.DeleteUser(ctx, "svc_a", "u2"); err != nil {
+		t.Fatal(err)
+	}
+	if ms, _ := s.ListOrgMembers(ctx, "svc_a", "org2"); len(ms) != 0 {
+		t.Fatalf("membership must die with the user: %+v", ms)
+	}
+	if err := s.CreateUser(ctx, u2); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOrgMember(ctx, OrgMember{ServiceID: "svc_a", OrgID: "org2", UserID: "u2", Role: "admin", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteOrg(ctx, "svc_a", "org2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteOrg(ctx, "svc_a", "org2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete missing org: %v", err)
+	}
+	if ms, _ := s.ListUserOrgs(ctx, "svc_a", "u2"); len(ms) != 0 {
+		t.Fatalf("membership must die with the org: %+v", ms)
+	}
+	if _, err := s.GetOrg(ctx, "svc_a", "org2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted org: %v", err)
+	}
+
 	// Resources map to services, uniquely.
 	if err := s.AddServiceResource(ctx, "svc_a", "https://finforge.test/mcp"); err != nil {
 		t.Fatal(err)

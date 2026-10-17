@@ -282,3 +282,71 @@ func TestUserPoolFlow(t *testing.T) {
 	_, err = s.Token(ctx, TokenRequest{GrantType: "refresh_token", ClientID: c.ID, ClientSecret: secret, RefreshToken: tok2.RefreshToken}, "ip")
 	oauthErr(t, err, "invalid_grant")
 }
+
+// TestOwnerOrgContext: the owner completing an org-scoped authorization is
+// admin of that org; a user who is not a member is refused before the
+// request is consumed; a disabled org bounces at authorize.
+func TestOwnerOrgContext(t *testing.T) {
+	s, mem, svc := newServer(t)
+	ctx := context.Background()
+	_ = mem.UpdateServiceLogin(ctx, svc.ID, "https://finforge.test/login", "finforge.test", []string{"https://finforge.test"}, []string{"viewer"}, true)
+	org := store.Org{ID: "org_1", ServiceID: svc.ID, Name: "Practice", Status: "active", CreatedAt: s.Now()}
+	if err := mem.CreateOrg(ctx, org); err != nil {
+		t.Fatal(err)
+	}
+	user := store.User{ID: "u1", ServiceID: svc.ID, Method: "google", Identity: "google:1", Email: "u@x.test", Roles: []string{"viewer"}, Status: "active", CreatedAt: s.Now()}
+	if err := mem.CreateUser(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	c, _, _ := s.Register(ctx, RegisterRequest{RedirectURIs: []string{"https://finforge.test/cb"}, ClientName: "web", TokenEndpointAuthMethod: "none"}, "ip")
+	verifier, challenge := pkce()
+	begin := func(org string) AuthzOutcome {
+		out, err := s.BeginAuthorize(ctx, AuthzParams{ClientID: c.ID, RedirectURI: "https://finforge.test/cb", ResponseType: "code", Scope: "read",
+			Challenge: challenge, Method: "S256", Resource: "https://finforge.test/mcp", Org: org}, "ip")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if out := begin("org_nope"); out.Err == nil || out.Err.Code != "invalid_request" {
+		t.Fatalf("unknown org: %+v", out)
+	}
+	authzID := func(out AuthzOutcome) string {
+		u, _ := url.Parse(out.ApproveURL)
+		return u.Query().Get("login_challenge")
+	}
+	id := authzID(begin("org_1"))
+	// Non-member: refused, request still pending.
+	if _, err := s.CompleteForUser(ctx, id, user, []string{"read"}, "ip"); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("non-member: %v", err)
+	}
+	if _, err := s.Pending(ctx, id); err != nil {
+		t.Fatalf("request must survive a refusal: %v", err)
+	}
+	loc, err := s.CompleteForOwner(ctx, id, "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(loc)
+	tok, err := s.Token(ctx, TokenRequest{GrantType: "authorization_code", ClientID: c.ID, Code: u.Query().Get("code"), CodeVerifier: verifier, RedirectURI: "https://finforge.test/cb"}, "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := s.Core.VerifyToken(tok.AccessToken, svc.ID)
+	if err != nil || claims.Subject != OwnerSubject || claims.Org != "org_1" || claims.OrgRole != OrgRoleAdmin {
+		t.Fatalf("owner org claims: %+v %v", claims, err)
+	}
+	// A disabled org bounces at authorize and is dropped on refresh.
+	org.Status = "disabled"
+	_ = mem.UpdateOrg(ctx, org)
+	if out := begin("org_1"); out.Err == nil || out.Err.Code != "access_denied" {
+		t.Fatalf("disabled org: %+v", out)
+	}
+	tok2, err := s.Token(ctx, TokenRequest{GrantType: "refresh_token", ClientID: c.ID, RefreshToken: tok.RefreshToken}, "ip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims, _ := s.Core.VerifyToken(tok2.AccessToken, svc.ID); claims.Org != "" {
+		t.Fatalf("disabled org must be dropped: %+v", claims)
+	}
+}

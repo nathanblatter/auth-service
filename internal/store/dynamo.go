@@ -44,6 +44,10 @@ const (
 	pkIdent     = "IDENT#"
 	gsiUsers    = "USERS#"
 	gsiUPK      = "UPK#"
+	pkOrg       = "ORG#"
+	skMember    = "MEMBER#"
+	gsiOrgs     = "ORGS#"
+	gsiUserOrgs = "USERORGS#"
 )
 
 // DynamoAPI is the slice of the DynamoDB client the store uses.
@@ -631,6 +635,7 @@ type authzItem struct {
 	Challenge   string `dynamodbav:"challenge"`
 	Resource    string `dynamodbav:"resource"`
 	ServiceID   string `dynamodbav:"service_id"`
+	Org         string `dynamodbav:"org,omitempty"`
 	ExpiresAt   string `dynamodbav:"expires_at"`
 	TTL         int64  `dynamodbav:"ttl"`
 }
@@ -638,7 +643,7 @@ type authzItem struct {
 func (d *Dynamo) PutAuthzRequest(ctx context.Context, a AuthzRequest) error {
 	item, err := attributevalue.MarshalMap(authzItem{
 		PK: pkAuthz + a.ID, SK: skMeta, Type: "authz", ID: a.ID, ClientID: a.ClientID, RedirectURI: a.RedirectURI, State: a.State,
-		Scope: a.Scope, Challenge: a.Challenge, Resource: a.Resource, ServiceID: a.ServiceID,
+		Scope: a.Scope, Challenge: a.Challenge, Resource: a.Resource, ServiceID: a.ServiceID, Org: a.Org,
 		ExpiresAt: a.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: a.ExpiresAt.Unix() + 60,
 	})
 	if err != nil {
@@ -665,7 +670,7 @@ func (d *Dynamo) GetAuthzRequest(ctx context.Context, id string, now time.Time) 
 		return AuthzRequest{}, ErrNotFound
 	}
 	return AuthzRequest{ID: it.ID, ClientID: it.ClientID, RedirectURI: it.RedirectURI, State: it.State, Scope: it.Scope,
-		Challenge: it.Challenge, Resource: it.Resource, ServiceID: it.ServiceID, ExpiresAt: exp}, nil
+		Challenge: it.Challenge, Resource: it.Resource, ServiceID: it.ServiceID, Org: it.Org, ExpiresAt: exp}, nil
 }
 
 func (d *Dynamo) DeleteAuthzRequest(ctx context.Context, id string) error {
@@ -682,6 +687,8 @@ type codeItem struct {
 	Scope       string `dynamodbav:"scope,omitempty"`
 	Subject     string `dynamodbav:"subject"`
 	ServiceID   string `dynamodbav:"service_id"`
+	Org         string `dynamodbav:"org,omitempty"`
+	OrgRole     string `dynamodbav:"org_role,omitempty"`
 	ExpiresAt   string `dynamodbav:"expires_at"`
 	TTL         int64  `dynamodbav:"ttl"`
 }
@@ -689,7 +696,8 @@ type codeItem struct {
 func (d *Dynamo) CreateCode(ctx context.Context, hash string, c Code) error {
 	item, err := attributevalue.MarshalMap(codeItem{
 		PK: pkCode + hash, SK: skMeta, Type: "code", ClientID: c.ClientID, RedirectURI: c.RedirectURI, Challenge: c.Challenge,
-		Scope: c.Scope, Subject: c.Subject, ServiceID: c.ServiceID, ExpiresAt: c.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: c.ExpiresAt.Unix() + 60,
+		Scope: c.Scope, Subject: c.Subject, ServiceID: c.ServiceID, Org: c.Org, OrgRole: c.OrgRole,
+		ExpiresAt: c.ExpiresAt.UTC().Format(time.RFC3339Nano), TTL: c.ExpiresAt.Unix() + 60,
 	})
 	if err != nil {
 		return err
@@ -714,7 +722,8 @@ func (d *Dynamo) ConsumeCode(ctx context.Context, hash string, now time.Time) (C
 	if err != nil || !now.Before(exp) {
 		return Code{}, ErrNotFound
 	}
-	return Code{ClientID: it.ClientID, RedirectURI: it.RedirectURI, Challenge: it.Challenge, Scope: it.Scope, Subject: it.Subject, ServiceID: it.ServiceID, ExpiresAt: exp}, nil
+	return Code{ClientID: it.ClientID, RedirectURI: it.RedirectURI, Challenge: it.Challenge, Scope: it.Scope, Subject: it.Subject, ServiceID: it.ServiceID,
+		Org: it.Org, OrgRole: it.OrgRole, ExpiresAt: exp}, nil
 }
 
 type refreshItem struct {
@@ -725,6 +734,8 @@ type refreshItem struct {
 	ServiceID              string `dynamodbav:"service_id"`
 	Subject                string `dynamodbav:"subject"`
 	Scope                  string `dynamodbav:"scope,omitempty"`
+	Org                    string `dynamodbav:"org,omitempty"`
+	OrgRole                string `dynamodbav:"org_role,omitempty"`
 	IssuedAt               string `dynamodbav:"issued_at,omitempty"`
 	ExpiresAt              string `dynamodbav:"expires_at"`
 	Used                   bool   `dynamodbav:"used"`
@@ -738,13 +749,13 @@ func (it refreshItem) toToken() (RefreshToken, error) {
 	}
 	issued, _ := time.Parse(time.RFC3339Nano, it.IssuedAt)
 	return RefreshToken{Hash: strings.TrimPrefix(it.PK, pkRefresh), Family: it.Family, ClientID: it.ClientID, ServiceID: it.ServiceID,
-		Subject: it.Subject, Scope: it.Scope, IssuedAt: issued, ExpiresAt: exp, Used: it.Used}, nil
+		Subject: it.Subject, Scope: it.Scope, Org: it.Org, OrgRole: it.OrgRole, IssuedAt: issued, ExpiresAt: exp, Used: it.Used}, nil
 }
 
 func (d *Dynamo) CreateRefresh(ctx context.Context, t RefreshToken) error {
 	item, err := attributevalue.MarshalMap(refreshItem{
 		PK: pkRefresh + t.Hash, SK: skMeta, GSI1PK: gsiFamily + t.Family, GSI1SK: pkRefresh + t.Hash, Type: "refresh",
-		Family: t.Family, ClientID: t.ClientID, ServiceID: t.ServiceID, Subject: t.Subject, Scope: t.Scope,
+		Family: t.Family, ClientID: t.ClientID, ServiceID: t.ServiceID, Subject: t.Subject, Scope: t.Scope, Org: t.Org, OrgRole: t.OrgRole,
 		IssuedAt:  t.IssuedAt.UTC().Format(time.RFC3339Nano),
 		ExpiresAt: t.ExpiresAt.UTC().Format(time.RFC3339Nano), Used: false, TTL: t.ExpiresAt.Unix() + 60,
 	})
@@ -1417,6 +1428,16 @@ func (d *Dynamo) DeleteUser(ctx context.Context, serviceID, id string) error {
 			}
 		}
 	}
+	// Org memberships: the user must not linger as a member (or admin).
+	mems, err := d.ListUserOrgs(ctx, serviceID, id)
+	if err != nil {
+		return err
+	}
+	for _, mb := range mems {
+		if _, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkOrg+serviceID+"#"+mb.OrgID, skMember+id)}); err != nil {
+			return err
+		}
+	}
 	// Identity lock and user row go together so a half-deleted account can
 	// neither sign in nor block re-registration.
 	_, err = d.db.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
@@ -1425,5 +1446,248 @@ func (d *Dynamo) DeleteUser(ctx context.Context, serviceID, id string) error {
 			{Delete: &types.Delete{TableName: &d.table, Key: dynKey(pkUser+serviceID+"#"+id, skMeta)}},
 		},
 	})
+	return err
+}
+
+// ── orgs (auth-service-15) ─────────────────────────────────────────────────
+
+type orgItem struct {
+	PK, SK, GSI1PK, GSI1SK string
+	Type                   string `dynamodbav:"type"`
+	ID                     string `dynamodbav:"id"`
+	ServiceID              string `dynamodbav:"service_id"`
+	Name                   string `dynamodbav:"name"`
+	Status                 string `dynamodbav:"status"`
+	CreatedAt              string `dynamodbav:"created_at"`
+}
+
+func (it orgItem) toOrg() (Org, error) {
+	t, err := time.Parse(time.RFC3339Nano, it.CreatedAt)
+	if err != nil {
+		return Org{}, fmt.Errorf("store: bad created_at on %s: %w", it.PK, err)
+	}
+	return Org{ID: it.ID, ServiceID: it.ServiceID, Name: it.Name, Status: it.Status, CreatedAt: t}, nil
+}
+
+type memberItem struct {
+	PK, SK, GSI1PK, GSI1SK string
+	Type                   string `dynamodbav:"type"`
+	ServiceID              string `dynamodbav:"service_id"`
+	OrgID                  string `dynamodbav:"org_id"`
+	UserID                 string `dynamodbav:"user_id"`
+	Role                   string `dynamodbav:"role"`
+	CreatedAt              string `dynamodbav:"created_at"`
+}
+
+func (it memberItem) toMember() (OrgMember, error) {
+	t, err := time.Parse(time.RFC3339Nano, it.CreatedAt)
+	if err != nil {
+		return OrgMember{}, fmt.Errorf("store: bad created_at on %s/%s: %w", it.PK, it.SK, err)
+	}
+	return OrgMember{ServiceID: it.ServiceID, OrgID: it.OrgID, UserID: it.UserID, Role: it.Role, CreatedAt: t}, nil
+}
+
+func (d *Dynamo) CreateOrg(ctx context.Context, o Org) error {
+	item, err := attributevalue.MarshalMap(orgItem{
+		PK: pkOrg + o.ServiceID + "#" + o.ID, SK: skMeta, GSI1PK: gsiOrgs + o.ServiceID, GSI1SK: o.CreatedAt.UTC().Format(time.RFC3339Nano) + "#" + o.ID,
+		Type: "org", ID: o.ID, ServiceID: o.ServiceID, Name: o.Name, Status: o.Status, CreatedAt: o.CreatedAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = d.db.PutItem(ctx, &dynamodb.PutItemInput{TableName: &d.table, Item: item, ConditionExpression: aws.String("attribute_not_exists(PK)")})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrConflict
+	}
+	return err
+}
+
+func (d *Dynamo) GetOrg(ctx context.Context, serviceID, id string) (Org, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkOrg+serviceID+"#"+id, skMeta)})
+	if err != nil {
+		return Org{}, err
+	}
+	if out.Item == nil {
+		return Org{}, ErrNotFound
+	}
+	var it orgItem
+	if err := attributevalue.UnmarshalMap(out.Item, &it); err != nil {
+		return Org{}, err
+	}
+	return it.toOrg()
+}
+
+func (d *Dynamo) ListOrgs(ctx context.Context, serviceID string, limit int, cursor string) ([]Org, string, error) {
+	in := &dynamodb.QueryInput{
+		TableName:                 &d.table,
+		IndexName:                 aws.String(gsi1),
+		KeyConditionExpression:    aws.String("GSI1PK = :p"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: gsiOrgs + serviceID}},
+		Limit:                     aws.Int32(int32(limit + 1)), //nolint:gosec // limit is clamped by the caller
+	}
+	if cursor != "" {
+		gsk, pk, ok := strings.Cut(cursor, "|")
+		if !ok {
+			return nil, "", fmt.Errorf("store: bad cursor %q", cursor)
+		}
+		in.ExclusiveStartKey = map[string]types.AttributeValue{
+			"GSI1PK": &types.AttributeValueMemberS{Value: gsiOrgs + serviceID}, "GSI1SK": &types.AttributeValueMemberS{Value: gsk},
+			"PK": &types.AttributeValueMemberS{Value: pk}, "SK": &types.AttributeValueMemberS{Value: skMeta},
+		}
+	}
+	out, err := d.db.Query(ctx, in)
+	if err != nil {
+		return nil, "", err
+	}
+	var items []orgItem
+	if err := attributevalue.UnmarshalListOfMaps(out.Items, &items); err != nil {
+		return nil, "", err
+	}
+	next := ""
+	if len(items) > limit {
+		items = items[:limit]
+		next = items[limit-1].GSI1SK + "|" + items[limit-1].PK
+	}
+	orgs := make([]Org, 0, len(items))
+	for _, it := range items {
+		o, err := it.toOrg()
+		if err != nil {
+			return nil, "", err
+		}
+		orgs = append(orgs, o)
+	}
+	return orgs, next, nil
+}
+
+func (d *Dynamo) UpdateOrg(ctx context.Context, o Org) error {
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                &d.table,
+		Key:                      dynKey(pkOrg+o.ServiceID+"#"+o.ID, skMeta),
+		UpdateExpression:         aws.String("SET #n = :n, #s = :s"),
+		ConditionExpression:      aws.String("attribute_exists(PK)"),
+		ExpressionAttributeNames: map[string]string{"#n": "name", "#s": "status"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":n": &types.AttributeValueMemberS{Value: o.Name},
+			":s": &types.AttributeValueMemberS{Value: o.Status},
+		},
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
+	return err
+}
+
+func (d *Dynamo) DeleteOrg(ctx context.Context, serviceID, id string) error {
+	if _, err := d.GetOrg(ctx, serviceID, id); err != nil {
+		return err
+	}
+	mems, err := d.ListOrgMembers(ctx, serviceID, id)
+	if err != nil {
+		return err
+	}
+	for _, mb := range mems {
+		if _, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkOrg+serviceID+"#"+id, skMember+mb.UserID)}); err != nil {
+			return err
+		}
+	}
+	_, err = d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkOrg+serviceID+"#"+id, skMeta)})
+	return err
+}
+
+func (d *Dynamo) PutOrgMember(ctx context.Context, m OrgMember) error {
+	// Upsert that keeps the original created_at: role changes are not re-joins.
+	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                &d.table,
+		Key:                      dynKey(pkOrg+m.ServiceID+"#"+m.OrgID, skMember+m.UserID),
+		UpdateExpression:         aws.String("SET #t = :t, service_id = :svc, org_id = :o, user_id = :u, #r = :r, created_at = if_not_exists(created_at, :c), GSI1PK = :g1, GSI1SK = :g2"),
+		ExpressionAttributeNames: map[string]string{"#t": "type", "#r": "role"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":t":   &types.AttributeValueMemberS{Value: "org_member"},
+			":svc": &types.AttributeValueMemberS{Value: m.ServiceID},
+			":o":   &types.AttributeValueMemberS{Value: m.OrgID},
+			":u":   &types.AttributeValueMemberS{Value: m.UserID},
+			":r":   &types.AttributeValueMemberS{Value: m.Role},
+			":c":   &types.AttributeValueMemberS{Value: m.CreatedAt.UTC().Format(time.RFC3339Nano)},
+			":g1":  &types.AttributeValueMemberS{Value: gsiUserOrgs + m.ServiceID + "#" + m.UserID},
+			":g2":  &types.AttributeValueMemberS{Value: pkOrg + m.OrgID},
+		},
+	})
+	return err
+}
+
+func (d *Dynamo) GetOrgMember(ctx context.Context, serviceID, orgID, userID string) (OrgMember, error) {
+	out, err := d.db.GetItem(ctx, &dynamodb.GetItemInput{TableName: &d.table, Key: dynKey(pkOrg+serviceID+"#"+orgID, skMember+userID)})
+	if err != nil {
+		return OrgMember{}, err
+	}
+	if out.Item == nil {
+		return OrgMember{}, ErrNotFound
+	}
+	var it memberItem
+	if err := attributevalue.UnmarshalMap(out.Item, &it); err != nil {
+		return OrgMember{}, err
+	}
+	return it.toMember()
+}
+
+// queryMembers drains every page of a member query.
+func (d *Dynamo) queryMembers(ctx context.Context, in *dynamodb.QueryInput) ([]OrgMember, error) {
+	out := []OrgMember{}
+	for {
+		page, err := d.db.Query(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		var items []memberItem
+		if err := attributevalue.UnmarshalListOfMaps(page.Items, &items); err != nil {
+			return nil, err
+		}
+		for _, it := range items {
+			m, err := it.toMember()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, m)
+		}
+		if page.LastEvaluatedKey == nil {
+			break
+		}
+		in.ExclusiveStartKey = page.LastEvaluatedKey
+	}
+	sortMembers(out)
+	return out, nil
+}
+
+func (d *Dynamo) ListOrgMembers(ctx context.Context, serviceID, orgID string) ([]OrgMember, error) {
+	return d.queryMembers(ctx, &dynamodb.QueryInput{
+		TableName:              &d.table,
+		KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :sk)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: pkOrg + serviceID + "#" + orgID},
+			":sk": &types.AttributeValueMemberS{Value: skMember},
+		},
+	})
+}
+
+func (d *Dynamo) ListUserOrgs(ctx context.Context, serviceID, userID string) ([]OrgMember, error) {
+	return d.queryMembers(ctx, &dynamodb.QueryInput{
+		TableName:                 &d.table,
+		IndexName:                 aws.String(gsi1),
+		KeyConditionExpression:    aws.String("GSI1PK = :p"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":p": &types.AttributeValueMemberS{Value: gsiUserOrgs + serviceID + "#" + userID}},
+	})
+}
+
+func (d *Dynamo) DeleteOrgMember(ctx context.Context, serviceID, orgID, userID string) error {
+	_, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: &d.table, Key: dynKey(pkOrg+serviceID+"#"+orgID, skMember+userID),
+		ConditionExpression: aws.String("attribute_exists(PK)"),
+	})
+	var cond *types.ConditionalCheckFailedException
+	if errors.As(err, &cond) {
+		return ErrNotFound
+	}
 	return err
 }

@@ -185,7 +185,7 @@
   details .muted.fine { color: var(--steel); }
 
   /* ── tables ─────────────────────────────────────────────────────────── */
-  .creds, .users, .resources, #audit, #passkeys, #approve-body { overflow-x: auto; max-width: 100%; }
+  .creds, .users, .orgs, .resources, #audit, #passkeys, #approve-body { overflow-x: auto; max-width: 100%; }
   table {
     width: 100%; margin-top: 8px; border: 1px solid var(--mist); border-radius: var(--radius);
     border-collapse: separate; border-spacing: 0; background: var(--white); font-size: 13px;
@@ -199,12 +199,12 @@
   td.mono, td .mono { font-size: 12px; white-space: nowrap; }
   td.mono b { color: var(--ink); font-weight: 600; }
   td button { vertical-align: middle; }
-  .creds td, .users td, #passkeys td { white-space: nowrap; }
+  .creds td, .users td, .orgs td, #passkeys td { white-space: nowrap; }
   #approve-body th { width: 30%; vertical-align: middle; }
   #approve-body td.mono { white-space: normal; overflow-wrap: anywhere; }
   .resources > .mono { padding: 8px 12px; border: 1px solid var(--mist); border-radius: var(--radius); margin-top: 6px; overflow-wrap: anywhere; background: var(--white); }
   .resources > .mono + .mono { margin-top: 6px; }
-  .resources > p, .creds > p, .users > p, #audit > p, #passkeys > p { margin: 6px 0; font-size: 13px; }
+  .resources > p, .creds > p, .users > p, .orgs > p, #audit > p, #passkeys > p { margin: 6px 0; font-size: 13px; }
 
   /* ── pills, secrets, messages ───────────────────────────────────────── */
   .pill {
@@ -628,6 +628,10 @@
         <div class="users"></div>
         <div class="row user-add mt2${svc.login_url ? '' : ' hidden'}"><input class="grow user-email" placeholder="email"><input class="grow user-name" placeholder="name (optional)"><select class="user-method"><option value="passkey">passkey</option><option value="google">google</option><option value="email">email code</option></select><button class="small user-create">Add account</button></div>
       </details>
+      <details class="orgs-details${svc.login_url ? '' : ' hidden'}"><summary>Teams</summary>
+        <p class="muted fine">Organisations the app's users created (a practice, a company). Members and their org role are managed by the app under its service token; this view is read-only.</p>
+        <div class="orgs"></div>
+      </details>
       <details><summary>${(svc.resources || []).length} connector resource${(svc.resources || []).length === 1 ? '' : 's'}</summary>
         <div class="resources"></div>
         <div class="row mt2"><input class="grow res-url" placeholder="https://finforge.nathanblatter.com/mcp"><button class="small res-add">Add resource</button></div>
@@ -726,6 +730,39 @@
           await loadUsers();
         } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
       };
+    }
+
+    if (svc.login_url) {
+      const orgsEl = wrap.querySelector('.orgs');
+      const details = wrap.querySelector('.orgs-details');
+      let loadedOrgs = false;
+      const loadOrgs = async () => {
+        try {
+          const { orgs } = await api('GET', `/admin/services/${svc.id}/orgs?limit=200`);
+          orgsEl.innerHTML = '';
+          if (!orgs.length) { orgsEl.innerHTML = '<p class="muted">No teams yet.</p>'; return; }
+          const t = document.createElement('table');
+          t.innerHTML = '<tr><th>Name</th><th>Id</th><th>Status</th><th>Created</th><th>Members</th></tr>';
+          for (const o of orgs) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = '<td></td><td class="mono muted"></td><td></td><td class="muted"></td><td></td>';
+            tr.children[0].textContent = o.name; tr.children[1].textContent = o.id;
+            tr.children[2].innerHTML = o.status === 'active' ? '<span class="pill ok">active</span>' : '<span class="pill off">disabled</span>';
+            tr.children[3].textContent = fmt(o.created_at);
+            const b = document.createElement('button'); b.className = 'small'; b.textContent = 'Show';
+            b.onclick = async () => {
+              try {
+                const { members } = await api('GET', `/admin/services/${svc.id}/orgs/${o.id}/members`);
+                tr.children[4].textContent = members.length ? members.map(m => `${m.email} (${m.role})`).join(', ') : 'none';
+              } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+            };
+            tr.children[4].appendChild(b);
+            t.appendChild(tr);
+          }
+          orgsEl.appendChild(t);
+        } catch (e) { msg.textContent = e.message; msg.className = 'msg err'; }
+      };
+      details.addEventListener('toggle', () => { if (details.open && !loadedOrgs) { loadedOrgs = true; loadOrgs(); } });
     }
 
     const resources = wrap.querySelector('.resources');

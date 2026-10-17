@@ -64,8 +64,14 @@ func (s *Server) userFail(w http.ResponseWriter, err error) bool {
 	switch {
 	case err == nil:
 		return false
-	case errors.Is(err, users.ErrUserNotFound):
+	case errors.Is(err, users.ErrUserNotFound), errors.Is(err, users.ErrOrgNotFound):
 		writeJSON(w, 404, map[string]string{"error": "not_found"})
+	case errors.Is(err, users.ErrNotMember):
+		writeJSON(w, 404, map[string]string{"error": "not_a_member"})
+	case errors.Is(err, users.ErrLastAdmin):
+		writeJSON(w, 409, map[string]string{"error": "last_admin", "detail": "an org must keep at least one admin; promote someone else first or delete the org"})
+	case errors.Is(err, users.ErrInvalidOrgName), errors.Is(err, users.ErrInvalidOrgRole):
+		writeJSON(w, 400, map[string]string{"error": "invalid_request", "detail": err.Error()})
 	case errors.Is(err, users.ErrIdentityTaken):
 		writeJSON(w, 409, map[string]string{"error": "identity_taken"})
 	case errors.Is(err, users.ErrNotUserPool), errors.Is(err, users.ErrNoWebAuthn):
@@ -270,12 +276,28 @@ func (s *Server) userPasskeyFinish(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "login_challenge expired; the passkey is registered, sign in again"})
 			return
 		}
-		if s.oauthFail(w, err) {
+		if s.completeFail(w, err) {
 			return
 		}
 		out["redirect_to"] = loc
 	}
 	writeJSON(w, 201, out)
+}
+
+// completeFail maps the errors of OAuth completion after a successful
+// ceremony; returns true when it wrote.
+func (s *Server) completeFail(w http.ResponseWriter, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, store.ErrNotFound):
+		writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "login_challenge expired; start over"})
+	case errors.Is(err, oauth.ErrNotMember):
+		writeJSON(w, 403, map[string]string{"error": "not_a_member", "detail": "this account is not a member of the requested org; the login_challenge is still valid for another account"})
+	default:
+		return s.oauthFail(w, err)
+	}
+	return true
 }
 
 // pendingFor validates a login_challenge against the calling service.
@@ -334,11 +356,7 @@ func (s *Server) loginPasskeyFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loc, err := s.OAuth.CompleteForUser(r.Context(), authzID, user, users.AllowedScopes(svc, user), clientIP(r))
-	if errors.Is(err, store.ErrNotFound) {
-		writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "login_challenge expired; start over"})
-		return
-	}
-	if s.oauthFail(w, err) {
+	if s.completeFail(w, err) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"redirect_to": loc, "user": userJSON(user)})
@@ -490,6 +508,10 @@ func (s *Server) googleCallback(w http.ResponseWriter, r *http.Request) {
 		backToLogin("expired")
 		return
 	}
+	if errors.Is(err, oauth.ErrNotMember) {
+		backToLogin("not_a_member")
+		return
+	}
 	if s.oauthFail(w, err) {
 		return
 	}
@@ -639,11 +661,7 @@ func (s *Server) loginEmailFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	loc, err := s.OAuth.CompleteForUser(r.Context(), authzID, user, users.AllowedScopes(svc, user), clientIP(r))
-	if errors.Is(err, store.ErrNotFound) {
-		writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "login_challenge expired; start over"})
-		return
-	}
-	if s.oauthFail(w, err) {
+	if s.completeFail(w, err) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"redirect_to": loc, "user": userJSON(user)})

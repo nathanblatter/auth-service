@@ -100,6 +100,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/services/{id}/resources", s.requireAdmin(s.addResource))
 	mux.HandleFunc("PUT /admin/services/{id}/permissions", s.requireAdmin(s.setPermissions))
 	s.userRoutes(mux)
+	s.orgRoutes(mux)
 	return s.withCommon(mux)
 }
 
@@ -172,6 +173,7 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 		s.oauthToken(w, r, oauth.TokenRequest{
 			GrantType: g, ClientID: clientID, ClientSecret: secret, Code: r.PostForm.Get("code"),
 			CodeVerifier: r.PostForm.Get("code_verifier"), RedirectURI: r.PostForm.Get("redirect_uri"), RefreshToken: r.PostForm.Get("refresh_token"),
+			Org: r.PostForm.Get("org"),
 		})
 		return
 	default:

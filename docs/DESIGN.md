@@ -107,8 +107,8 @@ The console accepts only the issuer origin; the execute-api URL cannot register 
 - Service (machine) tokens keep the fixed scope `service`: they identify a backend to this API,
   not a person to a product.
 - Roles are stored now and become live in slice 3: each user of a service holds roles, and
-  "allowed" for that user is the union of their roles' scopes. Teams (auth-service-15) assign
-  roles at the organisation level.
+  "allowed" for that user is the union of their roles' scopes. Teams (auth-service-15) add an
+  org-level role (`admin | member`) on top; see "Teams and organisations".
 - Enforcement is the consumer's job: `client.RequireScope("write")` / `claims.HasScope`.
 
 ## Step-up verification (auth-service-17)
@@ -278,6 +278,8 @@ users get the service's `default_roles`. Refresh tokens carry `sub` and honour a
 | Identity lock (one method, one identity) | `IDENT#<svc>#google:<sub>`, `IDENT#<svc>#email:<email>` or `IDENT#<svc>#google-pending:<email>` (provisioned, not yet signed in) | `META` → user id | | |
 | User passkey | `USER#<svc>#<id>` | `PASSKEY#<cred id>` | `UPK#<svc>#<cred id>` | user id |
 | Seen address (new-login alerts) | `USER#<svc>#<id>` | `SEEN#<ip>` | | (TTL 90 days) |
+| Org | `ORG#<svc>#<id>` | `META` | `ORGS#<svc>` | `<created_at>#<id>` |
+| Org membership | `ORG#<svc>#<org>` | `MEMBER#<user id>` | `USERORGS#<svc>#<user id>` | `ORG#<org>` |
 
 Service row gains `login_url`, `rp_id`, `origins`, `default_roles`.
 
@@ -300,6 +302,42 @@ refresh tokens fail at the token endpoint because the subject no longer resolves
 tokens expire within the hour. The export never includes key material. The product is
 responsible for confirming the user's intent (and its own step-up) before calling delete.
 
+## Teams and organisations (auth-service-15)
+
+**DECIDED (Nathan, 2026-10-17):** (1) an org is scoped to **one service**, like its users
+(a therapy practice lives inside AI Therapist; nothing spans products). (2) **Any user may
+found an org** through the app and becomes its first admin; members are added directly **by
+user id** for now, emailed invitations later. (3) A user holds **0..n memberships** with an org
+role, `admin` or `member`, layered on their service roles; the app **requests an org context
+at login** and the token carries `org` + `org_role`, not a list of every membership.
+
+Shape (*proposed* details):
+
+- Rows: `ORG#<svc>#<id> / META` (GSI1 `ORGS#<svc>` by creation time, for listing) and
+  `ORG#<svc>#<org> / MEMBER#<user>` (GSI1 `USERORGS#<svc>#<user>`, so "which orgs am I in" is
+  one index query). Re-roling a member is an upsert that keeps the join date. Deleting a user
+  removes its memberships; deleting an org removes its members.
+- Invariant kept here, not in app code: an org always has at least one admin
+  (`409 last_admin` on the demotion or removal that would break it). An org whose only admin
+  deletes their account keeps its members; the product promotes one with the membership call.
+- Authority: the org endpoints run under the product's **service token**, like user
+  management. The product decides who may call them, normally by reading `org_role` from the
+  caller's own token. Squawk guarantees consistency and puts the context into tokens.
+- Login: `org=<id>` on `/oauth/authorize` is validated against the resource's service (unknown
+  → `invalid_request`, disabled → `access_denied`, both bounced to the client). At completion
+  the membership is checked **before** the parked request is consumed, so a non-member gets
+  `403 not_a_member` and someone else can still sign in on the same page. The owner is admin
+  of every org in the owner's services (one cross-tenant identity). The code and refresh token
+  carry `org` + `org_role` into `mint`.
+- Switching: a refresh with `org=<id>` moves the session into that org (non-member →
+  `invalid_grant`). A plain refresh re-resolves the role from the current membership and
+  **drops** a context whose membership, or org, is gone (audited `oauth.org.dropped`) rather
+  than failing: the app sees no `org` claim and shows its picker. Rejected: failing the refresh
+  (would log the person out of the product for an org-side change) and listing every
+  membership in the token (Nathan chose the explicit context).
+- Console: a read-only "Teams" view per user-pool service (orgs and members). Creating or
+  editing orgs from the console is not a flow Nathan asked for.
+
 ## Tokens
 
 *Proposed.* JWT, ES256, header `{"alg":"ES256","kid":"<kms key id>","typ":"at+jwt"}`.
@@ -310,6 +348,7 @@ responsible for confirming the user's intent (and its own step-up) before callin
 | `sub` | `svc:<service_id>` for service tokens; `usr:<user_id>` for end users; `owner` for the owner (connector approvals and owner sign-in) |
 | `aud` | the service id the token is for; for service tokens, `auth` (the auth API itself) |
 | `scope` | space-separated scopes |
+| `org`, `org_role` | when an org context was requested: org id and `admin`/`member` |
 | `iat`, `exp`, `jti` | standard |
 
 Lifetimes: service token 15 min. (User access tokens, refresh tokens and sessions are

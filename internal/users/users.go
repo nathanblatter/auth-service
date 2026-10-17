@@ -228,7 +228,9 @@ func (u *Users) LogoutEverywhere(ctx context.Context, serviceID, id string) erro
 	return nil
 }
 
-// Delete removes the account, its identity and passkeys (auth-service-13).
+// Delete removes the account, its identity, passkeys and org memberships
+// (auth-service-13). An org whose only admin is deleted keeps its other
+// members; the product promotes one with SetMember.
 // Refresh tokens die with it: the token endpoint refuses subjects whose user
 // row is gone. Already-issued access tokens run out within the hour.
 func (u *Users) Delete(ctx context.Context, serviceID, id string) error {
@@ -253,6 +255,7 @@ type Export struct {
 	ExportedAt time.Time          `json:"exported_at"`
 	User       store.User         `json:"user"`
 	Passkeys   []PasskeyMeta      `json:"passkeys"`
+	Orgs       []Membership       `json:"orgs"`
 	Audit      []store.AuditEvent `json:"audit"`
 }
 
@@ -276,6 +279,9 @@ func (u *Users) Export(ctx context.Context, serviceID, id string) (Export, error
 	out := Export{ExportedAt: u.Now(), User: user, Passkeys: make([]PasskeyMeta, 0, len(keys)), Audit: []store.AuditEvent{}}
 	for _, k := range keys {
 		out.Passkeys = append(out.Passkeys, PasskeyMeta{ID: k.ID, Name: k.Name, CreatedAt: k.CreatedAt})
+	}
+	if out.Orgs, err = u.memberships(ctx, serviceID, id); err != nil {
+		return Export{}, err
 	}
 	actor := "usr:" + id
 	for _, month := range []string{u.Now().UTC().Format("2006-01"), u.Now().UTC().AddDate(0, -1, 0).Format("2006-01")} {

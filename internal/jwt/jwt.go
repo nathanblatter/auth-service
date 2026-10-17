@@ -29,10 +29,14 @@ type Claims struct {
 	Email    string `json:"email,omitempty"`
 	// EmailVerified is set on user tokens once the address is proven
 	// (Google asserted it, an email code was entered, or the owner vouched).
-	EmailVerified bool   `json:"email_verified,omitempty"`
-	IssuedAt      int64  `json:"iat"`
-	Expires       int64  `json:"exp"`
-	ID            string `json:"jti"`
+	EmailVerified bool `json:"email_verified,omitempty"`
+	// Org / OrgRole are set when the app asked for an org context and the
+	// subject is a member (or the owner): the org id and admin|member.
+	Org      string `json:"org,omitempty"`
+	OrgRole  string `json:"org_role,omitempty"`
+	IssuedAt int64  `json:"iat"`
+	Expires  int64  `json:"exp"`
+	ID       string `json:"jti"`
 }
 
 type header struct {

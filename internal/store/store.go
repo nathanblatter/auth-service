@@ -57,6 +57,26 @@ type User struct {
 	LastLoginAt time.Time
 }
 
+// Org is a team / organisation inside one service (auth-service-15): a
+// customer account with several members. Orgs never span services.
+type Org struct {
+	ID        string
+	ServiceID string
+	Name      string
+	Status    string // active | disabled
+	CreatedAt time.Time
+}
+
+// OrgMember is one user's membership of one org, with an org-level role
+// (admin | member) layered on the user's service roles.
+type OrgMember struct {
+	ServiceID string
+	OrgID     string
+	UserID    string
+	Role      string
+	CreatedAt time.Time
+}
+
 // UserPasskey is a WebAuthn credential of an end user (Data = webauthn.Credential JSON).
 type UserPasskey struct {
 	ServiceID string
@@ -140,7 +160,10 @@ type AuthzRequest struct {
 	Challenge   string // PKCE S256
 	Resource    string
 	ServiceID   string
-	ExpiresAt   time.Time
+	// Org is the org context the app asked for (optional); membership is
+	// checked when the user signs in.
+	Org       string
+	ExpiresAt time.Time
 }
 
 // Code is a one-time authorization code (stored under its hash).
@@ -151,6 +174,8 @@ type Code struct {
 	Scope       string
 	Subject     string
 	ServiceID   string
+	Org         string // org context carried into the tokens (optional)
+	OrgRole     string
 	ExpiresAt   time.Time
 }
 
@@ -162,6 +187,8 @@ type RefreshToken struct {
 	ServiceID string
 	Subject   string
 	Scope     string
+	Org       string // org context; re-resolved against the membership on refresh
+	OrgRole   string
 	IssuedAt  time.Time
 	ExpiresAt time.Time
 	Used      bool
@@ -190,7 +217,20 @@ type Store interface {
 	// google-pending:<email> onto the real google:<sub>). ErrNotFound when the
 	// user or old lock is missing; ErrConflict when the new identity is taken.
 	RebindUserIdentity(ctx context.Context, serviceID, userID, oldIdentity, newIdentity string) error
-	DeleteUser(ctx context.Context, serviceID, id string) error // removes the user, its identity lock and passkeys; ErrNotFound
+	DeleteUser(ctx context.Context, serviceID, id string) error // removes the user, its identity lock, passkeys and org memberships; ErrNotFound
+
+	// Orgs (auth-service-15). Members are keyed by (org, user); PutOrgMember
+	// upserts (changing the role keeps created_at).
+	CreateOrg(ctx context.Context, o Org) error // ErrConflict when the id exists
+	GetOrg(ctx context.Context, serviceID, id string) (Org, error)
+	ListOrgs(ctx context.Context, serviceID string, limit int, cursor string) (orgs []Org, next string, err error)
+	UpdateOrg(ctx context.Context, o Org) error                // ErrNotFound; replaces Name, Status
+	DeleteOrg(ctx context.Context, serviceID, id string) error // removes the org and its memberships; ErrNotFound
+	PutOrgMember(ctx context.Context, m OrgMember) error
+	GetOrgMember(ctx context.Context, serviceID, orgID, userID string) (OrgMember, error)
+	ListOrgMembers(ctx context.Context, serviceID, orgID string) ([]OrgMember, error) // oldest first
+	ListUserOrgs(ctx context.Context, serviceID, userID string) ([]OrgMember, error)  // the user's memberships
+	DeleteOrgMember(ctx context.Context, serviceID, orgID, userID string) error       // ErrNotFound
 	PutUserPasskey(ctx context.Context, p UserPasskey) error
 	UpdateUserPasskey(ctx context.Context, p UserPasskey) error
 	ListUserPasskeys(ctx context.Context, serviceID, userID string) ([]UserPasskey, error)
