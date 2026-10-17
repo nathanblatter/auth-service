@@ -594,3 +594,75 @@ func TestPasskeyActivation(t *testing.T) {
 		t.Fatalf("no mailer: %v", err)
 	}
 }
+
+func TestNewLoginAlerts(t *testing.T) {
+	u, mem, svc := newUsers(t)
+	ctx := context.Background()
+	fm := &fakeMail{}
+	u.Mail = fm
+	login := func(ip string) store.User {
+		t.Helper()
+		ch, err := u.BeginLoginEmail(ctx, svc, "authz", "p@x.test", ip)
+		if err != nil {
+			t.Fatal(err)
+		}
+		user, _, err := u.FinishLoginEmail(ctx, svc, ch, fm.code(t), ip)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return user
+	}
+	alerts := func() int { return countAudit(t, mem, "user.login.alerted") }
+
+	// First ever sign-in (the sign-up) is not an alert; it records the ip.
+	user := login("1.1.1.1")
+	if got, _ := u.Get(ctx, svc.ID, user.ID); got.LastLoginAt.IsZero() {
+		t.Fatal("last_login_at not stamped")
+	}
+	if alerts() != 0 || strings.Contains(fm.subject, "New sign-in") {
+		t.Fatalf("first login alerted: %q", fm.subject)
+	}
+	// Same address again: quiet.
+	login("1.1.1.1")
+	if alerts() != 0 {
+		t.Fatal("known ip alerted")
+	}
+	// New address: one alert naming the method and the ip.
+	login("2.2.2.2")
+	if alerts() != 1 || !strings.Contains(fm.subject, "New sign-in to FinForge") || !strings.Contains(fm.text, "2.2.2.2") || !strings.Contains(fm.text, "email code") || !strings.Contains(fm.text, "https://finforge.test") {
+		t.Fatalf("alert: n=%d subj=%q text=%q", alerts(), fm.subject, fm.text)
+	}
+	// Now both addresses are known.
+	login("2.2.2.2")
+	login("1.1.1.1")
+	if alerts() != 1 {
+		t.Fatalf("known ips alerted again: %d", alerts())
+	}
+	// Per-account cap: the limiter says no → suppressed and audited.
+	u.AlertAllowed = func(context.Context, string) bool { return false }
+	login("3.3.3.3")
+	if alerts() != 1 || countAudit(t, mem, "user.login.alert_suppressed") != 1 {
+		t.Fatalf("suppression: alerts=%d", alerts())
+	}
+	// No ip (e.g. a test harness) → nothing recorded, no alert, no error.
+	u.AlertAllowed = nil
+	login("")
+	if alerts() != 1 {
+		t.Fatal("empty ip alerted")
+	}
+	// Google logins are covered too.
+	g, _ := u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "7", Email: "g@x.test", EmailVerified: true}, "5.5.5.5")
+	_, _ = u.LoginGoogle(ctx, svc, GoogleIdentity{Sub: "7", Email: "g@x.test", EmailVerified: true}, "6.6.6.6")
+	if alerts() != 2 || fm.to != g.Email || !strings.Contains(fm.text, "Google") {
+		t.Fatalf("google alert: n=%d to=%q", alerts(), fm.to)
+	}
+	// After the window the old address is new again (the audit lands in a
+	// later month, so judge by the mail itself).
+	later := u.Now().Add(SeenIPTTL + time.Hour)
+	u.Now = func() time.Time { return later }
+	fm.subject = ""
+	login("1.1.1.1")
+	if !strings.Contains(fm.subject, "New sign-in") {
+		t.Fatalf("expired sighting must alert: %q", fm.subject)
+	}
+}

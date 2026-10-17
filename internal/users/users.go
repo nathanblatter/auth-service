@@ -37,6 +37,8 @@ const (
 	CodeTTL = 10 * time.Minute
 	// CodeAttempts is how many wrong guesses one code survives.
 	CodeAttempts = 5
+	// SeenIPTTL is how long a sign-in address stays "known" for new-login alerts.
+	SeenIPTTL = 90 * 24 * time.Hour
 
 	// ChallengeTTL bounds a WebAuthn ceremony.
 	ChallengeTTL = 5 * time.Minute
@@ -72,6 +74,9 @@ type Users struct {
 	Log   *slog.Logger
 	// Mail sends sign-in and verification codes; nil = email features off.
 	Mail Mailer
+	// AlertAllowed, when set, caps new-login alerts per account (the HTTP
+	// layer wires the rate limiter in); nil = no cap.
+	AlertAllowed func(ctx context.Context, userID string) bool
 
 	mu sync.Mutex
 	wa map[string]*webauthn.WebAuthn // keyed by service id + config fingerprint
@@ -430,6 +435,7 @@ func (u *Users) FinishRegisterPasskey(ctx context.Context, svc store.Service, ch
 	u.audit(ctx, "user.passkey.register", svc.ID, user.ID, "pk="+pk.ID, clientIP(r))
 	if ch.AuthzID != "" {
 		u.audit(ctx, "user.login", svc.ID, user.ID, "passkey activation", clientIP(r))
+		u.noteLogin(ctx, svc, user, "new passkey", clientIP(r))
 	}
 	pk.Data = nil
 	return pk, ch.AuthzID, nil
@@ -504,6 +510,7 @@ func (u *Users) FinishLoginPasskey(ctx context.Context, svc store.Service, chall
 		return store.User{}, "", err
 	}
 	u.audit(ctx, "user.login", svc.ID, matched.ID, "passkey", ip)
+	u.noteLogin(ctx, svc, matched, "passkey", ip)
 	return matched, ch.AuthzID, nil
 }
 
@@ -578,7 +585,49 @@ func (u *Users) finishGoogle(ctx context.Context, svc store.Service, user store.
 		return store.User{}, ErrDisabled
 	}
 	u.audit(ctx, "user.login", svc.ID, user.ID, "google", ip)
+	u.noteLogin(ctx, svc, user, "Google", ip)
 	return user, nil
+}
+
+// ── new-login alerts ───────────────────────────────────────────────────────
+
+// noteLogin stamps the account's last sign-in and, when the address has not
+// been seen on this account within SeenIPTTL, emails the person. The very
+// first sign-in of an account is never alerted (it is the sign-up). Alerts
+// are best effort: nothing here can fail the sign-in.
+func (u *Users) noteLogin(ctx context.Context, svc store.Service, user store.User, how, ip string) {
+	now := u.Now()
+	firstEver := user.LastLoginAt.IsZero()
+	user.LastLoginAt = now
+	if err := u.Store.UpdateUser(ctx, user); err != nil {
+		u.Log.Error("last_login_at update failed", "user", user.ID, "err", err)
+	}
+	if ip == "" {
+		return
+	}
+	known, err := u.Store.TouchSeenIP(ctx, svc.ID, user.ID, ip, now, SeenIPTTL)
+	if err != nil {
+		u.Log.Error("seen ip update failed", "user", user.ID, "err", err)
+		return
+	}
+	if known || firstEver || u.Mail == nil || user.Email == "" {
+		return
+	}
+	if u.AlertAllowed != nil && !u.AlertAllowed(ctx, user.ID) {
+		u.audit(ctx, "user.login.alert_suppressed", svc.ID, user.ID, "rate limit", ip)
+		return
+	}
+	app := svc.Name
+	if o, err := url.Parse(svc.LoginURL); err == nil && o.Host != "" {
+		app = o.Scheme + "://" + o.Host
+	}
+	text := fmt.Sprintf("Someone just signed in to your %s account.\n\nWhen:   %s\nHow:    %s\nFrom:   %s\n\nIf this was you, there is nothing to do.\nIf it wasn't, sign in at %s, sign out everywhere from your account settings, and change how you sign in.",
+		svc.Name, now.UTC().Format("2006-01-02 15:04 UTC"), how, ip, app)
+	if err := u.Mail.Send(ctx, user.Email, fmt.Sprintf("New sign-in to %s", svc.Name), text); err != nil {
+		u.Log.Error("login alert email failed", "user", user.ID, "err", err)
+		return
+	}
+	u.audit(ctx, "user.login.alerted", svc.ID, user.ID, how+" ip="+ip, ip)
 }
 
 // ── passkey activation ─────────────────────────────────────────────────────
@@ -734,6 +783,7 @@ func (u *Users) FinishLoginEmail(ctx context.Context, svc store.Service, challen
 		return store.User{}, "", ErrDisabled
 	}
 	u.audit(ctx, "user.login", svc.ID, user.ID, "email", ip)
+	u.noteLogin(ctx, svc, user, "email code", ip)
 	return user, ch.AuthzID, nil
 }
 

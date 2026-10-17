@@ -225,6 +225,30 @@ func conformance(t *testing.T, s Store) {
 	if gu, _ := s.GetUser(ctx, "svc_a", "u2"); !gu.EmailVerified {
 		t.Fatalf("UpdateUser must persist email_verified: %+v", gu)
 	}
+	u2.LastLoginAt = now.Add(time.Minute)
+	if err := s.UpdateUser(ctx, u2); err != nil {
+		t.Fatal(err)
+	}
+	if gu, _ := s.GetUser(ctx, "svc_a", "u2"); !gu.LastLoginAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("UpdateUser must persist last_login_at: %+v", gu)
+	}
+	// Seen IPs: first sighting is unknown, a repeat inside the window is known,
+	// after the window it is new again.
+	if known, err := s.TouchSeenIP(ctx, "svc_a", "u2", "10.0.0.1", now, time.Hour); err != nil || known {
+		t.Fatalf("first sighting: known=%v %v", known, err)
+	}
+	if known, _ := s.TouchSeenIP(ctx, "svc_a", "u2", "10.0.0.1", now.Add(30*time.Minute), time.Hour); !known {
+		t.Fatal("repeat inside window must be known")
+	}
+	if known, _ := s.TouchSeenIP(ctx, "svc_a", "u2", "10.0.0.2", now.Add(30*time.Minute), time.Hour); known {
+		t.Fatal("other ip must be new")
+	}
+	if known, _ := s.TouchSeenIP(ctx, "svc_a", "u2", "10.0.0.1", now.Add(3*time.Hour), time.Hour); known {
+		t.Fatal("after the window the ip is new again")
+	}
+	if known, _ := s.TouchSeenIP(ctx, "svc_a", "u1", "10.0.0.1", now, time.Hour); known {
+		t.Fatal("seen ips are per user")
+	}
 	if _, err := s.GetUser(ctx, "svc_b", "u1"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("user from another service: %v", err)
 	}

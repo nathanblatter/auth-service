@@ -53,6 +53,8 @@ type User struct {
 	// EmailVerified: the address was proven (Google, email code, or the owner).
 	// App-created passkey accounts start false and cannot sign in until verified.
 	EmailVerified bool
+	// LastLoginAt is the most recent successful sign-in; zero until the first.
+	LastLoginAt time.Time
 }
 
 // UserPasskey is a WebAuthn credential of an end user (Data = webauthn.Credential JSON).
@@ -180,7 +182,10 @@ type Store interface {
 	GetUser(ctx context.Context, serviceID, id string) (User, error)
 	GetUserByIdentity(ctx context.Context, serviceID, identity string) (User, error)
 	ListUsers(ctx context.Context, serviceID string, limit int, cursor string) (users []User, next string, err error)
-	UpdateUser(ctx context.Context, u User) error // ErrNotFound; replaces Email, Name, Roles, Status, NotBefore, EmailVerified
+	UpdateUser(ctx context.Context, u User) error // ErrNotFound; replaces Email, Name, Roles, Status, NotBefore, EmailVerified, LastLoginAt
+	// TouchSeenIP records that the user signed in from ip and reports whether
+	// that ip was already on record (within ttl of its last sighting).
+	TouchSeenIP(ctx context.Context, serviceID, userID, ip string, now time.Time, ttl time.Duration) (known bool, err error)
 	// RebindUserIdentity moves a user's identity lock (e.g. a pre-provisioned
 	// google-pending:<email> onto the real google:<sub>). ErrNotFound when the
 	// user or old lock is missing; ErrConflict when the new identity is taken.

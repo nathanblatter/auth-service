@@ -1044,6 +1044,29 @@ func TestEmailCodeHTTP(t *testing.T) {
 	if code, _ := do(t, "POST", ts.URL+"/v1/login/email/finish?challenge="+chID, svcTok, "application/json", `{"code":"`+mail.code(t)+`"}`); code != 401 {
 		t.Fatalf("replay: %d", code)
 	}
+	// A second sign-in from another address raises a new-login alert email.
+	doFrom := func(ip, method, path, body string) (int, map[string]any) {
+		t.Helper()
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.Header.Set("Authorization", svcTok)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Forwarded-For", ip)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out map[string]any
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+	_, b2 := doFrom("203.0.113.9", "POST", "/v1/login/email/begin", `{"login_challenge":"`+authorize()+`","email":"player@x.test"}`)
+	if code, _ := doFrom("203.0.113.9", "POST", "/v1/login/email/finish?challenge="+b2["challenge_id"].(string), `{"code":"`+mail.code(t)+`"}`); code != 200 {
+		t.Fatalf("second login: %d", code)
+	}
+	if !strings.Contains(mail.subject, "New sign-in to Codenames") || !strings.Contains(mail.text, "203.0.113.9") {
+		t.Fatalf("alert email: subj=%q", mail.subject)
+	}
 	// Per-address send cap.
 	for i := 0; i < 10; i++ {
 		code, _ = do(t, "POST", ts.URL+"/v1/login/email/begin", svcTok, "application/json", `{"login_challenge":"`+authorize()+`","email":"spam@x.test"}`)

@@ -96,6 +96,9 @@ func userJSON(u store.User) map[string]any {
 	}
 	out := map[string]any{"id": u.ID, "service_id": u.ServiceID, "method": u.Method, "email": u.Email, "email_verified": u.EmailVerified, "name": u.Name,
 		"roles": roles, "status": u.Status, "created_at": u.CreatedAt.UTC().Format(time.RFC3339)}
+	if !u.LastLoginAt.IsZero() {
+		out["last_login_at"] = u.LastLoginAt.UTC().Format(time.RFC3339)
+	}
 	return out
 }
 

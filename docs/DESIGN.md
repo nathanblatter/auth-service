@@ -178,6 +178,14 @@ accounts. Tokens carry `email_verified`. Codes live in `CHALLENGE#` rows as a sa
 (challenge id + code), 10 minutes, 5 attempts (a wrong guess re-puts the row with the same
 expiry), single use. Sends are rate-limited per address and per IP.
 
+**New-sign-in alerts (auth-service-29).** Every successful user sign-in stamps
+`last_login_at` and touches a `SEEN#<ip>` row under the user (DynamoDB TTL, 90 days). A
+sign-in whose address was not on record, on an account that has signed in before, mails the
+person (service, method, time, IP, what to do: sign out everywhere from the app). Capped at
+3 per account per day through the rate limiter; suppressed alerts are audited. Best effort:
+an alert failure never fails a sign-in. Owner/admin console sessions are not covered here
+(they have their own audit trail).
+
 **Delivery (auth-service-8): an SQS outbox and a bridge, never SMTP from the Lambda.** The API
 enqueues `{to, subject, text}` on `MailQueue`; email-api's `sqs-bridge` on the Mac mini drains
 it over a scoped IAM user (receive/delete on that one queue) and calls email-api's own keyed
@@ -253,6 +261,7 @@ users get the service's `default_roles`. Refresh tokens carry `sub` and honour a
 | User | `USER#<svc>#<id>` | `META` | `USERS#<svc>` | `<created_at>` |
 | Identity lock (one method, one identity) | `IDENT#<svc>#google:<sub>`, `IDENT#<svc>#email:<email>` or `IDENT#<svc>#google-pending:<email>` (provisioned, not yet signed in) | `META` → user id | | |
 | User passkey | `USER#<svc>#<id>` | `PASSKEY#<cred id>` | `UPK#<svc>#<cred id>` | user id |
+| Seen address (new-login alerts) | `USER#<svc>#<id>` | `SEEN#<ip>` | | (TTL 90 days) |
 
 Service row gains `login_url`, `rp_id`, `origins`, `default_roles`.
 

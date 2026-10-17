@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,6 +28,7 @@ type Memory struct {
 	users     map[string]User        // svc#id
 	idents    map[string]string      // svc#identity -> user id
 	upks      map[string]UserPasskey // svc#cred
+	seen      map[string]time.Time   // svc#user#ip → expires
 	notBefore time.Time
 	Audit     []AuditEvent
 }
@@ -48,7 +50,7 @@ func NewMemory() *Memory {
 		passkeys: map[string]Passkey{}, chals: map[string]challenge{}, sessions: map[string]Session{},
 		fails: map[string]failCounter{}, resources: map[string]string{}, clients: map[string]OAuthClient{},
 		authz: map[string]AuthzRequest{}, codes: map[string]Code{}, refresh: map[string]RefreshToken{},
-		recovery: map[string]RecoveryCode{}, users: map[string]User{}, idents: map[string]string{}, upks: map[string]UserPasskey{},
+		recovery: map[string]RecoveryCode{}, users: map[string]User{}, idents: map[string]string{}, upks: map[string]UserPasskey{}, seen: map[string]time.Time{},
 	}
 }
 
@@ -549,7 +551,7 @@ func (m *Memory) UpdateUser(_ context.Context, u User) error {
 	if !ok {
 		return ErrNotFound
 	}
-	cur.Email, cur.Name, cur.Status, cur.NotBefore, cur.EmailVerified = u.Email, u.Name, u.Status, u.NotBefore, u.EmailVerified
+	cur.Email, cur.Name, cur.Status, cur.NotBefore, cur.EmailVerified, cur.LastLoginAt = u.Email, u.Name, u.Status, u.NotBefore, u.EmailVerified, u.LastLoginAt
 	cur.Roles = append([]string(nil), u.Roles...)
 	m.users[ukey(u.ServiceID, u.ID)] = cur
 	return nil
@@ -570,6 +572,15 @@ func (m *Memory) RebindUserIdentity(_ context.Context, serviceID, userID, oldIde
 	cur.Identity = newIdentity
 	m.users[ukey(serviceID, userID)] = cur
 	return nil
+}
+
+func (m *Memory) TouchSeenIP(_ context.Context, serviceID, userID, ip string, now time.Time, ttl time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := ukey(serviceID, userID) + "#" + ip
+	exp, ok := m.seen[k]
+	m.seen[k] = now.Add(ttl)
+	return ok && now.Before(exp), nil
 }
 
 func (m *Memory) PutUserPasskey(_ context.Context, p UserPasskey) error {
@@ -627,6 +638,11 @@ func (m *Memory) DeleteUser(_ context.Context, serviceID, id string) error {
 	for k, p := range m.upks {
 		if p.ServiceID == serviceID && p.UserID == id {
 			delete(m.upks, k)
+		}
+	}
+	for k := range m.seen {
+		if strings.HasPrefix(k, ukey(serviceID, id)+"#") {
+			delete(m.seen, k)
 		}
 	}
 	return nil

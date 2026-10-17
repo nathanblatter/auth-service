@@ -33,6 +33,8 @@ var (
 	EmailSend = Policy{Limit: 5, Window: 15 * time.Minute}
 	// EmailSendIP: codes requested from one IP, any address.
 	EmailSendIP = Policy{Limit: 20, Window: 15 * time.Minute}
+	// LoginAlert: new-sign-in alert emails to one account. Counts sends.
+	LoginAlert = Policy{Limit: 3, Window: 24 * time.Hour}
 )
 
 // Limiter checks and records failures through the store.

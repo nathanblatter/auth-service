@@ -140,6 +140,14 @@ func build(ctx context.Context, log *slog.Logger) (http.Handler, config.Config, 
 	lim.Log = log
 	us := users.New(st)
 	us.Log = log
+	us.AlertAllowed = func(ctx context.Context, userID string) bool {
+		key := "alert:" + userID
+		if !lim.Allow(ctx, ratelimit.LoginAlert, key) {
+			return false
+		}
+		lim.Fail(ctx, ratelimit.LoginAlert, key) // counts sends
+		return true
+	}
 	if cfg.MailQueueURL != "" {
 		us.Mail = &mailqueue.SQS{Client: sqs.NewFromConfig(awsCfg), QueueURL: cfg.MailQueueURL}
 	} else {

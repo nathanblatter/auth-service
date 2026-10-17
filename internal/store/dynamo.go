@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ const (
 
 	pkOwner     = "OWNER#me"
 	skPasskey   = "PASSKEY#"
+	skSeen      = "SEEN#"
 	pkChallenge = "CHALLENGE#"
 	pkSession   = "SESSION#"
 	pkRate      = "RATE#"
@@ -1076,6 +1078,7 @@ type userItem struct {
 	CreatedAt              string   `dynamodbav:"created_at"`
 	NotBefore              string   `dynamodbav:"sessions_not_before,omitempty"`
 	EmailVerified          bool     `dynamodbav:"email_verified,omitempty"`
+	LastLoginAt            string   `dynamodbav:"last_login_at,omitempty"`
 }
 
 func (it userItem) toUser() (User, error) {
@@ -1084,8 +1087,9 @@ func (it userItem) toUser() (User, error) {
 		return User{}, fmt.Errorf("store: bad created_at on %s: %w", it.PK, err)
 	}
 	nb, _ := time.Parse(time.RFC3339Nano, it.NotBefore)
+	ll, _ := time.Parse(time.RFC3339Nano, it.LastLoginAt)
 	return User{ID: it.ID, ServiceID: it.ServiceID, Method: it.Method, Identity: it.Identity, Email: it.Email, Name: it.Name,
-		Roles: it.Roles, Status: it.Status, CreatedAt: t, NotBefore: nb, EmailVerified: it.EmailVerified}, nil
+		Roles: it.Roles, Status: it.Status, CreatedAt: t, NotBefore: nb, EmailVerified: it.EmailVerified, LastLoginAt: ll}, nil
 }
 
 func (d *Dynamo) CreateUser(ctx context.Context, u User) error {
@@ -1093,7 +1097,7 @@ func (d *Dynamo) CreateUser(ctx context.Context, u User) error {
 		PK: pkUser + u.ServiceID + "#" + u.ID, SK: skMeta, GSI1PK: gsiUsers + u.ServiceID, GSI1SK: u.CreatedAt.UTC().Format(time.RFC3339Nano) + "#" + u.ID,
 		Type: "user", ID: u.ID, ServiceID: u.ServiceID, Method: u.Method, Identity: u.Identity, Email: u.Email, Name: u.Name,
 		Roles: u.Roles, Status: u.Status, CreatedAt: u.CreatedAt.UTC().Format(time.RFC3339Nano), NotBefore: fmtTime(u.NotBefore),
-		EmailVerified: u.EmailVerified,
+		EmailVerified: u.EmailVerified, LastLoginAt: fmtTime(u.LastLoginAt),
 	})
 	if err != nil {
 		return err
@@ -1198,7 +1202,7 @@ func (d *Dynamo) UpdateUser(ctx context.Context, u User) error {
 	_, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                &d.table,
 		Key:                      dynKey(pkUser+u.ServiceID+"#"+u.ID, skMeta),
-		UpdateExpression:         aws.String("SET email = :e, #n = :n, #r = :r, #s = :s, sessions_not_before = :nb, email_verified = :v"),
+		UpdateExpression:         aws.String("SET email = :e, #n = :n, #r = :r, #s = :s, sessions_not_before = :nb, email_verified = :v, last_login_at = :ll"),
 		ConditionExpression:      aws.String("attribute_exists(PK)"),
 		ExpressionAttributeNames: map[string]string{"#n": "name", "#r": "roles", "#s": "status"},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
@@ -1208,6 +1212,7 @@ func (d *Dynamo) UpdateUser(ctx context.Context, u User) error {
 			":s":  &types.AttributeValueMemberS{Value: u.Status},
 			":nb": &types.AttributeValueMemberS{Value: fmtTime(u.NotBefore)},
 			":v":  &types.AttributeValueMemberBOOL{Value: u.EmailVerified},
+			":ll": &types.AttributeValueMemberS{Value: fmtTime(u.LastLoginAt)},
 		},
 	})
 	var cond *types.ConditionalCheckFailedException
@@ -1247,6 +1252,35 @@ func (d *Dynamo) RebindUserIdentity(ctx context.Context, serviceID, userID, oldI
 		return ErrNotFound
 	}
 	return err
+}
+
+// TouchSeenIP keeps one row per (user, ip) under the user's partition,
+// expired by DynamoDB TTL, so a sign-in from an address not seen in the
+// window can raise a new-login alert.
+func (d *Dynamo) TouchSeenIP(ctx context.Context, serviceID, userID, ip string, now time.Time, ttl time.Duration) (bool, error) {
+	exp := now.Add(ttl)
+	out, err := d.db.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                &d.table,
+		Key:                      dynKey(pkUser+serviceID+"#"+userID, skSeen+ip),
+		UpdateExpression:         aws.String("SET #t = :t, expires_at = :e, #ttl = :ttl, last_seen_at = :now"),
+		ExpressionAttributeNames: map[string]string{"#t": "type", "#ttl": "ttl"},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":t":   &types.AttributeValueMemberS{Value: "seen_ip"},
+			":e":   &types.AttributeValueMemberS{Value: exp.UTC().Format(time.RFC3339Nano)},
+			":ttl": &types.AttributeValueMemberN{Value: strconv.FormatInt(exp.Unix()+60, 10)},
+			":now": &types.AttributeValueMemberS{Value: now.UTC().Format(time.RFC3339Nano)},
+		},
+		ReturnValues: types.ReturnValueAllOld,
+	})
+	if err != nil {
+		return false, err
+	}
+	if old, ok := out.Attributes["expires_at"].(*types.AttributeValueMemberS); ok {
+		if t, err := time.Parse(time.RFC3339Nano, old.Value); err == nil && now.Before(t) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type userPasskeyItem struct {
@@ -1364,6 +1398,23 @@ func (d *Dynamo) DeleteUser(ctx context.Context, serviceID, id string) error {
 	for _, k := range keys {
 		if _, err := d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkUser+serviceID+"#"+id, skPasskey+k.ID)}); err != nil {
 			return err
+		}
+	}
+	// Seen-IP rows: best effort, they expire on their own anyway.
+	q, err := d.db.Query(ctx, &dynamodb.QueryInput{
+		TableName:              &d.table,
+		KeyConditionExpression: aws.String("PK = :pk AND begins_with(SK, :sk)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: pkUser + serviceID + "#" + id},
+			":sk": &types.AttributeValueMemberS{Value: skSeen},
+		},
+		ProjectionExpression: aws.String("SK"),
+	})
+	if err == nil {
+		for _, it := range q.Items {
+			if sk, ok := it["SK"].(*types.AttributeValueMemberS); ok {
+				_, _ = d.db.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: &d.table, Key: dynKey(pkUser+serviceID+"#"+id, sk.Value)})
+			}
 		}
 	}
 	// Identity lock and user row go together so a half-deleted account can

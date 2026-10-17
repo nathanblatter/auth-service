@@ -158,6 +158,12 @@ owner-provisioned accounts. An app-created passkey account starts `false` and **
 in** (`403 email_unverified` from passkey finish) until the person enters the code from
 `POST /v1/users/{id}/email/verify/begin`. User tokens carry `email_verified`.
 
+**New-sign-in alerts.** When a user signs in from an address not seen on that account in the
+last 90 days (and it is not the account's very first sign-in), Squawk emails them: service,
+method, time, IP, and what to do if it wasn't them. At most 3 alerts per account per day
+(`user.login.alerted` / `user.login.alert_suppressed` in the audit log). Nothing to configure;
+it needs the mail outbox.
+
 Email endpoints answer `404 email_disabled` on a server without a mail outbox
 (`AUTH_MAIL_QUEUE_URL`). Codes: 6 digits, 10 minutes, 5 attempts, single use; sends are capped
 at 5 per address and 20 per IP per 15 minutes (`429`).
@@ -196,7 +202,7 @@ refusals are audited as `user.signup_denied`.
 | GET | `/v1/login/google/start?login_challenge=` | browser endpoint, no auth; `302` to Google (404 `google_disabled` when not configured) |
 | GET | `/v1/login/google/callback` | Google returns here; `302` to the app's `redirect_uri` with `code`, or back to `login_url?login_challenge=&error=` |
 
-`user` = `{"id":"usr_…","service_id","method","email","email_verified","name","roles":[…],"status","created_at"}`.
+`user` = `{"id":"usr_…","service_id","method","email","email_verified","name","roles":[…],"status","created_at","last_login_at"?}`.
 
 **Login flow:** the app sends the browser to `/oauth/authorize` (its own client, PKCE,
 `resource`); because the service has a `login_url` the browser lands on
@@ -261,7 +267,7 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | GET | `/admin/audit?month=YYYY-MM&limit=50&cursor=` | `{"month","events":[{"at","kind","actor","service_id","detail","ip"}],"next"}` newest first; pass `next` back as `cursor` |
 
 Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `service.login.set`,
-`user.create`, `user.provision`, `user.signup_denied`, `user.google.bind`, `user.email_code.sent`, `user.email.verified`, `user.passkey.register`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
+`user.create`, `user.provision`, `user.signup_denied`, `user.google.bind`, `user.email_code.sent`, `user.email.verified`, `user.passkey.register`, `user.login.alerted`, `user.login.alert_suppressed`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
 `user.passkey.register`, `user.export`, `user.delete`, `credential.mint`, `credential.revoke`,
 `token.issue`, `token.denied`, `passkey.register`, `owner.login`, `owner.login_denied`,
 `owner.stepup`, `owner.stepup_denied`, `owner.logout_everywhere`, `recovery.generate`,
