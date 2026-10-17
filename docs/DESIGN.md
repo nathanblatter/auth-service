@@ -222,6 +222,13 @@ same email is a stranger.
      `email`, `name`), then `POST /v1/users/{id}/passkeys/begin` + `/finish` registers the
      credential (service token), and `POST /v1/users/{id}/email/verify/begin` + `/finish`
      proves the address. Passkey users must register and verify before they can log in.
+   - **Passkey activation:** a passkey account with no passkey on this device (owner-provisioned,
+     or a sign-up finishing on another phone) enters its email at
+     `POST /v1/login/passkey/activate/begin`, gets a code, and `/finish` returns creation
+     options whose challenge carries the parked authorization; the usual
+     `/v1/users/{id}/passkeys/finish` then both stores the passkey and completes the sign-in.
+     The code doubles as email verification. Without this, an invite-only pool could never
+     hand a passkey account to its person.
    - **Email code:** app backend calls `POST /v1/login/email/begin` `{login_challenge, email}`
      (a code is mailed), then `POST /v1/login/email/finish?challenge=` `{code}` →
      `{redirect_to}`, exactly like the passkey finish.

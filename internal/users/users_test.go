@@ -106,7 +106,7 @@ func TestPasskeyCeremonies(t *testing.T) {
 		t.Fatalf("creation options bound to the service: %s", raw)
 	}
 	req := httptest.NewRequest("POST", "/", strings.NewReader(`{"id":"junk"}`))
-	if _, err := u.FinishRegisterPasskey(ctx, svc, chID, "Phone", req); !errors.Is(err, ErrCeremony) {
+	if _, _, err := u.FinishRegisterPasskey(ctx, svc, chID, "Phone", req); !errors.Is(err, ErrCeremony) {
 		t.Fatalf("junk attestation: %v", err)
 	}
 	// Service without rp config cannot run ceremonies.
@@ -532,5 +532,65 @@ func TestRandomDigits(t *testing.T) {
 	}
 	if len(seen) != 10 {
 		t.Fatalf("digits seen: %v", seen)
+	}
+}
+
+func TestPasskeyActivation(t *testing.T) {
+	u, mem, svc := newUsers(t)
+	ctx := context.Background()
+	fm := &fakeMail{}
+	u.Mail = fm
+
+	// Open pool: no such passkey account → not found (the app signs them up first).
+	if _, err := u.BeginActivatePasskey(ctx, svc, "authz-1", "nobody@x.test", "ip"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("unknown on open pool: %v", err)
+	}
+	// An email-method account is not a passkey account.
+	_, _ = u.Provision(ctx, svc, MethodEmail, "code@x.test", "")
+	if _, err := u.BeginActivatePasskey(ctx, svc, "authz-1", "code@x.test", "ip"); !errors.Is(err, ErrUserNotFound) {
+		t.Fatalf("email-method account: %v", err)
+	}
+	// Provisioned passkey account, unverified app-created one too: both activate.
+	prov, _ := u.Provision(ctx, svc, MethodPasskey, "prov@x.test", "P")
+	ch, err := u.BeginActivatePasskey(ctx, svc, "authz-1", "Prov@x.test", "ip")
+	if err != nil || fm.to != "prov@x.test" || !strings.Contains(fm.subject, "passkey") {
+		t.Fatalf("begin activate: %v to=%q subj=%q", err, fm.to, fm.subject)
+	}
+	if _, _, _, err := u.FinishActivatePasskey(ctx, svc, ch, "000000", "ip"); !errors.Is(err, ErrCodeRejected) {
+		t.Fatalf("wrong code: %v", err)
+	}
+	opts, regID, user, err := u.FinishActivatePasskey(ctx, svc, ch, fm.code(t), "ip")
+	if err != nil || opts == nil || regID == "" || user.ID != prov.ID {
+		t.Fatalf("finish activate: %+v %q %v", opts, regID, err)
+	}
+	// The registration challenge carries the authz: a junk attestation fails the ceremony but
+	// proves the challenge is a registration one bound to this service.
+	req, _ := http.NewRequest("POST", "/", strings.NewReader(`{"id":"junk"}`))
+	if _, _, err := u.FinishRegisterPasskey(ctx, svc, regID, "Phone", req); !errors.Is(err, ErrCeremony) {
+		t.Fatalf("junk attestation: %v", err)
+	}
+	// An app-created (unverified) passkey account becomes verified by activating.
+	fresh, _ := u.Create(ctx, svc, "fresh@x.test", "")
+	ch, _ = u.BeginActivatePasskey(ctx, svc, "authz-2", "fresh@x.test", "ip")
+	_, _, got, err := u.FinishActivatePasskey(ctx, svc, ch, fm.code(t), "ip")
+	if err != nil || got.ID != fresh.ID || !got.EmailVerified {
+		t.Fatalf("activation verifies: %+v %v", got, err)
+	}
+	if n := countAudit(t, mem, "user.email.verified"); n != 1 {
+		t.Fatalf("verified audits: %d", n)
+	}
+	// Closed pool: strangers get signup_closed, nothing sent.
+	_ = mem.UpdateServiceLogin(ctx, svc.ID, svc.LoginURL, svc.RPID, svc.Origins, svc.DefaultRoles, false)
+	svc, _ = mem.GetService(ctx, svc.ID)
+	sent := fm.sent
+	if _, err := u.BeginActivatePasskey(ctx, svc, "authz-3", "stranger@x.test", "ip"); !errors.Is(err, ErrSignupClosed) || fm.sent != sent {
+		t.Fatalf("closed pool stranger: %v", err)
+	}
+	if _, err := u.BeginActivatePasskey(ctx, svc, "authz-3", "prov@x.test", "ip"); err != nil {
+		t.Fatalf("closed pool provisioned: %v", err)
+	}
+	u.Mail = nil
+	if _, err := u.BeginActivatePasskey(ctx, svc, "authz-3", "prov@x.test", "ip"); !errors.Is(err, ErrEmailDisabled) {
+		t.Fatalf("no mailer: %v", err)
 	}
 }

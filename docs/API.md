@@ -184,9 +184,11 @@ refusals are audited as `user.signup_denied`.
 | DELETE | `/v1/users/{id}` | `204`; permanent. Removes the account, identity and passkeys; refresh tokens stop working. Your app owns the confirmation step |
 | GET | `/v1/users/{id}/passkeys` | `{"passkeys":[{"id","name","created_at"}]}` |
 | POST | `/v1/users/{id}/passkeys/begin` | `{"challenge_id","options"}` WebAuthn creation options bound to the service's `rp_id`/`origins` |
-| POST | `/v1/users/{id}/passkeys/finish?challenge=&name=` | body: the browser's credential JSON → `201` |
+| POST | `/v1/users/{id}/passkeys/finish?challenge=&name=` | body: the browser's credential JSON → `201 {"id","name","user_id","created_at","redirect_to"?}` (`redirect_to` only after a passkey activation) |
 | POST | `/v1/login/passkey/begin` | `{"login_challenge"}` → `{"challenge_id","options"}` (usernameless) |
 | POST | `/v1/login/passkey/finish?challenge=` | body: credential JSON → `{"redirect_to","user"}`; send the browser to `redirect_to`. `403 email_unverified` until the account verified its email |
+| POST | `/v1/login/passkey/activate/begin` | `{"login_challenge","email"}` → `{"challenge_id","expires_in"}`; mails a code to the **passkey** account created with that address (owner-provisioned, or an app sign-up on a new device). `404 not_found` on an open pool when no such account, `403 signup_closed` on an invite-only one |
+| POST | `/v1/login/passkey/activate/finish?challenge=` | `{"code"}` → `{"challenge_id","options","user"}`: WebAuthn **creation** options (the code also marks the email verified). Run `navigator.credentials.create`, then `POST /v1/users/{user.id}/passkeys/finish?challenge=&name=`, whose `201` carries `redirect_to` because the challenge completes the parked sign-in |
 | POST | `/v1/login/email/begin` | `{"login_challenge","email"}` → `{"challenge_id","expires_in":600}`; a code is mailed. `403 signup_closed` for an unknown address on an invite-only pool, `403 account_disabled`, `429` |
 | POST | `/v1/login/email/finish?challenge=` | `{"code":"123456"}` → `{"redirect_to","user"}`. `401 code_rejected` (wrong, expired, used, or out of attempts: request a new one) |
 | POST | `/v1/users/{id}/email/verify/begin` | → `{"challenge_id","expires_in"}`; mails a verification code. `409 already_verified` |
@@ -259,7 +261,7 @@ All under `/admin`. Auth: admin session cookie or admin bearer. **fresh** = step
 | GET | `/admin/audit?month=YYYY-MM&limit=50&cursor=` | `{"month","events":[{"at","kind","actor","service_id","detail","ip"}],"next"}` newest first; pass `next` back as `cursor` |
 
 Event kinds: `service.create`, `service.resource.add`, `service.permissions.set`, `service.login.set`,
-`user.create`, `user.provision`, `user.signup_denied`, `user.google.bind`, `user.email_code.sent`, `user.email.verified`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
+`user.create`, `user.provision`, `user.signup_denied`, `user.google.bind`, `user.email_code.sent`, `user.email.verified`, `user.passkey.register`, `user.update`, `user.login`, `user.login_denied`, `user.logout_everywhere`,
 `user.passkey.register`, `user.export`, `user.delete`, `credential.mint`, `credential.revoke`,
 `token.issue`, `token.denied`, `passkey.register`, `owner.login`, `owner.login_denied`,
 `owner.stepup`, `owner.stepup_denied`, `owner.logout_everywhere`, `recovery.generate`,

@@ -1081,3 +1081,56 @@ func TestEmailCodeHTTP(t *testing.T) {
 		t.Fatalf("provision email: %d %v", code, p)
 	}
 }
+
+// TestPasskeyActivationHTTP: a provisioned passkey account proves its address
+// with a code and receives registration options bound to the parked sign-in.
+func TestPasskeyActivationHTTP(t *testing.T) {
+	ts, _ := newServerWithStore(t, "https://auth.test")
+	srv := lastServer
+	admin := "Bearer " + adminToken
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+	_, svc := do(t, "POST", ts.URL+"/admin/services", admin, "application/json", `{"name":"Site","slug":"site"}`)
+	id := svc["id"].(string)
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/permissions", admin, "application/json", `{"scopes":["admin"],"roles":{"owner":["admin"]}}`)
+	do(t, "POST", ts.URL+"/admin/services/"+id+"/resources", admin, "application/json", `{"resource":"https://site.test/api"}`)
+	do(t, "PUT", ts.URL+"/admin/services/"+id+"/login", admin, "application/json", `{"login_url":"https://site.test/login","rp_id":"site.test","origins":["https://site.test"],"default_roles":["owner"]}`)
+	_, cred := do(t, "POST", ts.URL+"/admin/services/"+id+"/credentials", admin, "", "")
+	form := url.Values{"grant_type": {"client_credentials"}, "client_id": {id}, "client_secret": {cred["credential"].(string)}}
+	_, tk := do(t, "POST", ts.URL+"/v1/token", "", "application/x-www-form-urlencoded", form.Encode())
+	svcTok := "Bearer " + tk["access_token"].(string)
+	_, me := do(t, "POST", ts.URL+"/admin/services/"+id+"/users", admin, "application/json", `{"email":"me@x.test","method":"passkey"}`)
+
+	_, reg := do(t, "POST", ts.URL+"/oauth/register", "", "application/json", `{"client_name":"Site","redirect_uris":["https://site.test/cb"],"token_endpoint_auth_method":"none"}`)
+	sum := sha256.Sum256([]byte(strings.Repeat("v", 43)))
+	q := url.Values{"client_id": {reg["client_id"].(string)}, "redirect_uri": {"https://site.test/cb"}, "response_type": {"code"}, "state": {"s1"},
+		"resource": {"https://site.test/api"}, "scope": {"admin"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])}, "code_challenge_method": {"S256"}}
+	resp, _ := noRedirect.Get(ts.URL + "/oauth/authorize?" + q.Encode())
+	resp.Body.Close()
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	lc := loc.Query().Get("login_challenge")
+
+	mail := &captureMail{}
+	srv.Users.Mail = mail
+	if code, body := do(t, "POST", ts.URL+"/v1/login/passkey/activate/begin", svcTok, "application/json", `{"login_challenge":"`+lc+`","email":"stranger@x.test"}`); code != 403 || body["error"] != "signup_closed" {
+		t.Fatalf("stranger: %d %v", code, body)
+	}
+	code, begin := do(t, "POST", ts.URL+"/v1/login/passkey/activate/begin", svcTok, "application/json", `{"login_challenge":"`+lc+`","email":"me@x.test"}`)
+	if code != 200 || mail.to != "me@x.test" {
+		t.Fatalf("begin: %d %v", code, begin)
+	}
+	chID := begin["challenge_id"].(string)
+	if code, _ := do(t, "POST", ts.URL+"/v1/login/passkey/activate/finish?challenge="+chID, svcTok, "application/json", `{"code":"000000"}`); code != 401 {
+		t.Fatalf("wrong code: %d", code)
+	}
+	code, fin := do(t, "POST", ts.URL+"/v1/login/passkey/activate/finish?challenge="+chID, svcTok, "application/json", `{"code":"`+mail.code(t)+`"}`)
+	if code != 200 || fin["options"] == nil || fin["challenge_id"] == nil || fin["user"].(map[string]any)["id"] != me["id"] {
+		t.Fatalf("finish: %d %v", code, fin)
+	}
+	// Junk attestation against the registration challenge is a 400, and the
+	// challenge is consumed.
+	regID := fin["challenge_id"].(string)
+	if code, body := do(t, "POST", ts.URL+"/v1/users/"+me["id"].(string)+"/passkeys/finish?challenge="+regID, svcTok, "application/json", `{"id":"junk"}`); code != 400 || body["error"] != "passkey_rejected" {
+		t.Fatalf("junk attestation: %d %v", code, body)
+	}
+}

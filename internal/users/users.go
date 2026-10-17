@@ -353,6 +353,12 @@ func (u *Users) BeginRegisterPasskey(ctx context.Context, svc store.Service, use
 	if err != nil {
 		return nil, "", err
 	}
+	return u.beginRegister(ctx, svc, user, "")
+}
+
+// beginRegister builds registration options. authzID, when set, rides on the
+// challenge so a successful registration also completes that sign-in.
+func (u *Users) beginRegister(ctx context.Context, svc store.Service, user store.User, authzID string) (*protocol.CredentialCreation, string, error) {
 	if user.Method != MethodPasskey {
 		return nil, "", ErrWrongMethod
 	}
@@ -377,36 +383,38 @@ func (u *Users) BeginRegisterPasskey(ctx context.Context, svc store.Service, use
 	if err != nil {
 		return nil, "", err
 	}
-	id, err := u.saveChallenge(ctx, challengeData{Session: sess, ServiceID: svc.ID, UserID: user.ID})
+	id, err := u.saveChallenge(ctx, challengeData{Session: sess, ServiceID: svc.ID, UserID: user.ID, AuthzID: authzID})
 	return opts, id, err
 }
 
 // FinishRegisterPasskey verifies the attestation and stores the credential.
-func (u *Users) FinishRegisterPasskey(ctx context.Context, svc store.Service, challengeID, name string, r *http.Request) (store.UserPasskey, error) {
+// The returned authz id is non-empty when the registration came from a
+// passkey activation and should complete that sign-in.
+func (u *Users) FinishRegisterPasskey(ctx context.Context, svc store.Service, challengeID, name string, r *http.Request) (store.UserPasskey, string, error) {
 	ch, err := u.loadChallenge(ctx, challengeID)
-	if err != nil || ch.ServiceID != svc.ID || ch.UserID == "" {
-		return store.UserPasskey{}, ErrCeremony
+	if err != nil || ch.ServiceID != svc.ID || ch.UserID == "" || ch.Session == nil {
+		return store.UserPasskey{}, "", ErrCeremony
 	}
 	user, err := u.Get(ctx, svc.ID, ch.UserID)
 	if err != nil {
-		return store.UserPasskey{}, err
+		return store.UserPasskey{}, "", err
 	}
 	wa, err := u.webauthnFor(svc)
 	if err != nil {
-		return store.UserPasskey{}, err
+		return store.UserPasskey{}, "", err
 	}
 	w, _, err := u.loadWAUser(ctx, user)
 	if err != nil {
-		return store.UserPasskey{}, err
+		return store.UserPasskey{}, "", err
 	}
 	cred, err := wa.FinishRegistration(w, *ch.Session, r)
 	if err != nil {
 		u.Log.Warn("user passkey registration failed", "service", svc.Slug, "err", err)
-		return store.UserPasskey{}, ErrCeremony
+		return store.UserPasskey{}, "", ErrCeremony
 	}
 	data, err := json.Marshal(cred)
 	if err != nil {
-		return store.UserPasskey{}, err
+		return store.UserPasskey{}, "", err
 	}
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -417,11 +425,14 @@ func (u *Users) FinishRegisterPasskey(ctx context.Context, svc store.Service, ch
 	}
 	pk := store.UserPasskey{ServiceID: svc.ID, UserID: user.ID, ID: b64(cred.ID), Name: name, CreatedAt: u.Now(), Data: data}
 	if err := u.Store.PutUserPasskey(ctx, pk); err != nil {
-		return store.UserPasskey{}, err
+		return store.UserPasskey{}, "", err
 	}
 	u.audit(ctx, "user.passkey.register", svc.ID, user.ID, "pk="+pk.ID, clientIP(r))
+	if ch.AuthzID != "" {
+		u.audit(ctx, "user.login", svc.ID, user.ID, "passkey activation", clientIP(r))
+	}
 	pk.Data = nil
-	return pk, nil
+	return pk, ch.AuthzID, nil
 }
 
 // BeginLoginPasskey starts a usernameless passkey sign-in for a pending
@@ -568,6 +579,77 @@ func (u *Users) finishGoogle(ctx context.Context, svc store.Service, user store.
 	}
 	u.audit(ctx, "user.login", svc.ID, user.ID, "google", ip)
 	return user, nil
+}
+
+// ── passkey activation ─────────────────────────────────────────────────────
+
+// BeginActivatePasskey lets a passkey-method account that cannot sign in yet
+// (owner-provisioned, or on a new device) prove its address with an emailed
+// code and then register a passkey. Found by the address the account was
+// created with.
+func (u *Users) BeginActivatePasskey(ctx context.Context, svc store.Service, authzID, email, ip string) (string, error) {
+	if svc.LoginURL == "" {
+		return "", ErrNotUserPool
+	}
+	if u.Mail == nil {
+		return "", ErrEmailDisabled
+	}
+	email, err := normalizeEmail(email)
+	if err != nil {
+		return "", err
+	}
+	user, err := u.Store.GetUserByIdentity(ctx, svc.ID, "email:"+email)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		if !svc.OpenSignup {
+			u.audit(ctx, "user.signup_denied", svc.ID, "", "method=passkey-activate email="+email, ip)
+			return "", ErrSignupClosed
+		}
+		return "", ErrUserNotFound // open pool: the app's sign-up creates the account first
+	case err != nil:
+		return "", err
+	case user.Status != "active":
+		u.audit(ctx, "user.login_denied", svc.ID, user.ID, "disabled", ip)
+		return "", ErrDisabled
+	}
+	chID, err := u.sendCode(ctx, svc, challengeData{Kind: "activate_passkey", ServiceID: svc.ID, AuthzID: authzID, UserID: user.ID, Email: email},
+		fmt.Sprintf("Set up your %s passkey", svc.Name),
+		fmt.Sprintf("Enter this code to add a passkey to your %s account:\n\n    %%s\n\nIt expires in %d minutes. If you didn't request it, ignore this email.", svc.Name, int(CodeTTL.Minutes())))
+	if err != nil {
+		return "", err
+	}
+	u.audit(ctx, "user.email_code.sent", svc.ID, user.ID, "activate email="+email, ip)
+	return chID, nil
+}
+
+// FinishActivatePasskey checks the code, marks the address verified (the code
+// proved it) and returns registration options whose challenge carries the
+// parked authorization, so FinishRegisterPasskey completes the sign-in.
+func (u *Users) FinishActivatePasskey(ctx context.Context, svc store.Service, challengeID, code, ip string) (*protocol.CredentialCreation, string, store.User, error) {
+	ch, err := u.checkCode(ctx, svc, challengeID, "activate_passkey", code)
+	if err != nil {
+		return nil, "", store.User{}, err
+	}
+	user, err := u.Get(ctx, svc.ID, ch.UserID)
+	if err != nil {
+		return nil, "", store.User{}, err
+	}
+	if user.Status != "active" {
+		u.audit(ctx, "user.login_denied", svc.ID, user.ID, "disabled", ip)
+		return nil, "", store.User{}, ErrDisabled
+	}
+	if !user.EmailVerified {
+		user.EmailVerified = true
+		if err := u.Store.UpdateUser(ctx, user); err != nil {
+			return nil, "", store.User{}, err
+		}
+		u.audit(ctx, "user.email.verified", svc.ID, user.ID, "passkey activation", ip)
+	}
+	opts, regID, err := u.beginRegister(ctx, svc, user, ch.AuthzID)
+	if err != nil {
+		return nil, "", store.User{}, err
+	}
+	return opts, regID, user, nil
 }
 
 // ── email codes ────────────────────────────────────────────────────────────

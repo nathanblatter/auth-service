@@ -32,6 +32,8 @@ func (s *Server) userRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/users/{id}/passkeys/finish", s.requireService(s.userPasskeyFinish))
 	mux.HandleFunc("POST /v1/login/passkey/begin", s.requireService(s.loginPasskeyBegin))
 	mux.HandleFunc("POST /v1/login/passkey/finish", s.requireService(s.loginPasskeyFinish))
+	mux.HandleFunc("POST /v1/login/passkey/activate/begin", s.requireService(s.loginPasskeyActivateBegin))
+	mux.HandleFunc("POST /v1/login/passkey/activate/finish", s.requireService(s.loginPasskeyActivateFinish))
 	mux.HandleFunc("POST /v1/login/email/begin", s.requireService(s.loginEmailBegin))
 	mux.HandleFunc("POST /v1/login/email/finish", s.requireService(s.loginEmailFinish))
 	mux.HandleFunc("POST /v1/users/{id}/email/verify/begin", s.requireService(s.userVerifyEmailBegin))
@@ -242,7 +244,7 @@ func (s *Server) userPasskeyFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
 	q := r.URL.Query()
-	pk, err := s.Users.FinishRegisterPasskey(r.Context(), svc, q.Get("challenge"), q.Get("name"), r)
+	pk, authzID, err := s.Users.FinishRegisterPasskey(r.Context(), svc, q.Get("challenge"), q.Get("name"), r)
 	if errors.Is(err, users.ErrCeremony) {
 		writeJSON(w, 400, map[string]string{"error": "passkey_rejected"})
 		return
@@ -250,7 +252,24 @@ func (s *Server) userPasskeyFinish(w http.ResponseWriter, r *http.Request) {
 	if s.userFail(w, err) {
 		return
 	}
-	writeJSON(w, 201, map[string]any{"id": pk.ID, "name": pk.Name, "user_id": pk.UserID, "created_at": pk.CreatedAt.UTC().Format(time.RFC3339)})
+	out := map[string]any{"id": pk.ID, "name": pk.Name, "user_id": pk.UserID, "created_at": pk.CreatedAt.UTC().Format(time.RFC3339)}
+	if authzID != "" {
+		// Registration came from a passkey activation: finish that sign-in too.
+		user, err := s.Users.Get(r.Context(), svc.ID, pk.UserID)
+		if s.userFail(w, err) {
+			return
+		}
+		loc, err := s.OAuth.CompleteForUser(r.Context(), authzID, user, users.AllowedScopes(svc, user), clientIP(r))
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, 404, map[string]string{"error": "not_found", "detail": "login_challenge expired; the passkey is registered, sign in again"})
+			return
+		}
+		if s.oauthFail(w, err) {
+			return
+		}
+		out["redirect_to"] = loc
+	}
+	writeJSON(w, 201, out)
 }
 
 // pendingFor validates a login_challenge against the calling service.
@@ -607,4 +626,73 @@ func (s *Server) userVerifyEmailFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, userJSON(u))
+}
+
+// ── passkey activation ─────────────────────────────────────────────────────
+
+// loginPasskeyActivateBegin mails a code to a passkey account that has no
+// usable passkey on this device (first activation of a provisioned account,
+// or a new phone). Same send caps as the email-code login.
+func (s *Server) loginPasskeyActivateBegin(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		LoginChallenge string `json:"login_challenge"`
+		Email          string `json:"email"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	if !s.pendingFor(w, r, svc, in.LoginChallenge) {
+		return
+	}
+	emailKey := "email:send:" + strings.ToLower(strings.TrimSpace(in.Email))
+	ipKey := "email:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.EmailSend, emailKey) {
+		tooMany(w, ratelimit.EmailSend)
+		return
+	}
+	if !s.Limit.Allow(r.Context(), ratelimit.EmailSendIP, ipKey) {
+		tooMany(w, ratelimit.EmailSendIP)
+		return
+	}
+	chID, err := s.Users.BeginActivatePasskey(r.Context(), svc, in.LoginChallenge, in.Email, clientIP(r))
+	if s.userFail(w, err) {
+		return
+	}
+	s.Limit.Fail(r.Context(), ratelimit.EmailSend, emailKey)
+	s.Limit.Fail(r.Context(), ratelimit.EmailSendIP, ipKey)
+	writeJSON(w, 200, map[string]any{"challenge_id": chID, "expires_in": int(users.CodeTTL.Seconds())})
+}
+
+// loginPasskeyActivateFinish checks the code and hands back WebAuthn creation
+// options; the browser runs navigator.credentials.create and the app posts the
+// result to POST /v1/users/{user_id}/passkeys/finish?challenge=, which also
+// completes the sign-in.
+func (s *Server) loginPasskeyActivateFinish(w http.ResponseWriter, r *http.Request) {
+	svc, ok := s.callerService(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Code string `json:"code"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	ipKey := "login:ip:" + clientIP(r)
+	if !s.Limit.Allow(r.Context(), ratelimit.LoginIP, ipKey) {
+		tooMany(w, ratelimit.LoginIP)
+		return
+	}
+	opts, regID, user, err := s.Users.FinishActivatePasskey(r.Context(), svc, r.URL.Query().Get("challenge"), in.Code, clientIP(r))
+	if errors.Is(err, users.ErrCodeRejected) || errors.Is(err, users.ErrCeremony) {
+		s.Limit.Fail(r.Context(), ratelimit.LoginIP, ipKey)
+	}
+	if s.userFail(w, err) {
+		return
+	}
+	writeJSON(w, 200, map[string]any{"challenge_id": regID, "options": opts, "user": userJSON(user)})
 }
