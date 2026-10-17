@@ -4,76 +4,272 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
 <title>auth-service admin</title>
+<script>
+  // Apply a remembered theme before first paint; no attribute = follow the OS.
+  (function () { try { var t = localStorage.getItem('auth-console-theme'); if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t; } catch (e) {} })();
+</script>
 <style>
+  /* Tokens mirror nathanblatter.com (frontend/src/index.css). The CSP has no
+     font-src, so the web fonts are named for machines that have them installed
+     and the stack falls through to system faces everywhere else. */
   :root {
-    --bg: #f6f7f9; --card: #ffffff; --ink: #15181d; --muted: #6b7280; --line: #e3e6ea;
-    --accent: #0f62fe; --accent-ink: #ffffff; --danger: #c0392b; --ok: #1a7f37; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --font-sans: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --white: #ffffff; --snow: #fafbfc; --cloud: #f1f4f8; --mist: #e4e9f0; --silver: #c8d0db;
+    --steel: #65708a; --slate: #5a6478; --ink: #2d3342;
+    --blue: #3b6cf5; --blue-dim: #2a54d4; --blue-wash: #eef3ff;
+    --blue-soft: rgba(59, 108, 245, .45); --blue-ring: rgba(59, 108, 245, .14);
+    --teal: #38b2ac; --teal-wash: rgba(56, 178, 172, .12);
+    --ember: #e25555; --ember-wash: rgba(226, 85, 85, .08); --ember-soft: rgba(226, 85, 85, .3);
+    --line-soft: rgba(228, 233, 240, .6);
+    --glass: rgba(255, 255, 255, .8);
+    --shadow: 0 1px 2px rgba(45, 51, 66, .05), 0 1px 1px rgba(45, 51, 66, .03);
+    --radius: 10px; --radius-lg: 14px; --radius-xl: 18px;
+    color-scheme: light;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #0f1216; --card: #171b21; --ink: #e8eaed; --muted: #9aa3ad; --line: #272d36; --accent: #4f8cff; --danger: #ff6b5b; --ok: #4cc26a; }
+    :root:not([data-theme="light"]) {
+      --white: #161b22; --snow: #0d1117; --cloud: #1c2128; --mist: #30363d; --silver: #484f58;
+      --steel: #8b949e; --slate: #b1bac4; --ink: #e6edf3;
+      --blue-wash: #162032; --blue-soft: rgba(91, 138, 247, .55); --blue-ring: rgba(91, 138, 247, .2);
+      --teal: #2ea043; --teal-wash: rgba(46, 160, 67, .16);
+      --ember: #f85149; --ember-wash: rgba(248, 81, 73, .12); --ember-soft: rgba(248, 81, 73, .4);
+      --line-soft: rgba(48, 54, 61, .6);
+      --glass: rgba(22, 27, 34, .8);
+      --shadow: none;
+      color-scheme: dark;
+    }
   }
+  :root[data-theme="dark"] {
+    --white: #161b22; --snow: #0d1117; --cloud: #1c2128; --mist: #30363d; --silver: #484f58;
+    --steel: #8b949e; --slate: #b1bac4; --ink: #e6edf3;
+    --blue-wash: #162032; --blue-soft: rgba(91, 138, 247, .55); --blue-ring: rgba(91, 138, 247, .2);
+    --teal: #2ea043; --teal-wash: rgba(46, 160, 67, .16);
+    --ember: #f85149; --ember-wash: rgba(248, 81, 73, .12); --ember-soft: rgba(248, 81, 73, .4);
+    --line-soft: rgba(48, 54, 61, .6);
+    --glass: rgba(22, 27, 34, .8);
+    --shadow: none;
+    color-scheme: dark;
+  }
+
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
-  header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--card); }
-  header h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: .01em; }
-  header h1 span { color: var(--muted); font-weight: 400; }
-  main { max-width: 760px; margin: 0 auto; padding: 16px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
-  .card h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  html { background: var(--cloud); }
+  body {
+    margin: 0; min-height: 100vh; background: var(--cloud); color: var(--slate);
+    font: 14px/1.55 var(--font-sans); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
+  }
+  ::selection { background: var(--blue); color: #fff; }
+  :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 4px; }
+  :focus:not(:focus-visible) { outline: none; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--silver); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--blue); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  }
+
+  /* ── header ─────────────────────────────────────────────────────────── */
+  header {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    padding: 12px 24px; border-bottom: 1px solid var(--mist);
+    background: var(--glass); -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .logo {
+    width: 36px; height: 36px; flex: none; border-radius: var(--radius); background: var(--blue); color: #fff;
+    display: flex; align-items: center; justify-content: center; font: 700 13px/1 var(--font-mono);
+  }
+  header h1 { margin: 0; font-size: 14px; font-weight: 500; line-height: 1.2; color: var(--ink); }
+  header h1 span { display: block; margin-top: 3px; font: 500 10px/1 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--steel); }
+  header .row { gap: 10px; }
+  #who { font-family: var(--font-mono); font-size: 12px; color: var(--steel); }
+
+  main { max-width: 840px; margin: 0 auto; padding: 24px 24px 56px; }
+
+  /* ── cards ──────────────────────────────────────────────────────────── */
+  .card {
+    background: var(--white); border: 1px solid var(--mist); border-radius: var(--radius-lg);
+    padding: 20px 24px 22px; margin-bottom: 16px; box-shadow: var(--shadow);
+  }
+  .card h2 {
+    margin: 0 0 14px; font: 500 11px/1.4 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--steel);
+  }
+  .card p { margin: 0 0 12px; }
+  .card p:last-child { margin-bottom: 0; }
+  .focus-card { max-width: 460px; margin: 32px auto 16px; padding: 28px; border-radius: var(--radius-xl); }
+  .focus-card h2 { font: 600 20px/1.25 var(--font-sans); letter-spacing: 0; text-transform: none; color: var(--ink); margin-bottom: 8px; }
+  #gate-intro, #gate-setup > p, #approve-body > p { color: var(--slate); font-size: 14px; }
+  #approve-body > p b { color: var(--ink); font-weight: 600; }
+
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .grow { flex: 1 1 160px; }
-  input { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); font: inherit; }
-  textarea { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--ink); font: inherit; resize: vertical; }
-  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
-  button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink); font: inherit; font-weight: 500; cursor: pointer; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
-  button.danger { color: var(--danger); }
-  button.small { padding: 5px 10px; font-size: 13px; }
-  button:disabled { opacity: .5; cursor: default; }
-  .muted { color: var(--muted); }
-  .mono { font-family: var(--mono); font-size: 13px; }
-  .svc { border-top: 1px solid var(--line); padding: 12px 0; }
-  .svc:first-of-type { border-top: 0; }
-  .svc .title { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  .svc .title b { font-weight: 600; }
-  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 14px; }
-  td, th { text-align: left; padding: 6px 4px; border-top: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; border-top: 0; }
-  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); }
-  .pill.ok { color: var(--ok); border-color: var(--ok); }
-  .pill.off { color: var(--danger); border-color: var(--danger); }
-  .secret { margin-top: 10px; padding: 12px; border: 1px dashed var(--accent); border-radius: 10px; }
-  .secret code { display: block; word-break: break-all; font-family: var(--mono); font-size: 13px; margin: 8px 0; }
-  .msg { margin: 8px 0 0; font-size: 14px; }
-  .msg.err { color: var(--danger); }
-  .msg.ok { color: var(--ok); }
-  details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+  .grow { flex: 1 1 180px; min-width: 0; }
+  .muted { color: var(--steel); }
+  .mono { font-family: var(--font-mono); font-size: 13px; }
+  .fine { font-size: 12px; line-height: 1.5; }
+  .mt1 { margin-top: 6px; } .mt2 { margin-top: 8px; } .mt3 { margin-top: 12px; }
+  .ta-r { text-align: right; }
+  p.fine { margin: 6px 0 0; }
   .hidden { display: none !important; }
+
+  /* ── form controls ──────────────────────────────────────────────────── */
+  input, textarea, select {
+    width: 100%; padding: 10px 14px; border: 1px solid var(--mist); border-radius: var(--radius);
+    background: var(--white); color: var(--ink); font: inherit; font-size: 14px; line-height: 1.4;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input::placeholder, textarea::placeholder { color: var(--silver); }
+  input.mono, textarea.mono { font-family: var(--font-mono); font-size: 13px; }
+  textarea { resize: vertical; min-height: 72px; }
+  select {
+    appearance: none; -webkit-appearance: none; width: auto; padding-right: 34px; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2365708a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 12px center;
+  }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--blue-soft); box-shadow: 0 0 0 3px var(--blue-ring); }
+  input[type="checkbox"] { width: 16px; height: 16px; flex: none; padding: 0; margin: 2px 0 0; accent-color: var(--blue); cursor: pointer; }
+  label.row { cursor: pointer; }
+  label.check { align-items: flex-start; gap: 8px; flex-wrap: nowrap; }
+
+  /* ── buttons ────────────────────────────────────────────────────────── */
+  button {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 9px 14px; border: 1px solid transparent; border-radius: var(--radius);
+    background: var(--cloud); color: var(--steel); font: 600 12px/1.4 var(--font-mono); letter-spacing: .01em;
+    cursor: pointer; white-space: nowrap; transition: background-color .15s, color .15s, border-color .15s, opacity .15s;
+  }
+  button:hover { background: var(--blue-wash); color: var(--blue); }
+  button.primary { background: var(--blue); color: #fff; }
+  button.primary:hover { background: var(--blue-dim); color: #fff; }
+  button.danger { background: var(--ember-wash); color: var(--ember); }
+  button.danger:hover { background: var(--ember); color: #fff; }
+  button[data-armed="1"] { background: var(--ember); border-color: var(--ember); color: #fff; animation: armed 1.2s ease-in-out infinite; }
+  button[data-armed="1"]:hover { background: var(--ember); color: #fff; }
+  @keyframes armed { 0%, 100% { box-shadow: 0 0 0 0 var(--ember-soft); } 50% { box-shadow: 0 0 0 4px var(--ember-soft); } }
+  button.small { padding: 6px 10px; font-size: 11px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button:disabled:hover { background: var(--cloud); color: var(--steel); }
+  button.primary:disabled:hover { background: var(--blue); color: #fff; }
+
+  /* ── services ───────────────────────────────────────────────────────── */
+  .svc { border-top: 1px solid var(--mist); padding: 18px 0 6px; }
+  .svc:first-of-type { border-top: 0; padding-top: 4px; }
+  .svc .title { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+  .svc .title > div:first-child { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
+  .svc .title b { font-size: 15px; font-weight: 600; color: var(--ink); }
+  .svc .title .mono { font-size: 12px; overflow-wrap: anywhere; }
+  .svc .title .row { flex-wrap: nowrap; }
+
+  details { margin-top: 6px; border: 1px solid transparent; border-radius: var(--radius); }
+  details[open] { background: var(--snow); border-color: var(--mist); padding: 0 14px 14px; }
+  details[open] > summary { margin: 0 -14px 10px; }
+  summary {
+    display: flex; align-items: center; gap: 10px; list-style: none; cursor: pointer;
+    padding: 9px 12px; border-radius: var(--radius); color: var(--steel); font: 500 12px/1.45 var(--font-mono);
+    transition: background-color .15s, color .15s; overflow-wrap: anywhere;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before {
+    content: ""; flex: none; width: 6px; height: 6px; margin-left: 2px;
+    border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+    transform: rotate(-45deg); transition: transform .15s;
+  }
+  summary:hover { background: var(--cloud); color: var(--ink); }
+  details[open] > summary { color: var(--ink); border-radius: var(--radius) var(--radius) 0 0; }
+  details[open] > summary::before { transform: rotate(45deg); }
+  details[open] > summary:hover { background: transparent; }
+  details .muted.fine { color: var(--steel); }
+
+  /* ── tables ─────────────────────────────────────────────────────────── */
+  .creds, .users, .resources, #audit, #passkeys, #approve-body { overflow-x: auto; max-width: 100%; }
+  table {
+    width: 100%; margin-top: 8px; border: 1px solid var(--mist); border-radius: var(--radius);
+    border-collapse: separate; border-spacing: 0; background: var(--white); font-size: 13px;
+  }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  th { background: var(--snow); color: var(--steel); font: 500 10px/1.6 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; border-bottom-color: var(--mist); }
+  tr:last-child > td, tr:last-child > th { border-bottom: 0; }
+  tr:first-child > th:first-child { border-top-left-radius: var(--radius); }
+  tr:first-child > th:last-child { border-top-right-radius: var(--radius); }
+  td { color: var(--slate); }
+  td.mono, td .mono { font-size: 12px; white-space: nowrap; }
+  td.mono b { color: var(--ink); font-weight: 600; }
+  td button { vertical-align: middle; }
+  .creds td, .users td, #passkeys td { white-space: nowrap; }
+  #approve-body th { width: 30%; vertical-align: middle; }
+  #approve-body td.mono { white-space: normal; overflow-wrap: anywhere; }
+  .resources > .mono { padding: 8px 12px; border: 1px solid var(--mist); border-radius: var(--radius); margin-top: 6px; overflow-wrap: anywhere; background: var(--white); }
+  .resources > .mono + .mono { margin-top: 6px; }
+  .resources > p, .creds > p, .users > p, #audit > p, #passkeys > p { margin: 6px 0; font-size: 13px; }
+
+  /* ── pills, secrets, messages ───────────────────────────────────────── */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+    background: var(--cloud); color: var(--steel); font: 500 10px/1.6 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; white-space: nowrap;
+  }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--silver); }
+  .pill.ok { background: var(--teal-wash); color: var(--teal); }
+  .pill.ok::before { background: var(--teal); }
+  .pill.off { background: var(--ember-wash); color: var(--ember); }
+  .pill.off::before { background: var(--ember); }
+
+  .secret { margin: 10px 0; padding: 14px 16px; border: 1px solid var(--blue-soft); border-radius: var(--radius); background: var(--blue-wash); color: var(--slate); }
+  .secret b { color: var(--ink); font-weight: 600; }
+  .secret code, .secret pre.codes {
+    display: block; margin: 10px 0; padding: 10px 12px; border-radius: 8px; background: var(--white); border: 1px solid var(--mist);
+    color: var(--ink); font: 13px/1.6 var(--font-mono); overflow-wrap: anywhere; white-space: pre-wrap;
+  }
+  .msg { margin: 10px 0 0; font: 12px/1.5 var(--font-mono); color: var(--steel); }
+  .msg:empty { display: none; }
+  .msg.err { color: var(--ember); }
+  .msg.ok { color: var(--teal); }
+
+  #audit-month { max-width: 130px; }
+  #audit td:first-child { white-space: nowrap; }
+  #audit td:not(.mono) { overflow-wrap: anywhere; min-width: 160px; }
+  #rc-status { font-size: 13px; }
+
+  /* ── phone ──────────────────────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    header { padding: 10px 16px; }
+    header h1 { font-size: 13px; }
+    main { padding: 16px 16px 40px; }
+    .card { padding: 16px; border-radius: var(--radius); }
+    .focus-card { margin-top: 8px; padding: 20px 16px; border-radius: var(--radius-lg); }
+    .row > .grow { flex-basis: 100%; }
+    .row > select { width: 100%; }
+    .svc .title { align-items: flex-start; }
+    .svc .title .row { width: 100%; justify-content: space-between; }
+    details[open] { padding: 0 10px 10px; }
+    details[open] > summary { margin: 0 -10px 8px; }
+    th, td { padding: 7px 10px; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>auth-service <span>/ admin</span></h1>
+  <div class="brand">
+    <div class="logo" aria-hidden="true">NB</div>
+    <h1>auth-service<span>Admin console</span></h1>
+  </div>
   <div class="row">
-    <span id="who" class="muted" style="font-size:13px"></span>
+    <span id="who"></span>
+    <button id="theme" class="small" type="button">Theme</button>
     <button id="logout" class="small hidden">Sign out</button>
   </div>
 </header>
 <main>
   <!-- Sign in -->
-  <section id="gate" class="card hidden">
+  <section id="gate" class="card focus-card hidden">
     <h2>Sign in</h2>
     <div id="gate-login">
       <p id="gate-intro">This console is protected by your passkey.</p>
       <button id="login" class="primary">Sign in with passkey</button>
     </div>
-    <details id="gate-recover" style="margin-top:10px"><summary>Lost your passkey? Use a recovery code</summary>
-      <div class="row" style="margin-top:8px">
-        <input id="recover-code" class="grow mono" autocomplete="off" placeholder="xxxx-xxxx-xxxx-xxxx">
-        <button id="recover">Sign in with recovery code</button>
-      </div>
-    </details>
     <div id="gate-setup" class="hidden">
       <p>No passkey is registered yet. Paste the bootstrap admin token to register this device as the first passkey.</p>
       <div class="row">
@@ -82,11 +278,17 @@
         <button id="setup" class="primary">Register passkey</button>
       </div>
     </div>
+    <details id="gate-recover" class="mt3"><summary>Lost your passkey? Use a recovery code</summary>
+      <div class="row">
+        <input id="recover-code" class="grow mono" autocomplete="off" placeholder="xxxx-xxxx-xxxx-xxxx">
+        <button id="recover">Sign in with recovery code</button>
+      </div>
+    </details>
     <p id="gate-msg" class="msg"></p>
   </section>
 
   <!-- Connector approval -->
-  <section id="approve" class="card hidden">
+  <section id="approve" class="card focus-card hidden">
     <h2>Connection request</h2>
     <div id="approve-body"></div>
     <p id="approve-msg" class="msg"></p>
@@ -98,7 +300,7 @@
       <h2>New service</h2>
       <div class="row">
         <input id="svc-name" class="grow" placeholder="Name (FinForge)">
-        <input id="svc-slug" class="grow" placeholder="slug (finforge)">
+        <input id="svc-slug" class="grow mono" placeholder="slug (finforge)">
         <button id="svc-create" class="primary">Create</button>
       </div>
       <p id="svc-msg" class="msg"></p>
@@ -120,19 +322,19 @@
     <section class="card">
       <h2>Passkeys</h2>
       <div id="passkeys"></div>
-      <div class="row" style="margin-top:10px">
+      <div class="row mt3">
         <input id="pk-name" class="grow" placeholder="Name for this device">
         <button id="pk-add">Add passkey for this device (backup)</button>
       </div>
-      <div class="row" style="margin-top:10px"><button id="logout-all" class="danger">Sign out everywhere</button><span class="muted" style="font-size:13px">Kills every console session and every connector's refresh token. Connectors reconnect with a new approval.</span></div>
+      <div class="row mt3"><button id="logout-all" class="danger">Sign out everywhere</button><span class="muted fine">Kills every console session and every connector's refresh token. Connectors reconnect with a new approval.</span></div>
       <p id="pk-msg" class="msg"></p>
     </section>
 
     <section class="card">
       <h2>Audit log</h2>
-      <div class="row"><input id="audit-month" class="mono" style="max-width:120px" placeholder="YYYY-MM"><button id="audit-load" class="small">Load</button></div>
+      <div class="row"><input id="audit-month" class="mono" placeholder="YYYY-MM"><button id="audit-load" class="small">Load</button></div>
       <div id="audit"></div>
-      <div class="row" style="margin-top:8px"><button id="audit-more" class="small hidden">Load more</button></div>
+      <div class="row mt2"><button id="audit-more" class="small hidden">Load more</button></div>
     </section>
   </div>
 </main>
@@ -274,7 +476,7 @@
       const { codes } = await api('POST', '/admin/recovery-codes');
       const el = $('rc-codes');
       el.classList.remove('hidden');
-      el.innerHTML = '<div><b>Your recovery codes.</b> Shown once. Print them or put them in your password manager.</div><pre class="mono" style="margin:8px 0;white-space:pre-wrap"></pre><div class="row"><button class="small copy">Copy all</button><button class="small done">I have stored them</button></div>';
+      el.innerHTML = '<div><b>Your recovery codes.</b> Shown once. Print them or put them in your password manager.</div><pre class="mono codes"></pre><div class="row"><button class="small copy">Copy all</button><button class="small done">I have stored them</button></div>';
       el.querySelector('pre').textContent = codes.join('\n');
       el.querySelector('.copy').onclick = async (ev) => { await navigator.clipboard.writeText(codes.join('\n')); ev.target.textContent = 'Copied'; };
       el.querySelector('.done').onclick = () => { el.classList.add('hidden'); el.innerHTML = ''; };
@@ -299,7 +501,7 @@
       body.innerHTML = `
         <p><b class="client"></b> wants to connect to <b class="svc"></b>.</p>
         <table><tr><th>Resource</th><td class="mono res"></td></tr><tr><th>Scope</th><td class="mono scope"></td></tr><tr><th>Client id</th><td class="mono cid"></td></tr><tr><th>Expires</th><td class="exp"></td></tr></table>
-        <div class="row" style="margin-top:12px"><button class="primary ok">Approve</button><button class="danger no">Deny</button></div>`;
+        <div class="row mt3"><button class="primary ok">Approve</button><button class="danger no">Deny</button></div>`;
       body.querySelector('.client').textContent = p.client_name;
       body.querySelector('.svc').textContent = p.service.name;
       body.querySelector('.res').textContent = p.resource;
@@ -351,6 +553,14 @@
       await refreshSession();
     } catch (e) { say('gate-msg', e.message, 'err'); }
   };
+
+  // Theme: no attribute follows the OS; the button pins light/dark in localStorage.
+  const root = document.documentElement;
+  const isDark = () => root.dataset.theme === 'dark' || (!root.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches);
+  const paintTheme = () => { $('theme').textContent = isDark() ? 'Light' : 'Dark'; $('theme').setAttribute('aria-label', isDark() ? 'Switch to light theme' : 'Switch to dark theme'); };
+  $('theme').onclick = () => { const next = isDark() ? 'light' : 'dark'; root.dataset.theme = next; try { localStorage.setItem('auth-console-theme', next); } catch { /* private mode */ } paintTheme(); };
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', paintTheme);
+  paintTheme();
 
   $('logout').onclick = async () => { await api('POST', '/admin/logout'); secretFor = null; await refreshSession(); };
 
@@ -405,22 +615,22 @@
       <div class="secret hidden"></div>
       <details><summary>${credentials.length} credential${credentials.length === 1 ? '' : 's'}, ${live} active</summary><div class="creds"></div></details>
       <details><summary>Permissions: ${(svc.scopes || []).length} scope${(svc.scopes || []).length === 1 ? '' : 's'}, ${Object.keys(svc.roles || {}).length} role${Object.keys(svc.roles || {}).length === 1 ? '' : 's'}</summary>
-        <div class="row" style="margin-top:8px"><input class="grow mono perm-scopes" placeholder="scopes, space separated: read write"></div>
-        <div class="row" style="margin-top:6px"><textarea class="grow mono perm-roles" rows="3" placeholder="one role per line: admin = read write"></textarea></div>
-        <div class="row" style="margin-top:6px"><button class="small perm-save">Save permissions</button><span class="muted" style="font-size:13px">Connector tokens may only carry catalog scopes; empty request = whole catalog.</span></div>
+        <div class="row mt2"><input class="grow mono perm-scopes" placeholder="scopes, space separated: read write"></div>
+        <div class="row mt1"><textarea class="grow mono perm-roles" rows="3" placeholder="one role per line: admin = read write"></textarea></div>
+        <div class="row mt1"><button class="small perm-save">Save permissions</button><span class="muted fine">Connector tokens may only carry catalog scopes; empty request = whole catalog.</span></div>
       </details>
       <details><summary>Users: ${svc.login_url ? 'user pool · ' + (svc.open_signup ? 'open to the public' : 'invite-only') + ' · ' + svc.login_url : 'owner-only (no login URL)'}</summary>
-        <div class="row" style="margin-top:8px"><input class="grow login-url" placeholder="login URL the app hosts, e.g. https://finforge.nathanblatter.com/login"></div>
-        <div class="row" style="margin-top:6px"><input class="grow mono login-rp" placeholder="rp_id, e.g. finforge.nathanblatter.com"><input class="grow mono login-origins" placeholder="origins, space separated: https://finforge.nathanblatter.com"></div>
-        <div class="row" style="margin-top:6px"><input class="grow mono login-roles" placeholder="default roles for new users: user"><button class="small login-save">Save user pool</button></div>
-        <label class="row muted" style="font-size:13px;margin-top:6px;gap:6px;align-items:center"><input type="checkbox" class="login-open"> Open to the public: anyone can sign up (Google, an email code, or the app's sign-up form). Off = invite-only, you add every account below.</label>
-        <p class="muted" style="font-size:13px;margin:6px 0 0">Leave the login URL empty for an owner-only service (connectors approved by you). With a login URL, the app's own page signs users in with passkeys or Google.</p>
+        <div class="row mt2"><input class="grow login-url" placeholder="login URL the app hosts, e.g. https://finforge.nathanblatter.com/login"></div>
+        <div class="row mt1"><input class="grow mono login-rp" placeholder="rp_id, e.g. finforge.nathanblatter.com"><input class="grow mono login-origins" placeholder="origins, space separated: https://finforge.nathanblatter.com"></div>
+        <div class="row mt1"><input class="grow mono login-roles" placeholder="default roles for new users: user"><button class="small login-save">Save user pool</button></div>
+        <label class="row check muted fine mt2"><input type="checkbox" class="login-open"> Open to the public: anyone can sign up (Google, an email code, or the app's sign-up form). Off = invite-only, you add every account below.</label>
+        <p class="muted fine">Leave the login URL empty for an owner-only service (connectors approved by you). With a login URL, the app's own page signs users in with passkeys or Google.</p>
         <div class="users"></div>
-        <div class="row user-add${svc.login_url ? '' : ' hidden'}" style="margin-top:8px"><input class="grow user-email" placeholder="email"><input class="grow user-name" placeholder="name (optional)"><select class="user-method"><option value="passkey">passkey</option><option value="google">google</option><option value="email">email code</option></select><button class="small user-create">Add account</button></div>
+        <div class="row user-add mt2${svc.login_url ? '' : ' hidden'}"><input class="grow user-email" placeholder="email"><input class="grow user-name" placeholder="name (optional)"><select class="user-method"><option value="passkey">passkey</option><option value="google">google</option><option value="email">email code</option></select><button class="small user-create">Add account</button></div>
       </details>
       <details><summary>${(svc.resources || []).length} connector resource${(svc.resources || []).length === 1 ? '' : 's'}</summary>
         <div class="resources"></div>
-        <div class="row" style="margin-top:8px"><input class="grow res-url" placeholder="https://finforge.nathanblatter.com/mcp"><button class="small res-add">Add resource</button></div>
+        <div class="row mt2"><input class="grow res-url" placeholder="https://finforge.nathanblatter.com/mcp"><button class="small res-add">Add resource</button></div>
       </details>
       <p class="msg"></p>`;
     wrap.querySelector('b').textContent = svc.name;
@@ -434,7 +644,7 @@
       t.innerHTML = '<tr><th>Ends in</th><th>Id</th><th>Created</th><th>Status</th><th></th></tr>';
       for (const c of credentials) {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td class="mono">····<b></b></td><td class="mono muted"></td><td class="muted"></td><td></td><td style="text-align:right"></td>`;
+        tr.innerHTML = `<td class="mono">····<b></b></td><td class="mono muted"></td><td class="muted"></td><td></td><td class="ta-r"></td>`;
         tr.children[0].querySelector('b').textContent = c.last4;
         tr.children[1].textContent = c.id;
         tr.children[2].textContent = fmt(c.created_at);
